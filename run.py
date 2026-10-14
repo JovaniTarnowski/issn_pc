@@ -218,6 +218,14 @@ def main():
                 isa_args = ['--isa-rewrite', str(out / 'isa-rewrite.bin')]
         run_script('content_profile.py', game, '--out', out, '--sku', env.get('GOW3_CONTENT_SKU', 'full'))
 
+        # issn: settings a game needs (scripts/game_profiles.py); derived again on each start.
+        import game_profiles
+        title, game_settings = game_profiles.environment(game, env)
+        if game_settings:
+            env.update(game_settings)
+            derived.extend(game_settings)
+            print(f'Game profile {title}: ' + ', '.join(f'{k}={v}' for k, v in game_settings.items()), flush=True)
+
         import patches
         from patches import game_profile_for, patch_requirements, patch_status, selected_patches
         profile = game_profile_for(game)
@@ -245,8 +253,10 @@ def main():
         env.setdefault('GOW3_READBACK_LINEAR', '1')
         if profile:
             names = selected_patches(profile[1], profile[2], env.get('GOW3_PATCHES', ''), env.get('GOW3_PATCHES_ONLY') == '1')
-            # gow3.ini decides the resolution and frame rate patches (in-game menu, launcher).
-            names = graphics_options.patch_names(names, graphics)
+            # gow3.ini decides the resolution and frame rate patches (in-game menu, launcher); their
+            # names are God of War III's (issn: other games keep their patch file's choice).
+            if profile[3] == 'God of War III':
+                names = graphics_options.patch_names(names, graphics)
             names = graphics_options.restrict_to_available(names, patches.available_patches(profile[1], profile[2]))
             env['GOW3_PATCHES'] = ';'.join(names)
             env['GOW3_PATCHES_ONLY'] = '1'

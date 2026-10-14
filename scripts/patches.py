@@ -123,6 +123,25 @@ def encode(line):
     raise ValueError(f'unsupported patch type {kind!r}')
 
 
+def fnv1a64(data):
+    """FNV-1a (64 bits): the OriginalHash of a patch Line is this hash of the bytes it replaces
+    (the format of the shadPS4 build for inFAMOUS Second Son, which carries no game bytes)."""
+    value=0xcbf29ce484222325
+    for byte in data:
+        value=((value^byte)*0x100000001b3)&0xffffffffffffffff
+    return value
+
+
+def check_original(image, line, offset, size):
+    """LookupError when the Line has an OriginalHash and the game's bytes at its site differ: the
+    patch is made for another version of the game."""
+    expected=line.get('OriginalHash')
+    if expected is None or image is None:
+        return
+    if offset<0 or offset+size>len(image) or fnv1a64(image[offset:offset+size])!=int(expected,16):
+        raise LookupError(f'original bytes differ at {offset+EBOOT_BASE:#x} (another game version)')
+
+
 def compile_patches(xml, names, app_version, segments, image=None, skipped=None):
     """Writes of the named patches. With the game's image, each site is found by its signature
     (any build); without it, at the reference build's Address. A Line with a Target writes at that
@@ -144,15 +163,18 @@ def compile_patches(xml, names, app_version, segments, image=None, skipped=None)
             targets=(resolve_targets(image,found[name],sites) if image is not None else
                      {t.get('Name'):int(t.get('Address'),0)-EBOOT_BASE for t in found[name].iter('Target')})
             sites=[targets[line.get('Target')] if line.get('Target') else site for line,site in zip(lines,sites)]
+            ours=[]
+            for line,offset in zip(lines,sites):
+                data=fill(line.get('Value'),offset,targets) if '{' in line.get('Value','') else encode(line)
+                if not any(start<=offset and offset+len(data)<=end for start,end in segments):
+                    raise ValueError(f'{name}: address {offset+EBOOT_BASE:#x} is outside the eboot')
+                check_original(image,line,offset,len(data))
+                ours.append((offset,data))
         except LookupError as error:
             if skipped is None: raise ValueError(f'{name}: {error}')
             skipped[name]=str(error)
             continue
-        for line,offset in zip(lines,sites):
-            data=fill(line.get('Value'),offset,targets) if '{' in line.get('Value','') else encode(line)
-            if not any(start<=offset and offset+len(data)<=end for start,end in segments):
-                raise ValueError(f'{name}: address {offset+EBOOT_BASE:#x} is outside the eboot')
-            writes.append((offset,data))
+        writes+=ours
     return writes
 
 
@@ -161,7 +183,9 @@ PATCHES_DIR=Path(__file__).resolve().parent.parent/'patches'
 # title that also recognizes a release under an ID not listed. The signatures find the sites in
 # any region or version whose code matches, so the eboot.bin build is not checked.
 GAMES=[({'CUSA01623','CUSA01715','CUSA01720'},PATCHES_DIR/'God_of_War_III_Remastered.xml','01.02',
-        'God of War III')]
+        'God of War III'),
+       # issn: Address lines checked by OriginalHash, so another version skips them instead.
+       ({'CUSA00004','CUSA00223'},PATCHES_DIR/'inFAMOUS_Second_Son.xml','01.00','inFAMOUS Second Son')]
 # The build the built-in Address values and third-party patch files are written for.
 REFERENCE_SHA256='d85c8135d330c3b601bf5dc3f1dd86bd6119fb8a9fce372bed2c9785f9a79299'
 DMEM_RETAIL_MB=5056  # runtime_memory.c POOL_SIZE default

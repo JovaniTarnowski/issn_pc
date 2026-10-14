@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Settings that a game needs, chosen by the title ID of its param.sfo.
+
+run.py adds them to the environment of the game unless the variable is already set (an explicit
+GOW3_... value always wins), and GOW3_GAME_PROFILE=0 leaves every game on the defaults.
+"""
+from pathlib import Path
+
+# inFAMOUS Second Son (US, EU). From the settings measured by the shadPS4 build made for this game
+# (AYOUB1080p, github.com/weshayoub92/shadPS4-perf): compute workgroups wider than a host subgroup
+# need barriers where the game relies on GCN waves of 64 running in lockstep.
+INFAMOUS_SECOND_SON = ('CUSA00004', 'CUSA00223')
+
+PROFILES = {
+    title: {
+        'GOW3_WAVE_MEMORY_BARRIERS': '1',
+    }
+    for title in INFAMOUS_SECOND_SON
+}
+
+
+def title_id(game):
+    """TITLE_ID of the game folder's param.sfo, or None."""
+    try:
+        from prepare import read_sfo
+    except ImportError:
+        return None
+    sfo = read_sfo(Path(game) / 'sce_sys' / 'param.sfo') or {}
+    value = sfo.get('TITLE_ID')
+    return str(value) if value else None
+
+
+def environment(game, env):
+    """(title ID, {variable: value}) to add for this game: only variables env does not set."""
+    title = title_id(game)
+    if env.get('GOW3_GAME_PROFILE') == '0' or title not in PROFILES:
+        return title, {}
+    return title, {key: value for key, value in PROFILES[title].items() if key not in env}

@@ -384,6 +384,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        // issn: compute synchronization for code that relies on the 64 invocations of a GCN
+        // wave running in lockstep. run.py turns GOW3_WAVE_MEMORY_BARRIERS on for inFAMOUS
+        // Second Son (scripts/game_profiles.py); both are part of the profile, so changing them
+        // rebuilds the shader cache.
+        .lds_barriers_multi_wave = [] {
+            const char* env = std::getenv("GOW3_LDS_BARRIERS_MULTI_WAVE");
+            return env != nullptr && env[0] == '1';
+        }(),
+        .wave_memory_barriers = [] {
+            const char* env = std::getenv("GOW3_WAVE_MEMORY_BARRIERS");
+            return env != nullptr && env[0] == '1';
+        }(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,

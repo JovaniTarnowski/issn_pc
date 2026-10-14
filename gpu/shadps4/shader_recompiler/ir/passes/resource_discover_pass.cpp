@@ -241,6 +241,26 @@ SamplerPatchResult CheckClearAnisoRatioAndThresholdPattern(IR::Value value) {
     return {inst->Arg(0), true};
 }
 
+SamplerPatchResult CheckForceUnnormalizedPattern(IR::Value value) {
+    // s_or_b32 s12, s8, 0x8000
+    // is used to force unnormalized texture coordinates (S# FORCE_UNNORMALIZED, bit 15)
+
+    auto* inst = value.TryInst();
+    if (!inst || inst->GetOpcode() != IR::Opcode::BitwiseOr32) {
+        return {value, false};
+    }
+    const bool imm0 = inst->Arg(0).IsImmediate();
+    const bool imm1 = inst->Arg(1).IsImmediate();
+    if (imm0 == imm1) {
+        return {value, false};
+    }
+    const IR::Value imm = imm0 ? inst->Arg(0) : inst->Arg(1);
+    if (imm.U32() != 0x8000u) {
+        return {value, false};
+    }
+    return {imm0 ? inst->Arg(1) : inst->Arg(0), true};
+}
+
 IR::Inst* FindSharpSource(IR::Inst* handle) {
     ASSERT(IsSharpSource(handle));
     return handle;
@@ -344,6 +364,9 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     } else if (auto [ssharp_dw0, found] = CheckClearAnisoRatioAndThresholdPattern(ssharp.dwords[0]);
                found) {
         ssharp.post_op = SharpFetchPostOp::ClearAnisoRatioAndThreshold;
+        ssharp.dwords[0] = ssharp_dw0;
+    } else if (auto [ssharp_dw0, found] = CheckForceUnnormalizedPattern(ssharp.dwords[0]); found) {
+        ssharp.post_op = SharpFetchPostOp::ForceUnnormalizedCoords;
         ssharp.dwords[0] = ssharp_dw0;
     }
 

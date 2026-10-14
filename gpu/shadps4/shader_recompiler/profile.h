@@ -50,6 +50,13 @@ struct Profile {
     /// gow3: NVIDIA without fragment shader barycentrics (Pascal and older).
     bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
+    /// issn: also synchronize LDS accesses of compute workgroups larger than a GCN wave (see
+    /// SharedMemoryBarrierPass), for code relying on the 64 invocations of a wave in lockstep.
+    bool lds_barriers_multi_wave{};
+    /// issn: compute workgroups spanning several host subgroups are synchronized after the
+    /// buffer stores of their uniform loops (see WaveMemoryBarrierPass), for code exchanging data
+    /// through memory within a GCN wave (inFAMOUS Second Son).
+    bool wave_memory_barriers{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
