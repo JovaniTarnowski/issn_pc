@@ -8,3 +8,17 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
   mode (#5126), e518a6515 S_SUBB_U32 SCC wrap (#5031), 282e5c792 S_ADDC_U32 SCC carry-out (#5030),
   fb6367d29 32-bit literals in the high dword of 64-bit floats (#5114), 94e217781 V_BFM_B32 (#5185),
   d1cb90dbb ADDC (#5200), dd43d1cac V_CVT_PK_U8_F32 (#5194), ef08b1e1f V_ALIGNBIT/ALIGNBYTE (#5186).
+
+issn (inFAMOUS Second Son port), changes marked "issn:":
+  Backported from upstream between b4e7ae7 and 2338a06, unchanged: 612713d5 geometry invocation
+  count, 53af37af V_TRUNC_F64, 282f6445 V_MIN_F64, caeb240d Flat VUID-06202, e0cd957a SampleId on
+  the KHR barycentric path, 4c7b287f readlanes before tessellation/ring passes, 3f21ee0b
+  PackedAncillary lowering. By hand: 1a0f5be8 default sampler for S# with undefined fields.
+  From the shadPS4-AYOUB1080p build for inFAMOUS Second Son (github.com/weshayoub92/shadPS4-perf
+  153a5aa7, GPL-2.0-or-later), correctness parts only: legacy multiply in V_MAC/V_MAD_LEGACY_F32,
+  1D image atomics, WaveMemoryBarrierPass and multi-wave LDS barriers (profile flags),
+  FORCE_UNNORMALIZED S# pattern, ISub folding, InverseBallot warning, append buffer lane offset.
+  Not taken yet (performance, tied to that build's scheduler): threaded command recording,
+  readback queue, async graphics pipelines, real occlusion queries, per-draw memoization, the
+  upstream memory tracker and renderer reworks (1eab1796, c6b24ec1, fca10b26) and 8c91be2b,
+  f6cd16e8, e754ce62, 2f40f87b, c6fa48c7, c01ae7e6, bcf083f0, 41c0fca5, 4cbd23ef.

@@ -7,7 +7,7 @@ Port nativo de **inFAMOUS Second Son** (PS4) para Windows, construído sobre a b
 |---|---|
 | Base | `gow3_pc`, branch `main` (commit `11219a1`, 2026-10-14), histórico preservado |
 | Branch de trabalho | `issn` |
-| Jogo alvo | inFAMOUS Second Son, **CUSA00004** (EUA), versão **01.07** (a confirmar com o dump) |
+| Jogo alvo | inFAMOUS Second Son, **CUSA00004** (EUA), versão **01.00** (a versão dos patches e testes do fork do Ayoub) |
 | Plataforma | Windows 10/11 64-bit, Vulkan 1.3 |
 | Referência gráfica | Fork do shadPS4 do Ayoub para o Second Son (60 FPS, 4K, sem os glitches da versão principal) |
 
@@ -38,9 +38,9 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 |---|---|---|---|
 | 0 | Estrutura do projeto, ferramenta de diagnóstico, guia de dump | ✅ feito | |
 | 1 | Dump do jogo e diagnóstico (`tools/issn/inspect_dump.py`) | ⏳ aguardando dump | dump |
-| 2 | Ambiente de build no Windows (MSYS2 CLANG64) e build do `gow3-probe` | a fazer | |
+| 2 | Ambiente de build no Windows (MSYS2 CLANG64) e build do `gow3-probe` | ✅ feito (RX 9060 XT, Vulkan OK) | |
 | 3 | Primeiro boot: implementar as funções que faltam, uma a uma, até a primeira tela | a fazer | 1, 2 |
-| 4 | Gráficos: trazer as correções do fork do Ayoub para `gpu/shadps4` | a fazer | 3 |
+| 4 | Gráficos: trazer as correções do fork do Ayoub para `gpu/shadps4` | 🟡 correções de renderização feitas; desempenho depois | 3 |
 | 5 | Áudio, vídeos (Bink/AvPlayer), controle e saves | a fazer | 3 |
 | 6 | Prólogo jogável (critérios da Alpha) | a fazer | 4, 5 |
 | 7 | Identidade: renomear `gow3` → `issn`, launcher com a cara do Second Son | a fazer | 6 |
@@ -62,6 +62,27 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 3. Funções de serviços online (NP, trophies, PSN) entram como versões "vazias" que respondem
    "offline" ou "ok", como o GOW3 fez em `runtime_services.c`.
 
+### Etapa 4: o que já entrou (gráficos)
+
+O fork do Ayoub é **um commit** sobre o shadPS4 `2338a06` (30/09/2026), com ~14.700 linhas em 92
+arquivos, quase tudo desempenho. O shadPS4 do port está na base `b4e7ae7`, com as mudanças do GOW3.
+Um merge de três vias completo dá 195 conflitos (os dois otimizaram as mesmas peças). Por isso
+entrou primeiro só o que muda a **imagem**:
+
+| Correção | Origem | Para quê |
+|---|---|---|
+| Multiplicação "legacy" em `V_MAC/V_MAD_LEGACY_F32` | Ayoub | 0 × ∞ = 0 como no PS4; sem isso, NaN (pixels pretos ou estourados) |
+| Atomics em imagens 1D | Ayoub | shaders de compute que contam em texturas 1D |
+| Barreiras de memória entre "waves" (`GOW3_WAVE_MEMORY_BARRIERS`) | Ayoub | compute shaders que contam com 64 threads em sincronia; ligado só para o Second Son (`scripts/game_profiles.py`) |
+| S# com campos inválidos → sampler padrão | shadPS4 `1a0f5be8` | evita sampler Vulkan inválido |
+| 7 correções de shader do shadPS4 oficial | shadPS4 | ver `gpu/VENDOR.txt` |
+| Patches do Ayoub com `OriginalHash` | Ayoub | qualidade dinâmica ×2, trava anti-congelamento, lista de luzes maior; resolução e FOV opcionais |
+
+Fica para a fase de desempenho (com o jogo para medir): gravação de comandos em thread própria,
+fila de readback, pipelines assíncronos, occlusion queries reais, e os reworks grandes do
+shadPS4 oficial. O modo PS4 Pro (e o patch do checkerboard) também fica para depois: o port roda
+o jogo no modo PS4 normal.
+
 ### Riscos conhecidos
 
 | Risco | Por que | Plano |
@@ -75,7 +96,7 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 
 - [ ] Dump do jogo (guia: [DUMP.md](DUMP.md)).
 - [ ] Rodar o diagnóstico e enviar `out/issn/issn_report.md`.
-- [ ] Instalar o MSYS2 no PC (para a etapa 2).
+- [x] Instalar o MSYS2 no PC (para a etapa 2).
 
 ## Referências
 

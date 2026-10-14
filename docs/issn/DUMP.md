@@ -14,9 +14,12 @@ digital) e tira uma cópia dele de um PS4 desbloqueado. Este guia mostra como.
 | Um pendrive ou HD externo | Formatado em **exFAT**, com pelo menos **60 GB livres** |
 | Um PC com Windows | Para onde a cópia vai |
 
-**Versão recomendada:** a **atualização mais recente** do jogo instalada no PS4
-(**01.07**, até onde encontrei). A versão americana é a **CUSA00004**; a de outras regiões
-também serve para começar, e a ferramenta de diagnóstico diz qual você tem.
+**Versão recomendada:** a **01.00**, que é a do disco e do jogo base, sem atualização. É a
+versão em que o fork do shadPS4 para o Second Son foi testado, e os patches embutidos do port
+(qualidade, trava anti-congelamento, resolução) conferem os bytes dela. Se o seu PS4 já tem uma
+atualização instalada, tudo bem: no passo 4 faça o dump do **jogo base** e da **atualização**
+separados (o Itemzflow faz os dois), e a gente decide depois qual usar. A versão americana é a
+**CUSA00004**; a europeia é a **CUSA00223**.
 
 ## Passo 1: conferir o firmware
 
@@ -45,8 +48,8 @@ dump, basta ativá-lo uma vez.
 1. Instale o jogo: insira o disco ou baixe a compra digital.
 2. Abra o jogo uma vez para confirmar que ele inicia. Isso também confirma a licença, no caso
    do digital.
-3. Instale a **atualização mais recente** (Opções → Verificar se há atualizações, no ícone
-   do jogo).
+3. Não precisa instalar atualização. Se ela já estiver instalada, não tem problema (veja a
+   versão recomendada, acima).
 4. Espere terminar qualquer cópia ou download em segundo plano.
 
 ## Passo 4: fazer o dump com o Itemzflow

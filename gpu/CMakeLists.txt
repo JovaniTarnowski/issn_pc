@@ -272,6 +272,20 @@ if (WIN32)
         -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
     target_link_libraries(pipeline-binary-cache-test PRIVATE onecore)
 endif()
+# issn: the inFAMOUS Second Son shader fixes on translated GCN code.
+add_executable(issn-shader-fixes-test EXCLUDE_FROM_ALL ../tests/test_issn_shader_fixes.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_definitions(issn-shader-fixes-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(issn-shader-fixes-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(issn-shader-fixes-test PRIVATE gow3gpu)
+target_compile_options(issn-shader-fixes-test PRIVATE -fPIC)
+if (WIN32)
+    target_sources(issn-shader-fixes-test PRIVATE ../src/compat_win.c)
+    target_compile_definitions(issn-shader-fixes-test PRIVATE sigjmp_buf=gow3_jmp_buf)
+    target_compile_options(issn-shader-fixes-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
+    target_link_libraries(issn-shader-fixes-test PRIVATE onecore)
+endif()
 add_executable(pipeline-binary-initialization-test EXCLUDE_FROM_ALL
     ../tests/test_pipeline_binary_initialization.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_compile_definitions(pipeline-binary-initialization-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

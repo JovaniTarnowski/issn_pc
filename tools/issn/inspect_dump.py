@@ -37,6 +37,7 @@ import link_modules  # noqa: E402
 # Title IDs conhecidos de inFAMOUS Second Son (PS4). Outros podem funcionar: o relatório avisa.
 KNOWN_TITLES = {
     'CUSA00004': 'inFAMOUS Second Son (EUA)',
+    'CUSA00223': 'inFAMOUS Second Son (Europa)',
 }
 # Módulos do dump que o pipeline atual já junta ao jogo (scripts/link_modules.py).
 LINKED_BY_DEFAULT = link_modules.DEFAULT_MODULES
