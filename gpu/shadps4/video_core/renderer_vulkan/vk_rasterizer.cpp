@@ -2567,6 +2567,20 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
+        // issn: shadPS4 1a0f5be8: an S# with undefined fields (or a custom border color without
+        // a border color table) gets a default sampler instead of an invalid Vulkan sampler.
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                Regs().ta_bc_base.Address() == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+                        "border_color_type={}, border_color_base={:#x}",
+                        static_cast<u32>(ssharp.max_aniso.Value()),
+                        static_cast<u32>(ssharp.filter_mode.Value()),
+                        static_cast<u32>(ssharp.mip_filter.Value()),
+                        static_cast<u32>(ssharp.border_color_type.Value()),
+                        Regs().ta_bc_base.Address());
+            ssharp = AmdGpu::Sampler{};
+        }
         const auto vk_sampler = texture_cache.GetSampler(
             ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);

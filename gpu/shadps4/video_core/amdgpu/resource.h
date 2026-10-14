@@ -471,7 +471,9 @@ struct Sampler {
     }
 
     bool Valid() const {
-        return true;
+        // issn: shadPS4 1a0f5be8 (S# with undefined fields get a default sampler).
+        return max_aniso.Value() <= AnisoRatio::Sixteen && filter_mode.Value() <= FilterMode::Max &&
+               mip_filter.Value() <= MipFilter::Linear;
     }
 
     bool operator==(const Sampler& other) const noexcept {
