@@ -740,8 +740,25 @@ public:
 
     /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
     /// everything it uses (capture by value): it may run later on the recording thread.
+    /// issn: the recording calls have one producer at a time (the GPU command thread, or the
+    /// draw recording thread after a drain). Two threads inside at once (record_chunk found
+    /// null mid-handoff: inFAMOUS Second Son's spray can) are reported with both names and
+    /// this thread's stack, the first few times.
+    class ProducerGuard {
+    public:
+        explicit ProducerGuard(Scheduler& scheduler) noexcept;
+        ~ProducerGuard();
+        ProducerGuard(const ProducerGuard&) = delete;
+        ProducerGuard& operator=(const ProducerGuard&) = delete;
+
+    private:
+        Scheduler& scheduler;
+        bool owner{};
+    };
+
     template <typename Func>
     void Record(Func&& func) {
+        const ProducerGuard guard{*this};
         if (!recording_threaded || direct_mode) {
             func(current_cmdbuf);
             return;
@@ -769,6 +786,7 @@ public:
     /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
     /// chunk: data and command must share a chunk, which is recycled once executed.
     void ReserveRecordData(size_t bytes) {
+        const ProducerGuard guard{*this};
         if (!IsRecordingDeferred()) {
             return;
         }
@@ -932,6 +950,8 @@ private:
     bool is_rendering = false;
     // gow3: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
+    std::atomic<std::thread::id> producer{};       ///< see ProducerGuard
+    char producer_name[64]{};
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
     std::mutex oversized_mutex;
     std::vector<std::unique_ptr<std::byte[]>> oversized_data; ///< see RecordData

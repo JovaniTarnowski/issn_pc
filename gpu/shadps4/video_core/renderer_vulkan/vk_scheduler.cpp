@@ -6,6 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <cstring>
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#undef near
+#undef far
+#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -263,7 +270,64 @@ void Scheduler::WaitHostCopies() {
     Gow3Copy::WaitAsync();
 }
 
+namespace {
+void PrintStack() {
+#ifdef _WIN32
+    void* frames[32];
+    const USHORT count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(frames[i]), &module) &&
+            module) {
+            GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            std::fprintf(stderr, "    #%u %s+0x%llx\n", i, base ? base + 1 : name,
+                         static_cast<unsigned long long>(address -
+                                                         reinterpret_cast<uintptr_t>(module)));
+        } else {
+            std::fprintf(stderr, "    #%u %p\n", i, frames[i]);
+        }
+    }
+#endif
+}
+} // namespace
+
+Scheduler::ProducerGuard::ProducerGuard(Scheduler& scheduler_) noexcept : scheduler{scheduler_} {
+    const auto self = std::this_thread::get_id();
+    std::thread::id expected{};
+    if (scheduler.producer.compare_exchange_strong(expected, self, std::memory_order_acq_rel)) {
+        owner = true;
+        thread_local const std::string name = Common::GetCurrentThreadName();
+        std::snprintf(scheduler.producer_name, sizeof(scheduler.producer_name), "%s",
+                      name.c_str());
+        return;
+    }
+    if (expected == self) {
+        return; // nested on the same thread
+    }
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 5) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "STOP-WARN: Vulkan recording entered by '%s' while '%s' is inside; stack:\n",
+                 Common::GetCurrentThreadName().c_str(), scheduler.producer_name);
+    PrintStack();
+    std::fflush(stderr);
+}
+
+Scheduler::ProducerGuard::~ProducerGuard() {
+    if (owner) {
+        scheduler.producer.store(std::thread::id{}, std::memory_order_release);
+    }
+}
+
 void Scheduler::KickRecording(bool force) {
+    const ProducerGuard guard{*this};
     if (!recording_threaded) {
         return;
     }
