@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -199,11 +200,42 @@ static int game_path(const char *p) {
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
+/* issn: GOW3_FILE_ALIAS="a.ext=b.ext;c=d": a host file named a.ext (any directory, case
+ * ignored) is opened as b.ext from the same directory when that exists. run.py builds it from
+ * GOW3_VOICE (inFAMOUS Second Son: English voices with another language's text). */
+static void apply_alias(char *path,size_t size) {
+    static char spec[2048];
+    static int loaded;
+    if (!loaded) { const char *e=getenv("GOW3_FILE_ALIAS"); snprintf(spec,sizeof(spec),"%s",e ? e : ""); loaded=1; }
+    if (!spec[0]) return;
+    char *base=path+strlen(path);
+    while (base>path && base[-1]!='/' && base[-1]!='\\') --base;
+    for (const char *entry=spec; *entry;) {
+        const char *end=strchr(entry,';'); if (!end) end=entry+strlen(entry);
+        const char *eq=memchr(entry,'=',(size_t)(end-entry));
+        if (eq && (size_t)(eq-entry)==strlen(base) && !strncasecmp(entry,base,(size_t)(eq-entry))) {
+            char aliased[1024];
+            const size_t dir=(size_t)(base-path), len=(size_t)(end-eq-1);
+            if (dir+len<sizeof(aliased) && dir+len<size) {
+                memcpy(aliased,path,dir); memcpy(aliased+dir,eq+1,len); aliased[dir+len]=0;
+                HostStat s;
+                if (!host_stat(aliased,&s)) {
+                    static int logged;
+                    if (logged++<16) printf("Runtime: file alias %s -> %s\n",base,aliased+dir);
+                    memcpy(path,aliased,dir+len+1);
+                }
+            }
+            return;
+        }
+        entry=*end ? end+1 : end;
+    }
+}
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
+    apply_alias(path,sizeof(path));
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;

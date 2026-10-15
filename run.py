@@ -294,6 +294,19 @@ def main():
         if glyph_style:  # the in-game menu names the buttons the same way
             env['GOW3_GLYPHS'] = glyph_style
             derived.append('GOW3_GLYPHS')
+        voice = env.get('GOW3_VOICE', '').strip().lower()
+        if voice:
+            # inFAMOUS Second Son: the voices of one language under the text of another (the
+            # runtime opens lang_<x>_audio.xpps as lang_<voice>_audio.xpps).
+            others = ('english', 'dutch', 'french', 'german', 'italian', 'polish', 'portuguese',
+                      'russian', 'spanish', 'turkish', 'danish', 'finnish', 'norwegian', 'swedish',
+                      'czech', 'arabic', 'greek')
+            aliases = [f'lang_{x}_audio.xpps=lang_{voice}_audio.xpps' for x in others if x != voice]
+            if env.get('GOW3_FILE_ALIAS'):
+                aliases.insert(0, env['GOW3_FILE_ALIAS'])
+            env['GOW3_FILE_ALIAS'] = ';'.join(aliases)
+            derived.append('GOW3_FILE_ALIAS')
+            print(f'Voices: {voice} (with the text of GOW3_LANGUAGE)', flush=True)
         env['GOW3_DERIVED'] = ','.join(derived)
         # The guest memory pool is committed in full at start: a resolution patch above 1080p
         # can need more than 16 GB of RAM, and the game then closes when the page file cannot grow.

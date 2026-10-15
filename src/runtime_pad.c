@@ -264,10 +264,11 @@ static void play_click(PadData *d) {
 enum { SWIPE_US=250000, SWIPE_TAIL_US=50000 };
 static struct { int active, used; float dx, dy; uint64_t start; uint8_t id; } swipe;
 static float swipe_stick(uint8_t v) { return ((float)v-128.0f)/127.0f; }
-/* issn: two fingers (Second Son: two fingers on the touchpad to lift a tree). R1 with the right
- * click source held: one finger on each half of the touchpad, no click, while both are held;
- * the right stick drags both (up to 1200 units/s). */
-static struct { int active; float x, y; uint64_t last; uint8_t id; } fingers;
+/* issn: two fingers (Second Son: both thumbs on the touchpad to lift a tree). R1 with the right
+ * click source held: one finger on each half of the touchpad and, 50 ms after they land, the
+ * touchpad click, while both are held; the right stick drags both (up to 1200 units/s). */
+enum { FINGERS_CLICK_US=50000 };
+static struct { int active; float x, y; uint64_t last, start; uint8_t id; } fingers;
 static bool play_two_fingers(PadData *d) {
     if (!(d->buttons & CLICK_RIGHT) || !(d->buttons & BTN_R1)) {
         if (fingers.active) printf("Runtime: pad: two fingers lifted\n");
@@ -275,7 +276,7 @@ static bool play_two_fingers(PadData *d) {
         return false;
     }
     if (!fingers.active) {
-        fingers.active=1; fingers.x=0.0f; fingers.y=0.0f; fingers.last=d->timestamp;
+        fingers.active=1; fingers.x=0.0f; fingers.y=0.0f; fingers.last=fingers.start=d->timestamp;
         fingers.id=(uint8_t)(fingers.id+2)&0x7e;
         click.side=-1; swipe.active=0; swipe.used=1;
         printf("Runtime: pad: two fingers on the touchpad\n");
@@ -300,6 +301,7 @@ static bool play_two_fingers(PadData *d) {
                                                 .y=(uint16_t)(y<0 ? 0 : y>942 ? 942 : y),
                                                 .id=(uint8_t)(fingers.id+i)};
     }
+    if (d->timestamp-fingers.start>=FINGERS_CLICK_US) d->buttons|=BTN_TOUCHPAD;
     return true;
 }
 static void play_swipe(PadData *d) {

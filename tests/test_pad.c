@@ -298,10 +298,13 @@ int main(void) {
     data=read_pad();
     assert(data.touch_count==0 && !(data.buttons & BTN_TOUCHPAD));
 
-    /* issn: R1 with the right click source: two fingers, no click, dragged by the right stick. */
+    /* issn: R1 with the right click source: two fingers, then the click, dragged by the right stick. */
     inject(path,"r1 touchpad_right");
     data=read_pad();
     assert(data.touch_count==2 && !(data.buttons & (BTN_TOUCHPAD|BTN_R1)));
+    usleep(60000);
+    data=read_pad();
+    assert(data.touch_count==2 && (data.buttons & BTN_TOUCHPAD) && !(data.buttons & BTN_R1));
     const int x0=data.touches[0].x, x1=data.touches[1].x, y0=data.touches[0].y;
     assert(x0<960 && x1>960 && data.touches[0].id!=data.touches[1].id);
     inject(path,"r1 touchpad_right ry=0");
