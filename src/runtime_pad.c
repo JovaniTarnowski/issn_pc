@@ -11,7 +11,8 @@
  * issn: spray pose (pads without motion sensors). L3+R3 together, or H, turns it on and off:
  * the game reads the pad held sideways (gravity along its side, the orientation turned 90
  * degrees), L1 shakes it, and the right stick turns it to aim (angular velocity). GOW3_SPRAY_SIDE
- * =left holds it the other way up; GOW3_SPRAY_AIM=0 leaves the right stick to the game alone.
+ * =left holds it the other way up; GOW3_SPRAY_AIM=0 leaves the right stick to the game alone;
+ * GOW3_SPRAY_ORIENT=level keeps the orientation level (only gravity turns sideways).
  *
  * issn: the motion sensors of a DualShock 4/DualSense (SDL accelerometer and gyroscope) and the
  * orientation integrated from the gyroscope; scePadSetLightBar colors the pad's light bar. */
@@ -134,12 +135,18 @@ static bool spray_aim(void) {
     if (aim<0) { const char *e=getenv("GOW3_SPRAY_AIM"); aim=!(e && e[0]=='0'); }
     return aim!=0;
 }
+static bool spray_level(void) {
+    static int level=-1;
+    if (level<0) { const char *e=getenv("GOW3_SPRAY_ORIENT"); level=e && !SDL_strcasecmp(e,"level"); }
+    return level!=0;
+}
 static void spray_pose_set(int on) {
     spray_pose=on;
     /* Rotation of -90 (+90 the other side) degrees about z takes the pad's up axis (y) to x. */
     const float s=0.70710678f;
+    const bool turned=on && !spray_level();
     orientation_q[0]=0.0f; orientation_q[1]=0.0f;
-    orientation_q[2]=on ? -spray_side()*s : 0.0f; orientation_q[3]=on ? s : 1.0f;
+    orientation_q[2]=turned ? -spray_side()*s : 0.0f; orientation_q[3]=turned ? s : 1.0f;
     orientation_time=0; spray_time=0;
     printf("Runtime: pad spray pose %s\n",on ? "on (pad held sideways)" : "off");
 }
