@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include "core/emulator_settings.h"
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/info.h"
@@ -106,6 +108,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
+    if (EmulatorSettings.IsDumpShaders()) {
+        // issn: the driver may end the process while compiling: the last one named is the one.
+        std::fprintf(stderr, "Pipeline: creating compute %s\n", debug_str.c_str());
+        std::fflush(stderr);
+    }
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",

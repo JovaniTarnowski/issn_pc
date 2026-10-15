@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include "core/emulator_settings.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -433,6 +435,11 @@ GraphicsPipeline::GraphicsPipeline(
 
     const auto binary_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
         Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
+    if (EmulatorSettings.IsDumpShaders()) {
+        // issn: the driver may end the process while compiling: the last one named is the one.
+        std::fprintf(stderr, "Pipeline: creating graphics %s\n", debug_str.c_str());
+        std::fflush(stderr);
+    }
     auto [pipeline_result, pipe] =
         CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
                                      instance.GetPipelineBinaryGlobalKey(), binary_directory);
