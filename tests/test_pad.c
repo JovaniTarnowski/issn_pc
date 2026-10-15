@@ -274,7 +274,7 @@ int main(void) {
     data=read_pad();
     usleep(20000);
     data=read_pad();
-    assert(data.angular_velocity[0]<-1.5f && !near(data.orientation[0],0.0f,1e-4f));
+    assert(data.angular_velocity[0]>1.5f && !near(data.orientation[0],0.0f,1e-4f));
     inject(path,"l3 r3");
     data=read_pad();
     assert(!spray_pose && !(data.buttons & (BTN_L3|BTN_R3)));

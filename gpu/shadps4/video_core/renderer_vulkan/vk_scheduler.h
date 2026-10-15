@@ -951,6 +951,7 @@ private:
     // gow3: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
     std::atomic<std::thread::id> producer{};       ///< see ProducerGuard
+    std::atomic<u32> producer_tid{};               ///< its native id, for its stack
     char producer_name[64]{};
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
     std::mutex oversized_mutex;

@@ -87,11 +87,14 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::ProcessCommands() {
-    if (num_commands && rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // gow3: commands touch the caches
-    }
     // Process incoming commands with high priority
     while (num_commands) {
+        // gow3: commands touch the caches. issn: drained for each command, inside the loop: a
+        // command queued after a check made outside it ran while the draw recording thread was
+        // still recording (two threads in the Vulkan recorder: inFAMOUS Second Son's spray can).
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+        }
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};

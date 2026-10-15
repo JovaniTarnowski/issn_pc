@@ -162,9 +162,13 @@ static void apply_spray_pose(PadData *d, bool shaking) {
     float w[3]={0.0f,0.0f,0.0f};
     if (spray_aim()) {
         /* The right stick turns the pad: left/right about the vertical (the pad's x now), up/down
-         * about the horizontal axis across it (its y), up to 2 rad/s. */
-        w[0]=-side*2.0f*stick_unit(d->right_x);
-        w[1]=-2.0f*stick_unit(d->right_y);
+         * about the horizontal axis across it (its y), up to 2 rad/s. Signs as the tester played
+         * the spray can (the first ones were backwards on both axes); GOW3_SPRAY_INVERT=1 flips. */
+        static int invert=-1;
+        if (invert<0) { const char *e=getenv("GOW3_SPRAY_INVERT"); invert=e && e[0]=='1'; }
+        const float sign=invert ? -1.0f : 1.0f;
+        w[0]=sign*side*2.0f*stick_unit(d->right_x);
+        w[1]=sign*2.0f*stick_unit(d->right_y);
     }
     memcpy(d->angular_velocity,w,sizeof(w));
     if (spray_time) integrate_orientation(orientation_q,w,(float)(d->timestamp-spray_time)/1e6f);

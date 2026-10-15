@@ -294,6 +294,59 @@ void PrintStack() {
     }
 #endif
 }
+/// The stack of another thread (the one already recording): suspended just long enough to
+/// unwind it (RtlVirtualUnwind), printed after it resumes (it may hold the stdio lock).
+void PrintOtherThreadStack(u32 tid) {
+#ifdef _WIN32
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                   THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!thread) {
+        return;
+    }
+    DWORD64 frames[24]{};
+    int count = 0;
+    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(thread, &context)) {
+            while (count < 24 && context.Rip) {
+                frames[count++] = context.Rip;
+                DWORD64 image_base = 0;
+                auto* entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+                if (!entry) { // leaf function: the return address is at rsp
+                    context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+                    context.Rsp += 8;
+                    continue;
+                }
+                void* handler_data = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
+                                 &handler_data, &establisher, nullptr);
+            }
+        }
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+    for (int i = 0; i < count; ++i) {
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(frames[i]), &module) &&
+            module) {
+            GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            std::fprintf(stderr, "    #%d %s+0x%llx\n", i, base ? base + 1 : name,
+                         static_cast<unsigned long long>(frames[i] -
+                                                         reinterpret_cast<DWORD64>(module)));
+        } else {
+            std::fprintf(stderr, "    #%d 0x%llx\n", i, static_cast<unsigned long long>(frames[i]));
+        }
+    }
+#else
+    (void)tid;
+#endif
+}
 } // namespace
 
 Scheduler::ProducerGuard::ProducerGuard(Scheduler& scheduler_) noexcept : scheduler{scheduler_} {
@@ -301,6 +354,7 @@ Scheduler::ProducerGuard::ProducerGuard(Scheduler& scheduler_) noexcept : schedu
     std::thread::id expected{};
     if (scheduler.producer.compare_exchange_strong(expected, self, std::memory_order_acq_rel)) {
         owner = true;
+        scheduler.producer_tid.store(static_cast<u32>(gettid()), std::memory_order_relaxed);
         thread_local const std::string name = Common::GetCurrentThreadName();
         std::snprintf(scheduler.producer_name, sizeof(scheduler.producer_name), "%s",
                       name.c_str());
@@ -317,6 +371,8 @@ Scheduler::ProducerGuard::ProducerGuard(Scheduler& scheduler_) noexcept : schedu
                  "STOP-WARN: Vulkan recording entered by '%s' while '%s' is inside; stack:\n",
                  Common::GetCurrentThreadName().c_str(), scheduler.producer_name);
     PrintStack();
+    std::fprintf(stderr, "  and the stack of '%s' (inside):\n", scheduler.producer_name);
+    PrintOtherThreadStack(scheduler.producer_tid.load(std::memory_order_relaxed));
     std::fflush(stderr);
 }
 
