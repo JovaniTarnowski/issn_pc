@@ -5,8 +5,13 @@
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
- *   IJKL d-pad (I up, K down, J left, L right), G shake (issn: the motion sensors of a pad
- *   without them, for inFAMOUS Second Son's spray can).
+ *   IJKL d-pad (I up, K down, J left, L right), G shake, H spray pose (issn: the motion
+ *   sensors of a pad without them, for inFAMOUS Second Son's spray can).
+ *
+ * issn: spray pose (pads without motion sensors). L3+R3 together, or H, turns it on and off:
+ * the game reads the pad held sideways (gravity along its side, the orientation turned 90
+ * degrees), L1 shakes it, and the right stick turns it to aim (angular velocity). GOW3_SPRAY_SIDE
+ * =left holds it the other way up; GOW3_SPRAY_AIM=0 leaves the right stick to the game alone.
  *
  * issn: the motion sensors of a DualShock 4/DualSense (SDL accelerometer and gyroscope) and the
  * orientation integrated from the gyroscope; scePadSetLightBar colors the pad's light bar. */
@@ -37,6 +42,8 @@ enum {
     CLICK_LEFT=0x40000000, CLICK_RIGHT=0x80000000,
     /* issn: shakes the pad (motion_shake) while held: keyboard G, or a mapped pad button. */
     SHAKE=0x20000000,
+    /* issn: turns the spray pose on and off (H; L3+R3 together on a pad). */
+    SPRAY_POSE=0x10000000,
 };
 typedef struct { uint16_t x, y; uint8_t id, reserve[3]; } PadTouch;
 typedef struct {
@@ -104,12 +111,58 @@ static void integrate_orientation(float q[4], const float w[3], float dt) {
     if (n>0.0f) for (int i=0;i<4;++i) q[i]/=n;
 }
 
-/* A vertical shake at 6 Hz, 2.5 G around gravity: what shaking a spray can reads like. */
-static void motion_shake(float accel[3], uint64_t now, float scale) {
+/* A shake at 6 Hz, 2.5 G around gravity, along the axis gravity is on (y flat, x in the spray
+ * pose): what shaking a spray can reads like. */
+static void motion_shake_axis(float accel[3], uint64_t now, float scale, int axis, float sign) {
     const float t=(float)(now%1000000u)/1e6f;
-    accel[0]=0.0f;
-    accel[1]=(1.0f+2.5f*sinf(2.0f*3.14159265f*6.0f*t))*STANDARD_GRAVITY*scale;
-    accel[2]=0.0f;
+    accel[0]=accel[1]=accel[2]=0.0f;
+    accel[axis]=sign*(1.0f+2.5f*sinf(2.0f*3.14159265f*6.0f*t))*STANDARD_GRAVITY*scale;
+}
+static void motion_shake(float accel[3], uint64_t now, float scale) { motion_shake_axis(accel,now,scale,1,1.0f); }
+
+/* issn: the spray pose. The pad turned 90 degrees about its z axis (towards the player): its
+ * x axis points up, so gravity reads along +x (-x with GOW3_SPRAY_SIDE=left). */
+static int spray_pose, spray_chord_held;
+static uint64_t spray_time;
+static float spray_side(void) {
+    static float side;
+    if (side==0.0f) { const char *e=getenv("GOW3_SPRAY_SIDE"); side=e && !SDL_strcasecmp(e,"left") ? -1.0f : 1.0f; }
+    return side;
+}
+static bool spray_aim(void) {
+    static int aim=-1;
+    if (aim<0) { const char *e=getenv("GOW3_SPRAY_AIM"); aim=!(e && e[0]=='0'); }
+    return aim!=0;
+}
+static void spray_pose_set(int on) {
+    spray_pose=on;
+    /* Rotation of -90 (+90 the other side) degrees about z takes the pad's up axis (y) to x. */
+    const float s=0.70710678f;
+    orientation_q[0]=0.0f; orientation_q[1]=0.0f;
+    orientation_q[2]=on ? -spray_side()*s : 0.0f; orientation_q[3]=on ? s : 1.0f;
+    orientation_time=0; spray_time=0;
+    printf("Runtime: pad spray pose %s\n",on ? "on (pad held sideways)" : "off");
+}
+static float stick_unit(uint8_t v) {
+    const float x=((float)v-128.0f)/127.0f;
+    return fabsf(x)<0.15f ? 0.0f : x;
+}
+/* Called under lock for each read in the spray pose. */
+static void apply_spray_pose(PadData *d, bool shaking) {
+    const float scale=accel_scale(), side=spray_side();
+    if (shaking) motion_shake_axis(d->acceleration,d->timestamp,scale,0,side);
+    else { d->acceleration[0]=side*STANDARD_GRAVITY*scale; d->acceleration[1]=0.0f; d->acceleration[2]=0.0f; }
+    float w[3]={0.0f,0.0f,0.0f};
+    if (spray_aim()) {
+        /* The right stick turns the pad: left/right about the vertical (the pad's x now), up/down
+         * about the horizontal axis across it (its y), up to 2 rad/s. */
+        w[0]=-side*2.0f*stick_unit(d->right_x);
+        w[1]=-2.0f*stick_unit(d->right_y);
+    }
+    memcpy(d->angular_velocity,w,sizeof(w));
+    if (spray_time) integrate_orientation(orientation_q,w,(float)(d->timestamp-spray_time)/1e6f);
+    spray_time=d->timestamp;
+    memcpy(d->orientation,orientation_q,sizeof(orientation_q));
 }
 
 /* The pad's light bar takes the last color the game set (GOW3_LIGHTBAR=0 leaves it alone); sent
@@ -223,6 +276,7 @@ static const struct { const char *name; uint32_t ps; } ps_names[]={
     {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
     {"options",BTN_OPTIONS}, {"touchpad",CLICK_LEFT}, {"touchpad_left",CLICK_LEFT}, {"touchpad_right",CLICK_RIGHT},
     {"up",BTN_UP}, {"down",BTN_DOWN}, {"left",BTN_LEFT}, {"right",BTN_RIGHT}, {"shake",SHAKE},
+    {"spray_pose",SPRAY_POSE},
 };
 typedef struct { int source; uint32_t ps; } ButtonSource;
 typedef struct { ButtonSource entries[48]; size_t count; } ButtonMap;
@@ -243,8 +297,8 @@ static ButtonMap key_map={{
     {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
     {SDL_SCANCODE_RETURN,BTN_OPTIONS}, {SDL_SCANCODE_TAB,CLICK_LEFT}, {SDL_SCANCODE_BACKSPACE,CLICK_RIGHT},
     {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
-    {SDL_SCANCODE_G,SHAKE},
-},18};
+    {SDL_SCANCODE_G,SHAKE}, {SDL_SCANCODE_H,SPRAY_POSE},
+},19};
 
 static char *trim(char *text) {
     while (*text==' ' || *text=='\t') ++text;
@@ -472,10 +526,21 @@ static void sample(PadData *d) {
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
-    if (d->buttons & SHAKE) {
-        d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
-        motion_shake(d->acceleration,d->timestamp,accel_scale());
+    /* issn: spray pose: L3+R3 together (hidden from the game) or a SPRAY_POSE source toggles it;
+     * in it L1 shakes the can. */
+    const bool chord=(d->buttons & BTN_L3) && (d->buttons & BTN_R3);
+    if (chord || (d->buttons & SPRAY_POSE)) {
+        if (!spray_chord_held) spray_pose_set(!spray_pose);
+        spray_chord_held=1;
+        d->buttons&=~(BTN_L3|BTN_R3|SPRAY_POSE);
+    } else {
+        spray_chord_held=0;
     }
+    if (spray_pose && (d->buttons & BTN_L1)) d->buttons=(d->buttons&~BTN_L1)|SHAKE;
+    const bool shaking=(d->buttons & SHAKE)!=0;
+    d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
+    if (spray_pose) apply_spray_pose(d,shaking);
+    else if (shaking) motion_shake(d->acceleration,d->timestamp,accel_scale());
     play_click(d);
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;

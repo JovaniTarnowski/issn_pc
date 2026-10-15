@@ -250,6 +250,37 @@ int main(void) {
     data=read_pad();
     assert(near(data.acceleration[1],1.0f,1e-3f));
 
+    /* issn: spray pose (pads without sensors): toggled by its source or L3+R3 (both hidden), the
+     * pad reads held sideways; L1 shakes it along that axis; the right stick turns it. */
+    inject(path,"spray_pose");
+    data=read_pad();
+    assert(spray_pose && !(data.buttons & SPRAY_POSE));
+    inject(path,"");
+    data=read_pad();
+    assert(spray_pose && near(data.acceleration[0],1.0f,1e-3f) && near(data.acceleration[1],0.0f,1e-3f));
+    assert(near(data.orientation[2],-0.7071068f,1e-3f) && near(data.orientation[3],0.7071068f,1e-3f));
+    inject(path,"l1");
+    lowest=10.0f; highest=-10.0f;
+    for (int i=0;i<12;++i) {
+        data=read_pad();
+        assert(!(data.buttons & (BTN_L1|SHAKE)));
+        if (data.acceleration[0]<lowest) lowest=data.acceleration[0];
+        if (data.acceleration[0]>highest) highest=data.acceleration[0];
+        usleep(15000);
+    }
+    assert(highest-lowest>2.0f);
+    inject(path,"rx=255");
+    data=read_pad();
+    usleep(20000);
+    data=read_pad();
+    assert(data.angular_velocity[0]<-1.5f && !near(data.orientation[0],0.0f,1e-4f));
+    inject(path,"l3 r3");
+    data=read_pad();
+    assert(!spray_pose && !(data.buttons & (BTN_L3|BTN_R3)));
+    inject(path,"");
+    data=read_pad();
+    assert(near(data.acceleration[1],1.0f,1e-3f) && data.orientation[3]==1.0f);
+
     /* scePadSetLightBar reaches the pad once per color; scePadResetLightBar is user 1's blue. */
     const uint8_t red[3]={255,16,0};
     assert(pad_light_bar(1,red)==0 && led[0]==255 && led[1]==16 && led[2]==0);
@@ -266,5 +297,5 @@ int main(void) {
     SDL_Quit();
     unlink(path);
     puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture, "
-         "motion sensors, orientation, shake, light bar");
+         "motion sensors, orientation, shake, spray pose, light bar");
 }

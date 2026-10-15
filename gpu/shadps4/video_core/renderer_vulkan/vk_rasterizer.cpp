@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <xxhash.h>
@@ -3563,8 +3564,12 @@ void Rasterizer::UpdateDepthStencilState() const {
         if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
             (back_op && regs.depth_control.backface_enable &&
              ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
+            // issn: once; inFAMOUS Second Son hits it on most frames (8,000 lines a minute).
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp "
+                                           "requires op_val; the stencil test will use op_val");
+            }
         }
         dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
                                            back_op ? back.stencil_op_val : back.stencil_test_val);
