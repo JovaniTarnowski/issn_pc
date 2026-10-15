@@ -282,6 +282,22 @@ int main(void) {
     data=read_pad();
     assert(near(data.acceleration[1],1.0f,1e-3f) && data.orientation[3]==1.0f);
 
+    /* issn: right stick + the right click source: a swipe across the touchpad, no click. */
+    inject(path,"ry=0");
+    data=read_pad();
+    inject(path,"ry=0 touchpad_right");
+    int last_y=10000, swiped=0;
+    for (int i=0;i<30;++i) {
+        data=read_pad();
+        assert(!(data.buttons & BTN_TOUCHPAD) && data.right_y==128);
+        if (data.touch_count==1) { assert(data.touches[0].y<=last_y); last_y=data.touches[0].y; ++swiped; }
+        usleep(15000);
+    }
+    assert(swiped>=5 && last_y<300 && !swipe.active);
+    inject(path,"");
+    data=read_pad();
+    assert(data.touch_count==0 && !(data.buttons & BTN_TOUCHPAD));
+
     /* scePadSetLightBar reaches the pad once per color; scePadResetLightBar is user 1's blue. */
     const uint8_t red[3]={255,16,0};
     assert(pad_light_bar(1,red)==0 && led[0]==255 && led[1]==16 && led[2]==0);
@@ -298,5 +314,5 @@ int main(void) {
     SDL_Quit();
     unlink(path);
     puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture, "
-         "motion sensors, orientation, shake, spray pose, light bar");
+         "motion sensors, orientation, shake, spray pose, swipe, light bar");
 }

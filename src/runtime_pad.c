@@ -255,6 +255,40 @@ static void play_click(PadData *d) {
     if (now>=down && now<up) d->buttons|=BTN_TOUCHPAD;
 }
 
+/* issn: a swipe on pads without a touchpad (inFAMOUS Second Son: swipe up to lift a prisoner).
+ * The right stick pushed while the right click source (Back/Select, Backspace) is held: a finger
+ * crosses the touchpad in the stick's direction (one of four) in SWIPE_US, without a click; the
+ * click in progress, if any, is dropped. The right stick is hidden from the game while the
+ * source is held. Stick first, then Select: a swipe with no click at all. */
+enum { SWIPE_US=250000, SWIPE_TAIL_US=50000 };
+static struct { int active, used; float dx, dy; uint64_t start; uint8_t id; } swipe;
+static float swipe_stick(uint8_t v) { return ((float)v-128.0f)/127.0f; }
+static void play_swipe(PadData *d) {
+    const bool source=(d->buttons & CLICK_RIGHT)!=0;
+    if (!source) {
+        swipe.used=0;
+    } else {
+        const float sx=swipe_stick(d->right_x), sy=swipe_stick(d->right_y);
+        if (!swipe.used && sx*sx+sy*sy>0.36f) {
+            swipe.used=1; swipe.active=1; swipe.start=d->timestamp; swipe.id=(uint8_t)(swipe.id+1)&0x7f;
+            if (fabsf(sx)>fabsf(sy)) { swipe.dx=sx>0 ? 1.0f : -1.0f; swipe.dy=0.0f; }
+            else { swipe.dx=0.0f; swipe.dy=sy>0 ? 1.0f : -1.0f; }
+            click.side=-1; /* no click with the swipe */
+            printf("Runtime: pad: touchpad swipe %s\n",swipe.dy<0 ? "up" : swipe.dy>0 ? "down" : swipe.dx<0 ? "left" : "right");
+        }
+        if (swipe.used) d->buttons&=~CLICK_RIGHT;
+        d->right_x=d->right_y=128;
+    }
+    if (!swipe.active) return;
+    const uint64_t t=d->timestamp-swipe.start;
+    if (t>=SWIPE_US+SWIPE_TAIL_US) { swipe.active=0; return; }
+    const float p=t>=SWIPE_US ? 1.0f : (float)t/(float)SWIPE_US;
+    const float x=960.0f+swipe.dx*(p-0.5f)*1400.0f, y=471.0f+swipe.dy*(p-0.5f)*700.0f;
+    if (d->touch_count<2) {
+        d->touches[d->touch_count++]=(PadTouch){.x=(uint16_t)x,.y=(uint16_t)y,.id=swipe.id};
+    }
+}
+
 /* Opens the first gamepad SDL knows about; called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
@@ -562,6 +596,7 @@ static void sample(PadData *d) {
     d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
     if (spray_pose) apply_spray_pose(d,shaking);
     else if (shaking) motion_shake(d->acceleration,d->timestamp,accel_scale());
+    play_swipe(d);
     play_click(d);
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;

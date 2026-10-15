@@ -18,6 +18,9 @@ PROFILES = {
         # the image go black or stale (the game reads compute output the port's barriers miss).
         # Tested on the tester's RX 9060 XT; the exact missing barrier is still to find.
         'GOW3_FULL_BARRIERS': '1',
+        # The game reads rdtsc itself and scales it by sceKernelGetTscFrequency: the host's TSC
+        # and frequency, or it runs several times too fast (runtime_kernel.c).
+        'GOW3_TSC': 'host',
         # Diagnostic, printed only by the watchdog (GOW3_TIMEOUT): the render thread's fence
         # labels (pointer to the table) and the frame fence it waits on (target, label index)
         # in the 01.00 EU eboot (EP9000); the GPU writes those labels with end-of-pipe events.
