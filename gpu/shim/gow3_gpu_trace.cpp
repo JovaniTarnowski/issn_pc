@@ -143,6 +143,23 @@ void WaitEnd(std::uint32_t queue) {
               static_cast<unsigned long long>(NowMs() - wait.since_ms.load()));
     }
 }
+void Dump(const char* what, const std::uint32_t* data, std::uint64_t dwords) {
+    if (!Enabled() || !data) {
+        return;
+    }
+    const std::uint64_t shown = dwords < 128 ? dwords : 128;
+    Event("%s: %llu dwords at %p%s", what, static_cast<unsigned long long>(dwords),
+          static_cast<const void*>(data), shown < dwords ? " (first 128)" : "");
+    for (std::uint64_t at = 0; at < shown; at += 8) {
+        char line[160];
+        int used = std::snprintf(line, sizeof(line), "  +%03llx:",
+                                 static_cast<unsigned long long>(at));
+        for (std::uint64_t i = at; i < shown && i < at + 8 && used < 150; ++i) {
+            used += std::snprintf(line + used, sizeof(line) - used, " %08x", data[i]);
+        }
+        Event("%s", line);
+    }
+}
 } // namespace Gow3GpuTrace
 
 extern "C" void gow3gpu_dump_gpu_state(void) {

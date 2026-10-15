@@ -31,6 +31,8 @@ void ReleaseMem(std::uint32_t vqid, std::uint64_t address, std::uint64_t data,
 void WaitBegin(std::uint32_t queue, std::uint64_t address, std::uint32_t ref, std::uint32_t mask,
                std::uint32_t function, bool memory);
 void WaitEnd(std::uint32_t queue);
+/// GOW3_GPU_TRACE=1: the dwords of a command buffer (at most 128), 8 per line.
+void Dump(const char* what, const std::uint32_t* data, std::uint64_t dwords);
 } // namespace Gow3GpuTrace
 
 extern "C" void gow3gpu_dump_gpu_state(void);

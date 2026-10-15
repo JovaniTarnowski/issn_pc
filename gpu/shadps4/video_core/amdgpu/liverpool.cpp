@@ -1143,6 +1143,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 Gow3GpuTrace::Count(Gow3GpuTrace::CountEos);
+                Gow3GpuTrace::Event("gfx EOS: command %u address %#llx data %#x",
+                                    static_cast<u32>(event_eos->command.Value()),
+                                    static_cast<unsigned long long>(event_eos->Address<u64>()),
+                                    event_eos->DataDWord());
                 if (rasterizer &&
                     rasterizer->RunInOrder(&RunEventWriteEos, event_eos, sizeof(*event_eos))) {
                     NotePendingFences(*event_eos);
@@ -1391,6 +1395,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
+    Gow3GpuTrace::Dump(is_indirect ? "compute indirect buffer" : "compute ring", acb.data(),
+                       acb.size());
     while (!acb.empty()) {
         ProcessCommands();
         if (rasterizer) {
@@ -1437,6 +1443,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        Gow3GpuTrace::Event("compute %u%s packet %#x (%u dwords)", vqid + 1,
+                            is_indirect ? " indirect" : "", static_cast<u32>(opcode),
+                            header->type3.NumWords() + 1);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
