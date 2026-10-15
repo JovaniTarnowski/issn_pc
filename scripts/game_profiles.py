@@ -14,6 +14,10 @@ INFAMOUS_SECOND_SON = ('CUSA00004', 'CUSA00223')
 PROFILES = {
     title: {
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
+        # A full memory barrier around each render pass and dispatch: without it 64x64 tiles of
+        # the image go black or stale (the game reads compute output the port's barriers miss).
+        # Tested on the tester's RX 9060 XT; the exact missing barrier is still to find.
+        'GOW3_FULL_BARRIERS': '1',
         # Diagnostic, printed only by the watchdog (GOW3_TIMEOUT): the render thread's fence
         # labels (pointer to the table) and the frame fence it waits on (target, label index)
         # in the 01.00 EU eboot (EP9000); the GPU writes those labels with end-of-pipe events.

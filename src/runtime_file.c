@@ -51,7 +51,7 @@ typedef struct { int used, host; Listing *dir; size_t position; char path[512]; 
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
-static size_t mount_count, opens, reads, writes, missing;
+static size_t mount_count, opens, reads, writes, missing, read_errors;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
@@ -283,32 +283,45 @@ static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write
 #define host_read read
 #define host_write write
 #endif
-/* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
- * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
- * goes through the handler, which unprotects it (and records the upcoming write). */
-static void touch_for_write(void *buffer,uint64_t size) {
-    if (!size) return;
-    uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
-    for (; p<end; p+=4096) {
-        volatile unsigned char *b=(volatile unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
-        *b=*b;
+/* issn: reads go through a host buffer, then a user-mode copy into guest memory. Reading
+ * straight into it raced with GPU page tracking: a page touched writable could be protected
+ * again before the kernel's copy, which then failed (inFAMOUS Second Son streams geometry from
+ * disk into GPU memory, and a lost read left a scene waiting forever). The copy faults to our
+ * handler like any guest write. offset<0: from the current position. */
+enum { BOUNCE_SIZE=4<<20 };
+static int64_t bounce_read(int h,void *buffer,uint64_t size,int64_t offset) {
+    static _Thread_local unsigned char *bounce;
+    if (!bounce && !(bounce=malloc(BOUNCE_SIZE))) return -ENOMEM;
+    uint64_t done=0;
+    while (done<size) {
+        const uint64_t chunk=size-done<BOUNCE_SIZE ? size-done : BOUNCE_SIZE;
+        const ssize_t n=offset<0 ? host_read(h,bounce,chunk) : pread(h,bounce,chunk,offset+(int64_t)done);
+        if (n<0) return done ? (int64_t)done : -errno;
+        memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
+        done+=(uint64_t)n;
+        if ((uint64_t)n<chunk) break; /* end of file */
     }
+    return (int64_t)done;
+}
+static void note_read_error(int fd,uint64_t size,int64_t offset,int64_t error) {
+    const size_t count=__atomic_add_fetch(&read_errors,1,__ATOMIC_RELAXED);
+    if (count<=20)
+        printf("Runtime: read failed: fd %d, %llu bytes at %lld, error %lld\n",fd,(unsigned long long)size,
+               (long long)offset,(long long)error);
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    touch_for_write(buffer,size);
-    ssize_t n=host_read(h,buffer,size);
-    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+    const int64_t n=bounce_read(h,buffer,size,-1);
+    if (n<0) { note_read_error(fd,size,-1,n); return n; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    const int64_t n=bounce_read(h,buffer,size,offset);
+    if (n<0) { note_read_error(fd,size,offset,n); return n; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -514,7 +527,7 @@ int64_t runtime_file_fstat(int fd,void *s) { return do_fstat(fd,s); }
 int64_t runtime_file_getdents(int fd,char *b,uint64_t n,int64_t *base) { return do_getdents(fd,b,n,base); }
 int runtime_file_translate(const char *guest,char *out,size_t size) { return translate(guest,out,size); }
 void runtime_file_report(void) {
-    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
-           opens,reads,(unsigned long long)bytes_read,writes,missing);
+    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu, read errors=%zu\n",
+           opens,reads,(unsigned long long)bytes_read,writes,missing,read_errors);
 }
 
