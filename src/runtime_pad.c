@@ -620,8 +620,32 @@ static ABI int32_t pad_reset_light_bar(int32_t handle) {
     static const uint8_t user1[3]={0,0,255};
     return pad_light_bar(handle,user1);
 }
+/* issn: what the game asks of the motion sensors (the spray can), logged when it changes. */
+static void log_motion_call(const char *what, int value) {
+    static int last[3]={-1,-1,-1};
+    static unsigned resets;
+    const int slot=!strcmp(what,"motion sensors") ? 0 : !strcmp(what,"tilt correction") ? 1 :
+                   !strcmp(what,"angular velocity deadband") ? 2 : -1;
+    if (slot<0) {
+        if (++resets<=20) printf("Runtime: pad: game reset the orientation (%u)%s\n",resets,
+                                  spray_pose ? " in the spray pose" : "");
+        return;
+    }
+    if (last[slot]==value) return;
+    last[slot]=value;
+    printf("Runtime: pad: game set %s %s%s\n",what,value ? "on" : "off",spray_pose ? " (spray pose on)" : "");
+}
+static ABI int32_t pad_tilt_correction(int32_t handle, uint8_t enable) {
+    log_motion_call("tilt correction",enable!=0);
+    return pad_ok_handle(handle);
+}
+static ABI int32_t pad_deadband(int32_t handle, uint8_t enable) {
+    log_motion_call("angular velocity deadband",enable!=0);
+    return pad_ok_handle(handle);
+}
 static ABI int32_t pad_motion_sensor_state(int32_t handle, uint8_t enable) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    log_motion_call("motion sensors",enable!=0);
     pthread_mutex_lock(&lock);
     motion_enabled=enable!=0;
     pthread_mutex_unlock(&lock);
@@ -629,6 +653,7 @@ static ABI int32_t pad_motion_sensor_state(int32_t handle, uint8_t enable) {
 }
 static ABI int32_t pad_reset_orientation(int32_t handle) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    log_motion_call("reset",0);
     pthread_mutex_lock(&lock);
     orientation_q[0]=orientation_q[1]=orientation_q[2]=0.0f; orientation_q[3]=1.0f;
     orientation_time=0;
@@ -649,7 +674,7 @@ static const RuntimeExport exports[]={
     {"scePadReadState",pad_read_state}, {"scePadRead",pad_read},
     {"scePadGetControllerInformation",pad_info}, {"scePadSetVibration",pad_vibration},
     {"scePadResetOrientation",pad_reset_orientation},
-    {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
+    {"scePadSetAngularVelocityDeadbandState",pad_deadband}, {"scePadSetTiltCorrectionState",pad_tilt_correction},
     {"scePadSetMotionSensorState",pad_motion_sensor_state},
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
