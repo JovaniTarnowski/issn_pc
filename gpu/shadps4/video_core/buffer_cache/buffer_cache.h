@@ -128,6 +128,17 @@ private:
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
+public:
+    /// issn: `size` cut so that [addr, addr + size) ends within the second arena page from the
+    /// one holding addr (a request may span two). With the 1 GiB pages of drivers whose buffers
+    /// stop short of 4 GiB (AMD on Windows), a guest buffer of "all memory" spans more.
+    [[nodiscard]] u64 ClampToArenas(VAddr addr, u64 size) const noexcept {
+        const u64 limit = (((addr >> arena_page_bits) + 2) << arena_page_bits) - addr;
+        return size < limit ? size : limit;
+    }
+
+private:
+
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
