@@ -14,6 +14,10 @@ INFAMOUS_SECOND_SON = ('CUSA00004', 'CUSA00223')
 PROFILES = {
     title: {
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
+        # Diagnostic, printed only by the watchdog (GOW3_TIMEOUT): the render thread's fence
+        # labels (pointer to the table) and the frame fence it waits on (target, label index)
+        # in the 01.00 EU eboot (EP9000); the GPU writes those labels with end-of-pipe events.
+        'GOW3_WATCHDOG_PEEK': '0x11c0380,0x4ec7310',
     }
     for title in INFAMOUS_SECOND_SON
 }

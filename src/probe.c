@@ -298,6 +298,26 @@ static void fault(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
+/* issn: what the watchdog adds after the thread stacks: the GPU emulation's state (which queue
+ * waits on what, the last fences) and GOW3_WATCHDOG_PEEK, comma-separated image offsets whose
+ * qwords are printed (a game's fence table; set by scripts/game_profiles.py). */
+static size_t image_size_for_watchdog;
+static void watchdog_extra(void) {
+    if (gpu_enabled) gow3gpu_dump_gpu_state();
+    const char *peek=getenv("GOW3_WATCHDOG_PEEK");
+    while (peek && *peek && image) {
+        char *end;
+        const unsigned long long offset=strtoull(peek,&end,0);
+        if (end==peek) break;
+        if (offset+8<=image_size_for_watchdog) {
+            uint64_t value;
+            memcpy(&value,image+offset,sizeof(value));
+            fprintf(stderr,"peek image+0x%llx = 0x%016llx\n",offset,(unsigned long long)value);
+        }
+        peek=*end==',' ? end+1 : end;
+    }
+    fflush(NULL);
+}
 #ifndef _WIN32
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
@@ -342,11 +362,11 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
             at+=d->reclen;
         }
     usleep(100000);
+    watchdog_extra();
     _exit(128 + sig);
 }
 #endif
 #ifdef _WIN32
-static size_t image_size_for_watchdog;
 static DWORD WINAPI watchdog_thread(void *arg) {
     Sleep(*(unsigned *)arg*1000u);
     static ThreadSnapshot snaps[256];
@@ -363,7 +383,7 @@ static DWORD WINAPI watchdog_thread(void *arg) {
                 fprintf(stderr,"    #%u host  0x%016llx\n",d,(unsigned long long)rip);
         }
     }
-    fflush(NULL);
+    watchdog_extra();
     _exit(124);
     return 0;
 }
@@ -873,9 +893,7 @@ int main(int argc, char **argv) {
     /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
     image = allocate(round_page(size) + stub_area);
-#ifdef _WIN32
     image_size_for_watchdog=size;
-#endif
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);

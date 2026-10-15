@@ -19,8 +19,10 @@ class GameProfileTests(unittest.TestCase):
     def test_second_son_gets_wave_barriers(self):
         with tempfile.TemporaryDirectory() as tmp:
             for title in ('CUSA00004', 'CUSA00223'):
-                self.assertEqual(game_profiles.environment(game(tmp, title), {}),
-                                 (title, {'GOW3_WAVE_MEMORY_BARRIERS': '1'}))
+                found, env = game_profiles.environment(game(tmp, title), {})
+                self.assertEqual(found, title)
+                self.assertEqual(env['GOW3_WAVE_MEMORY_BARRIERS'], '1')
+                self.assertIn('GOW3_WATCHDOG_PEEK', env)
 
     def test_other_games_get_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -29,7 +31,8 @@ class GameProfileTests(unittest.TestCase):
     def test_explicit_values_and_opt_out_win(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = game(tmp, 'CUSA00004')
-            self.assertEqual(game_profiles.environment(folder, {'GOW3_WAVE_MEMORY_BARRIERS': '0'})[1], {})
+            self.assertNotIn('GOW3_WAVE_MEMORY_BARRIERS',
+                             game_profiles.environment(folder, {'GOW3_WAVE_MEMORY_BARRIERS': '0'})[1])
             self.assertEqual(game_profiles.environment(folder, {'GOW3_GAME_PROFILE': '0'})[1], {})
 
     def test_missing_sfo(self):

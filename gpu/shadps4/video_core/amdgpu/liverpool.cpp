@@ -24,6 +24,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "gow3_write_log.h"
+#include "gow3_gpu_trace.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -119,6 +120,7 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             const auto idle_start = std::chrono::steady_clock::now();
+            Gow3GpuTrace::SetPhase(Gow3GpuTrace::Idle);
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
@@ -131,6 +133,7 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
 
+        Gow3GpuTrace::SetPhase(Gow3GpuTrace::Processing);
         VideoCore::StartCapture();
 
         curr_qid = -1;
@@ -181,7 +184,9 @@ void Liverpool::Process(std::stop_token stoken) {
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
         if (rasterizer) {
+            Gow3GpuTrace::SetPhase(Gow3GpuTrace::EndDrain);
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+            Gow3GpuTrace::SetPhase(Gow3GpuTrace::EndDeferred);
             rasterizer->WaitDeferredSignals();
         }
         {
@@ -249,6 +254,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             Gow3WriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, Gow3WriteLog::Fence);
+            Gow3GpuTrace::EopWritten(reinterpret_cast<u64>(address), data, num_bytes);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
@@ -1136,6 +1142,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                Gow3GpuTrace::Count(Gow3GpuTrace::CountEos);
                 if (rasterizer &&
                     rasterizer->RunInOrder(&RunEventWriteEos, event_eos, sizeof(*event_eos))) {
                     NotePendingFences(*event_eos);
@@ -1144,6 +1151,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                Gow3GpuTrace::EopDecoded(reinterpret_cast<u64>(event_eop->Address<u32>()),
+                                         event_eop->DataQWord(),
+                                         static_cast<u32>(event_eop->data_sel.Value()),
+                                         static_cast<u32>(event_eop->int_sel.Value()));
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop))) {
                         NotePendingFences(*event_eop);
@@ -1171,6 +1182,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 ASSERT(!write_data->wr_one_addr.Value());
+                Gow3GpuTrace::Count(Gow3GpuTrace::CountWriteData);
+                Gow3GpuTrace::Event("gfx WriteData: address %#llx first dword %#x (%u dwords)",
+                                    static_cast<unsigned long long>(write_data->Address<u64>()),
+                                    write_data->data[0], count - 2);
                 if (rasterizer) {
                     // In order with the draws (on the draw recording thread when in use).
                     Gow3WriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,
@@ -1250,6 +1265,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                const bool memory_wait =
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    Gow3GpuTrace::WaitBegin(
+                        0, memory_wait ? wait_reg_mem->Address<VAddr>() : wait_reg_mem->Reg(),
+                        wait_reg_mem->ref, wait_reg_mem->mask,
+                        static_cast<u32>(wait_reg_mem->function.Value()), memory_wait);
+                }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
@@ -1257,6 +1280,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     YIELD_GFX();
                 }
+                Gow3GpuTrace::WaitEnd(0);
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
@@ -1595,9 +1619,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            const bool memory_wait =
+                wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                Gow3GpuTrace::WaitBegin(
+                    vqid + 1, memory_wait ? wait_reg_mem->Address<VAddr>() : wait_reg_mem->Reg(),
+                    wait_reg_mem->ref, wait_reg_mem->mask,
+                    static_cast<u32>(wait_reg_mem->function.Value()), memory_wait);
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
+            Gow3GpuTrace::WaitEnd(vqid + 1);
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
@@ -1608,6 +1641,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            Gow3GpuTrace::ReleaseMem(vqid + 1, release_mem->Address<VAddr>(),
+                                     release_mem->data_lo | u64(release_mem->data_hi) << 32,
+                                     static_cast<u32>(release_mem->data_sel.Value()));
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
@@ -1695,6 +1731,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         auto task = ProcessGraphics(dcb, ccb, seq);
         queue.submits.emplace(task.handle);
     }
+    Gow3GpuTrace::Count(Gow3GpuTrace::CountGfxSubmit);
+    Gow3GpuTrace::Event("gfx submit: dcb %p %zu dwords, ccb %zu dwords",
+                        static_cast<const void*>(dcb.data()), dcb.size(), ccb.size());
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
@@ -1707,6 +1746,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    Gow3GpuTrace::Count(Gow3GpuTrace::CountAscSubmit);
+    Gow3GpuTrace::Event("compute submit: queue %u acb %p %zu dwords", gnm_vqid,
+                        static_cast<const void*>(acb.data()), acb.size());
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
