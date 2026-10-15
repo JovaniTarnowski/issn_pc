@@ -24,6 +24,7 @@ import argparse
 import collections
 import gzip
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -132,6 +133,7 @@ def run_probe(probe, game, out, modules):
     """Prepara a imagem com os scripts do port e roda o carregador com --check-imports."""
     out.mkdir(parents=True, exist_ok=True)
     python = sys.executable
+    env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}  # the scripts print game titles
     steps = [
         [python, str(REPO / 'scripts' / 'prepare.py'), str(game), '--out', str(out)],
         [python, str(REPO / 'scripts' / 'link_modules.py'), str(game), '--out', str(out), '--modules', *modules],
@@ -141,7 +143,7 @@ def run_probe(probe, game, out, modules):
     for command in steps:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
-                                timeout=600)
+                                timeout=600, env=env)
         log.append(f'$ {" ".join(command)}\n{result.stdout}(saída {result.returncode})')
         if result.returncode and command is not steps[-1]:
             break
@@ -154,7 +156,12 @@ def main():
     parser.add_argument('--out', type=Path, default=REPO / 'out' / 'issn', help='onde gravar o relatório')
     parser.add_argument('--probe', type=Path, help='gow3-probe.exe para a verificação definitiva')
     args = parser.parse_args()
-    sys.stdout.reconfigure(errors='replace')
+    # The report is UTF-8 (Portuguese, the ✅/❌ marks): a pipe or file gets UTF-8 whatever the
+    # code page (Windows Pythons write ANSI to pipes); a console shows it as is.
+    if sys.stdout.isatty():
+        sys.stdout.reconfigure(errors='replace')
+    else:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     game, out = args.game, args.out
     out.mkdir(parents=True, exist_ok=True)
     problems, notes = [], []

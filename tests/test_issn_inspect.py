@@ -1,5 +1,6 @@
 """tools/issn/inspect_dump.py em um dump sintético (sem arquivos do jogo)."""
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -87,8 +88,10 @@ class InspectTests(unittest.TestCase):
         return game
 
     def run_tool(self, game, out):
+        # cp1252: what a pipe gets on a Windows Python (its ANSI code page), not UTF-8.
+        env = {**os.environ, 'PYTHONIOENCODING': 'cp1252'}
         result = subprocess.run([sys.executable, str(TOOL), str(game), '--out', str(out)],
-                                capture_output=True, text=True, encoding='utf-8')
+                                capture_output=True, text=True, encoding='utf-8', env=env)
         return result, json.loads((out / 'issn_report.json').read_text(encoding='utf-8'))
 
     def test_classifies_every_import(self):
