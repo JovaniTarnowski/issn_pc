@@ -433,13 +433,21 @@ static DWORD WINAPI watchdog_thread(void *arg) {
      * on). */
     const unsigned seconds=*(unsigned *)arg;
     uint64_t last_frames=0;
-    for (unsigned still=0; !seconds || still<seconds;) {
-        Sleep(1000);
+    int f10_was_down=0;
+    for (unsigned still=0, tick=0; !seconds || still<seconds;) {
+        Sleep(100);
+        /* F10 read here too: a game waiting on a stream may stop reading its pad, so the pad
+         * code would never see it. */
+        const int f10=(GetAsyncKeyState(VK_F10)&0x8000)!=0;
+        if (f10 && !f10_was_down) runtime_snapshot_request=1;
+        f10_was_down=f10;
         if (runtime_snapshot_request) {
             runtime_snapshot_request=0;
             print_thread_stacks("F10 snapshot");
             if (gpu_enabled) gow3gpu_dump_gpu_state();
         }
+        if (++tick<10) continue;
+        tick=0;
         const uint64_t frames=gpu_enabled ? gow3gpu_frame_count() : 0;
         if (frames!=last_frames) { last_frames=frames; still=0; }
         else ++still;
