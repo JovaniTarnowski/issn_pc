@@ -37,9 +37,9 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 | # | Etapa | Status | Depende de |
 |---|---|---|---|
 | 0 | Estrutura do projeto, ferramenta de diagnóstico, guia de dump | ✅ feito | |
-| 1 | Dump do jogo e diagnóstico (`tools/issn/inspect_dump.py`) | ⏳ aguardando dump | dump |
+| 1 | Dump do jogo e diagnóstico (`tools/issn/inspect_dump.py`) | ✅ feito: CUSA00004 01.00 (digital EU, `EP9000`), 497 funções, 0 faltando | dump |
 | 2 | Ambiente de build no Windows (MSYS2 CLANG64) e build do `issn-probe` | ✅ feito (RX 9060 XT, Vulkan OK) | |
-| 3 | Primeiro boot: implementar as funções que faltam, uma a uma, até a primeira tela | a fazer | 1, 2 |
+| 3 | Primeiro boot: implementar as funções que faltam, uma a uma, até a primeira tela | 🟡 o código do jogo roda até ler `art/` (threads, memória de vídeo, troféus) | 1, 2 |
 | 4 | Gráficos: trazer as correções do fork do Ayoub para `gpu/shadps4` | 🟡 correções de renderização feitas; desempenho depois | 3 |
 | 5 | Áudio, vídeos (Bink/AvPlayer), controle e saves | a fazer | 3 |
 | 6 | Prólogo jogável (critérios da Alpha) | a fazer | 4, 5 |
@@ -61,6 +61,29 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 2. Rodar o jogo. A cada `STOP:` ou `Fault:` no `user/last_run.log`, implementar ou corrigir.
 3. Funções de serviços online (NP, trophies, PSN) entram como versões "vazias" que respondem
    "offline" ou "ok", como o GOW3 fez em `runtime_services.c`.
+
+### Etapa 3: o que o primeiro boot ensinou
+
+O executável do Second Son (SDK 1.50, 2014) é **ET_SCE_EXEC**: ligado em 0x400000, enquanto o do
+God of War III Remastered é relocável (ET_SCE_DYNEXEC). Diferenças que travavam e já foram
+resolvidas:
+
+| Problema | Correção |
+|---|---|
+| `libc.prx` antiga: relocação DTPMOD64 de um símbolo TLS que ela mesma exporta | `link_modules.py` aceita (é o bloco TLS do próprio módulo) |
+| `link_libc.py` (linker antigo, saída não usada) rejeitava símbolos de nome comum | `run.py` não o chama mais |
+| O ponteiro de thread (`mov r64, fs:[0]`) lido com 10 registradores, não só `rax` | reescrita das 16 formas (3.392 lugares) no Linux e no Windows |
+| Funções que o runtime implementa pelo nome só eram achadas se o GOW3 as importasse | `src/runtime_export_nids.inc` (gerado): NID#biblioteca de cada nome exportado |
+| 17 funções sem implementação | event flags do kernel (de verdade, com teste de threads), PlayGo, HTTP/NetCtl offline, NP, DLC, SystemService |
+| Endereços de patch de um executável em 0x400000 | `patches.py` usa base 0 nesse caso; patch fora do executável é pulado, não fatal |
+
+Até onde chega (Linux, GPU por software, só com o executável): `libc` e `Fios2` iniciam, o jogo
+cria as threads de arquivo, as 5 `JobWorker`, a de troféus, aloca 4 GB de memória de vídeo e lê
+`art/`. Próximo passo: rodar com o dump inteiro no Windows.
+
+Os patches do fork do Ayoub são de **outro build** da 01.00 (o dump é o digital europeu): todas
+as linhas são puladas pelo `OriginalHash`. Para usá-los neste build, é preciso achar os mesmos
+pontos no código dele (assinaturas).
 
 ### Etapa 4: o que já entrou (gráficos)
 

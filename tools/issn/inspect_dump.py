@@ -67,11 +67,26 @@ def load_names():
 
 
 def implemented_sets():
-    """(runtime, gpu): conjuntos de 'NID#biblioteca' que o código do port resolve."""
-    runtime, gpu = set(), set()
+    """(runtime, runtime_nids, gpu): 'NID#biblioteca' que o código do port resolve, e os NIDs das
+    funções que o runtime exporta pelo nome (qualquer biblioteca: src/runtime_export_nids.inc)."""
+    runtime, runtime_nids, gpu = set(), set(), set()
     for path in (REPO / 'src').glob('*.c'):
         for nid, library in NID_RE.findall(path.read_text(encoding='utf-8', errors='replace')):
             runtime.add(f'{nid}#{canonical_library(library)}')
+    # Exported by name and found through import_names.inc (runtime_symbol reads both tables).
+    sys.path.insert(0, str(REPO / 'tools' / 'issn'))
+    import gen_export_nids
+    exported = set(gen_export_nids.exported_names())
+    names_inc = REPO / 'src' / 'import_names.inc'
+    if names_inc.is_file():
+        for scoped, symbol in re.findall(r'\{"([^"#]+#[^"]+)","([^"]+)"\}', names_inc.read_text(encoding='utf-8')):
+            if symbol in exported:
+                code, library = scoped.split('#', 1)
+                runtime.add(f'{code}#{canonical_library(library)}')
+    exports = REPO / 'src' / 'runtime_export_nids.inc'
+    if exports.is_file():
+        runtime.update(f'{code}#{canonical_library(library)}' for code, library in
+                       re.findall(r'\{"([A-Za-z0-9+-]{11})#([A-Za-z0-9_]+)","', exports.read_text(encoding='utf-8')))
     for folder in (REPO / 'gpu' / 'shadps4', REPO / 'gpu' / 'shim'):
         for path in folder.rglob('*.cpp'):
             text = path.read_text(encoding='utf-8', errors='replace')
@@ -79,7 +94,7 @@ def implemented_sets():
                 gpu.add(f'{nid}#{canonical_library(library)}')
             for nid, library in NID_RE.findall(text):
                 gpu.add(f'{nid}#{canonical_library(library)}')
-    return runtime, gpu
+    return runtime, runtime_nids, gpu
 
 
 def file_kind(path):
@@ -217,7 +232,7 @@ def main():
 
     # 2. Imports do jogo e de onde cada um viria
     names = load_names()
-    runtime, gpu = implemented_sets()
+    runtime, runtime_nids, gpu = implemented_sets()
     eboot_imports, _, needed_modules = imports_and_exports(game / 'eboot.bin')
     report['needed_modules'] = needed_modules
     module_exports = {}
@@ -243,12 +258,14 @@ def main():
             if key in seen:
                 continue
             seen.add(key)
-            if key in runtime:
+            if key in runtime or nid in runtime_nids:
                 source = 'runtime'
             elif key in gpu:
                 source = 'gpu'
-            elif key in module_exports:
-                source = 'modulo' if module_exports[key] in linked else f'modulo:{module_exports[key]}'
+            elif key in module_exports or (library == 'libSceLibcInternal' and f'{nid}#libc' in module_exports):
+                # link_modules.py serves libSceLibcInternal (not shipped) with libc.prx's same-NID exports.
+                owner = module_exports.get(key) or module_exports[f'{nid}#libc']
+                source = 'modulo' if owner in linked else f'modulo:{owner}'
             else:
                 source = 'FALTA'
             rows.append(dict(nid=nid, library=library, name=names.get(nid, '?'), data=is_data,
