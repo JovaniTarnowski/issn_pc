@@ -259,11 +259,51 @@ static void play_click(PadData *d) {
  * The right stick pushed while the right click source (Back/Select, Backspace) is held: a finger
  * crosses the touchpad in the stick's direction (one of four) in SWIPE_US, without a click; the
  * click in progress, if any, is dropped. The right stick is hidden from the game while the
- * source is held. Stick first, then Select: a swipe with no click at all. */
+ * source is held. Stick first, then Select: a swipe with no click at all. R1 with it: two
+ * fingers (play_two_fingers). */
 enum { SWIPE_US=250000, SWIPE_TAIL_US=50000 };
 static struct { int active, used; float dx, dy; uint64_t start; uint8_t id; } swipe;
 static float swipe_stick(uint8_t v) { return ((float)v-128.0f)/127.0f; }
+/* issn: two fingers (Second Son: two fingers on the touchpad to lift a tree). R1 with the right
+ * click source held: one finger on each half of the touchpad, no click, while both are held;
+ * the right stick drags both (up to 1200 units/s). */
+static struct { int active; float x, y; uint64_t last; uint8_t id; } fingers;
+static bool play_two_fingers(PadData *d) {
+    if (!(d->buttons & CLICK_RIGHT) || !(d->buttons & BTN_R1)) {
+        if (fingers.active) printf("Runtime: pad: two fingers lifted\n");
+        fingers.active=0;
+        return false;
+    }
+    if (!fingers.active) {
+        fingers.active=1; fingers.x=0.0f; fingers.y=0.0f; fingers.last=d->timestamp;
+        fingers.id=(uint8_t)(fingers.id+2)&0x7e;
+        click.side=-1; swipe.active=0; swipe.used=1;
+        printf("Runtime: pad: two fingers on the touchpad\n");
+    }
+    const float dt=(float)(d->timestamp-fingers.last)/1e6f;
+    fingers.last=d->timestamp;
+    float sx=swipe_stick(d->right_x), sy=swipe_stick(d->right_y);
+    if (fabsf(sx)<0.15f) sx=0.0f;
+    if (fabsf(sy)<0.15f) sy=0.0f;
+    fingers.x+=sx*1200.0f*dt; fingers.y+=sy*1200.0f*dt;
+    if (fingers.x<-400.0f) fingers.x=-400.0f;
+    if (fingers.x>400.0f) fingers.x=400.0f;
+    if (fingers.y<-400.0f) fingers.y=-400.0f;
+    if (fingers.y>400.0f) fingers.y=400.0f;
+    d->buttons&=~(CLICK_RIGHT|BTN_R1);
+    d->right_x=d->right_y=128;
+    const float base[2]={520.0f,1400.0f};
+    d->touch_count=0;
+    for (int i=0;i<2;++i) {
+        const float x=base[i]+fingers.x, y=471.0f+fingers.y;
+        d->touches[d->touch_count++]=(PadTouch){.x=(uint16_t)(x<0 ? 0 : x>1919 ? 1919 : x),
+                                                .y=(uint16_t)(y<0 ? 0 : y>942 ? 942 : y),
+                                                .id=(uint8_t)(fingers.id+i)};
+    }
+    return true;
+}
 static void play_swipe(PadData *d) {
+    if (play_two_fingers(d)) return;
     const bool source=(d->buttons & CLICK_RIGHT)!=0;
     if (!source) {
         swipe.used=0;
