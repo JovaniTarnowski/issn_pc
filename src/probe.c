@@ -406,7 +406,19 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
 #endif
 #ifdef _WIN32
 static DWORD WINAPI watchdog_thread(void *arg) {
-    Sleep(*(unsigned *)arg*1000u);
+    /* issn: with the GPU the timeout counts seconds without a new frame (a hang, as the game
+     * freezing on a scene while its music plays), not the total time; before the GPU starts and
+     * without it, from the start. */
+    const unsigned seconds=*(unsigned *)arg;
+    uint64_t last_frames=0;
+    for (unsigned still=0; still<seconds;) {
+        Sleep(1000);
+        const uint64_t frames=gpu_enabled ? gow3gpu_frame_count() : 0;
+        if (frames!=last_frames) { last_frames=frames; still=0; }
+        else ++still;
+    }
+    if (gpu_enabled) fprintf(stderr,"STOP: no new frame for %u seconds (frame %llu)\n",seconds,
+                             (unsigned long long)last_frames);
     static ThreadSnapshot snaps[256];
     const size_t n=runtime_thread_snapshot(snaps,sizeof(snaps)/sizeof(*snaps));
     fprintf(stderr,"STOP: watchdog timeout; thread stacks (%zu guest threads):\n",n);

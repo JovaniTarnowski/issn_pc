@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <unordered_set>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "gow3_toggles.h"
@@ -2208,8 +2210,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     vsharp.base_address,
                     memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
                 if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                    // issn: once per shader; every bind of a clamped buffer logged it (167,000
+                    // lines in a few minutes of inFAMOUS Second Son).
+                    static std::mutex clamp_lock;
+                    static std::unordered_set<u64> clamp_logged;
+                    std::scoped_lock lk{clamp_lock};
+                    if (clamp_logged.insert(stage.pgm_hash).second) {
+                        LOG_WARNING(Render, "Clamped size from {} to {} for stage {:#x}",
+                                    vsharp.GetSize(), size, stage.pgm_hash);
+                    }
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);

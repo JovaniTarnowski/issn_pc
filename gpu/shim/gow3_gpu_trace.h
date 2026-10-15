@@ -36,3 +36,4 @@ void Dump(const char* what, const std::uint32_t* data, std::uint64_t dwords);
 } // namespace Gow3GpuTrace
 
 extern "C" void gow3gpu_dump_gpu_state(void);
+extern "C" std::uint64_t gow3gpu_frame_count(void);

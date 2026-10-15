@@ -26,6 +26,8 @@ int gow3gpu_handle_fault(void *ucontext, void *address);
 void gow3gpu_dump_guest_writes(void *ucontext);
 /* issn: the GPU emulation's state for the watchdog: queue waits, last fences, counters. */
 void gow3gpu_dump_gpu_state(void);
+/* issn: frames the guest has finished (sceGnmSubmitDone calls), for the hang watchdog. */
+uint64_t gow3gpu_frame_count(void);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int gow3gpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);

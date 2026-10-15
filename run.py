@@ -165,7 +165,12 @@ def main():
     graphics, reverted = graphics_options.prepare(env['GOW3_CONFIG'], out / 'graphics_state.json')
     if reverted:
         print('Graphics: the last restart never reached the game; previous options restored', flush=True)
-    env.update(graphics_options.environment(graphics))
+    # issn: a variable set by hand (a test run) wins over issn.ini; the ones taken from the ini
+    # are derived, so a restart from the in-game menu takes the ini's new values.
+    for key, value in graphics_options.environment(graphics).items():
+        if key not in env:
+            env[key] = value
+            derived.append(key)
     if not env.get('GOW3_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['GOW3_FSR411_DIR'] = str(data / 'fsr4_411')
 
