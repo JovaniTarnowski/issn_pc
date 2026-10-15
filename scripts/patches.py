@@ -69,18 +69,26 @@ def find_pattern(image, pattern, limit=2):
     return found
 
 
-def locate(image, element, prefix=''):
+def eboot_base(elf):
+    """What a patch Address is relative to: EBOOT_BASE for a relocatable eboot (its segments start
+    at 0, shadPS4 loads it at 0x400000), 0 for one linked at its address (issn: ET_SCE_EXEC, older
+    SDKs such as inFAMOUS Second Son's: its segments already start at 0x400000)."""
+    loads=[vaddr for vaddr,_ in eboot_segments(elf)]
+    return EBOOT_BASE if loads and min(loads)<EBOOT_BASE else 0
+
+
+def locate(image, element, prefix='', base=EBOOT_BASE):
     """Image offset of a Line's or Target's site: its Pattern (unique) plus At, else Address."""
     pattern=element.get(prefix+'Pattern')
     if not pattern:
-        return int(element.get('Address'),0)-EBOOT_BASE
+        return int(element.get('Address'),0)-base
     found=find_pattern(image,parse_pattern(pattern))
     if len(found)!=1:
         raise LookupError('signature not found' if not found else 'signature found more than once')
     return found[0]+int(element.get(prefix+'At','0'),0)
 
 
-def resolve_targets(image, meta, sites):
+def resolve_targets(image, meta, sites, base=EBOOT_BASE):
     """Image offsets of a patch's named Targets: a site (Pattern/At), or the address a rip-relative
     or rel32 operand points to (Ref: the operand's offset in its Pattern; Tail: the instruction's
     bytes after the operand)."""
@@ -90,7 +98,7 @@ def resolve_targets(image, meta, sites):
         if target.get('Line'):
             targets[name]=sites[int(target.get('Line'))]
             continue
-        at=locate(image,target)
+        at=locate(image,target,base=base)
         if target.get('Ref'):
             disp,=struct.unpack_from('<i',image,at)
             at=at+4+int(target.get('Tail','0'))+disp
@@ -132,17 +140,17 @@ def fnv1a64(data):
     return value
 
 
-def check_original(image, line, offset, size):
+def check_original(image, line, offset, size, base=EBOOT_BASE):
     """LookupError when the Line has an OriginalHash and the game's bytes at its site differ: the
     patch is made for another version of the game."""
     expected=line.get('OriginalHash')
     if expected is None or image is None:
         return
     if offset<0 or offset+size>len(image) or fnv1a64(image[offset:offset+size])!=int(expected,16):
-        raise LookupError(f'original bytes differ at {offset+EBOOT_BASE:#x} (another game version)')
+        raise LookupError(f'original bytes differ at {offset+base:#x} (another game version)')
 
 
-def compile_patches(xml, names, app_version, segments, image=None, skipped=None):
+def compile_patches(xml, names, app_version, segments, image=None, skipped=None, base=EBOOT_BASE):
     """Writes of the named patches. With the game's image, each site is found by its signature
     (any build); without it, at the reference build's Address. A Line with a Target writes at that
     Target instead: data the code points to, such as a .bss variable (no bytes of its own to find).
@@ -158,17 +166,19 @@ def compile_patches(xml, names, app_version, segments, image=None, skipped=None)
     for name in names:
         lines=list(found[name].iter('Line'))
         try:
-            sites=[locate(image,line) if image is not None else int(line.get('Address'),0)-EBOOT_BASE
+            sites=[locate(image,line,base=base) if image is not None else int(line.get('Address'),0)-base
                    for line in lines]
-            targets=(resolve_targets(image,found[name],sites) if image is not None else
-                     {t.get('Name'):int(t.get('Address'),0)-EBOOT_BASE for t in found[name].iter('Target')})
+            targets=(resolve_targets(image,found[name],sites,base) if image is not None else
+                     {t.get('Name'):int(t.get('Address'),0)-base for t in found[name].iter('Target')})
             sites=[targets[line.get('Target')] if line.get('Target') else site for line,site in zip(lines,sites)]
             ours=[]
             for line,offset in zip(lines,sites):
                 data=fill(line.get('Value'),offset,targets) if '{' in line.get('Value','') else encode(line)
                 if not any(start<=offset and offset+len(data)<=end for start,end in segments):
-                    raise ValueError(f'{name}: address {offset+EBOOT_BASE:#x} is outside the eboot')
-                check_original(image,line,offset,len(data))
+                    if line.get('OriginalHash') is not None:  # issn: a version check, like a mismatch
+                        raise LookupError(f'address {offset+base:#x} is outside this eboot (another game version)')
+                    raise ValueError(f'{name}: address {offset+base:#x} is outside the eboot')
+                check_original(image,line,offset,len(data),base)
                 ours.append((offset,data))
         except LookupError as error:
             if skipped is None: raise ValueError(f'{name}: {error}')
@@ -337,10 +347,10 @@ def compile_external(selected, segments):
     return writes
 
 
-def write_patches(out, writes):
+def write_patches(out, writes, base=EBOOT_BASE):
     # G3PATCH2: the patch base, so the loader can rebase pointers the patches write into
     # relocated slots.
-    blob=struct.pack('<8sQQ',b'G3PATCH2',EBOOT_BASE,len(writes))
+    blob=struct.pack('<8sQQ',b'G3PATCH2',base,len(writes))
     for offset,data in writes: blob+=struct.pack('<QQ',offset,len(data))+data
     (out/'patches.bin').write_bytes(blob)
 
@@ -365,8 +375,9 @@ def main():
     names=selected_patches(xml,tag,a.extra,os.environ.get('GOW3_PATCHES_ONLY')=='1')
     elf=(a.out/'eboot.elf').read_bytes()
     segments=eboot_segments(elf)
+    base=eboot_base(elf)
     skipped={}
-    writes=compile_patches(xml,names,None,segments,eboot_image(elf),skipped)
+    writes=compile_patches(xml,names,None,segments,eboot_image(elf),skipped,base)
     for name,reason in skipped.items():
         print(f'Patches: {name} skipped ({reason} in this eboot.bin)')
     if a.patches_dir and sha==REFERENCE_SHA256:
@@ -374,7 +385,7 @@ def main():
         # applied there. After the built-in ones: an external patch of the same bytes wins.
         writes+=compile_external(external_selection(external_patches(a.patches_dir,tag,xml,ids),
                                                     a.patches_config),segments)
-    write_patches(a.out,writes)
+    write_patches(a.out,writes,base)
     applied=[n for n in names if n not in skipped]
     (a.out/'patch_status.json').write_text(json.dumps({'sha256':sha,'applied':applied,'skipped':skipped}))
     print(f'Patches: {title}; {len(writes)} writes from {applied or "none"}')

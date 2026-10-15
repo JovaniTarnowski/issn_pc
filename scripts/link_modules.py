@@ -14,12 +14,16 @@ import collections
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 from prepare import parse_self, read_self, span, unpack
 from link_libc import encode_id
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
+# issn: `mov r64, fs:[0]` into any register (REX.W[R] 8B /r, SIB disp32 0): inFAMOUS Second Son's
+# older SDK loads the thread pointer into ten registers, God of War III's only into rax.
+FS_LOAD_ANY = re.compile(rb'\x64[\x48-\x4f]\x8b[\x04\x0c\x14\x1c\x24\x2c\x34\x3c]\x25\x00\x00\x00\x00')
 
 
 def canonical(identity, fallback=None):
@@ -80,17 +84,15 @@ def module(path):
 
 
 def patch_fs_loads(image, ph, base):
-    """Rewrite initial-exec `mov rax, fs:[0]` to GS: glibc owns FS on Linux."""
+    """Rewrite initial-exec `mov r64, fs:[0]` to GS: glibc owns FS on Linux."""
     patched = 0
     for p in ph:
         if p['type'] != 1 or not p['flags'] & 1:
             continue
         start, end = base + p['vaddr'], base + p['vaddr'] + p['filesz']
-        at = image.find(FS_LOAD, start, end)
-        while at >= 0:
-            image[at] = 0x65
+        for match in FS_LOAD_ANY.finditer(image, start, end):
+            image[match.start()] = 0x65
             patched += 1
-            at = image.find(FS_LOAD, at + len(FS_LOAD), end)
     return patched
 
 
@@ -157,8 +159,13 @@ def link(game, out, module_names=DEFAULT_MODULES):
             if kind == 8:
                 relocs.append((target, 0, base + addend, 0))
             elif kind == 16:
+                # R_X86_64_DTPMOD64: the module that owns a TLS variable. A section symbol, or
+                # (issn: older SDKs' libc.prx, inFAMOUS Second Son) a TLS symbol this module
+                # defines and exports: both are this module's own TLS block.
                 symbol = m['symbols'][symid]
-                if symbol['name'] or symbol['type'] != 3 or addend or not module_id:
+                own_section = not symbol['name'] and symbol['type'] == 3
+                own_tls_symbol = bool(symbol['section']) and symbol['section'] < 0xff00 and symbol['type'] == 6
+                if not (own_section or own_tls_symbol) or addend or not module_id:
                     raise ValueError(f'{filename}: unsupported external TLS relocation')
                 struct.pack_into('<Q', image, target, module_id)
                 tls_relocations += 1

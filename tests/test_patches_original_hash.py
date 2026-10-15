@@ -90,3 +90,38 @@ class SecondSonFileTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EbootBaseTests(unittest.TestCase):
+    """issn: a patch Address is relative to 0x400000 for a relocatable eboot (segments from 0),
+    absolute for one linked at 0x400000 (ET_SCE_EXEC, inFAMOUS Second Son's SDK)."""
+
+    @staticmethod
+    def elf(vaddr):
+        data = bytearray(64 + 56)
+        struct.pack_into('<Q', data, 0x20, 64)
+        struct.pack_into('<HH', data, 0x36, 56, 1)
+        struct.pack_into('<IIQQQQQQ', data, 64, 1, 5, 0, vaddr, vaddr, 0x1000, 0x1000, 0x1000)
+        return bytes(data)
+
+    def test_base(self):
+        from patches import eboot_base
+        self.assertEqual(eboot_base(self.elf(0)), EBOOT_BASE)
+        self.assertEqual(eboot_base(self.elf(0x400000)), 0)
+
+    def test_absolute_addresses_with_base_zero(self):
+        image = bytearray(0x402000)
+        struct.pack_into('<I', image, 0x401000, 1920)
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = Path(tmp) / 'p.xml'
+            xml.write_text(XML.format(a1=0x401000, a2=0x401004, a3=0x401100,
+                                      h1=f'{fnv1a64(struct.pack("<I", 1920)):016x}',
+                                      h2=f'{fnv1a64(bytes(4)):016x}'))
+            skipped = {}
+            writes = compile_patches(xml, ['Width'], None, [(0x400000, 0x402000)], bytes(image), skipped, 0)
+            self.assertEqual(skipped, {})
+            self.assertEqual(writes[0], (0x401000, bytes.fromhex('000A0000')))
+            # The same file read as relative lands outside: a version mismatch, skipped, not fatal.
+            skipped = {}
+            self.assertEqual(compile_patches(xml, ['Width'], None, [(0x400000, 0x402000)], bytes(image), skipped), [])
+            self.assertIn('another game version', skipped['Width'])

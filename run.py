@@ -206,7 +206,8 @@ def main():
     mod_view = game if game.resolve() != original_game else None
     try:
         run_script('prepare.py', game, '--out', out)
-        run_script('link_libc.py', game, '--out', out)
+        # issn: link_libc.py (boot-libc.bin, superseded by link_modules.py) is not run: nothing
+        # loads its output, and it rejects older SDKs' libc.prx (inFAMOUS Second Son).
         run_script('link_modules.py', game, '--out', out)
         # A failed rewrite prints its reason and the game starts without the table.
         isa_args = []

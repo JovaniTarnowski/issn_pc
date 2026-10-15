@@ -212,15 +212,22 @@ static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exce
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
+/* `mov r64, gs:[0]` (link_modules.py rewrote the fs: of each `mov r64, fs:[0]`): 65, REX.W[R],
+ * 8B, ModRM mod=00 rm=100 (any register), SIB 25 (disp32 only), displacement 0. issn: any
+ * register, not only rax (inFAMOUS Second Son's older SDK uses ten of them). */
+static int is_tcb_load(const unsigned char *at) {
+    return at[0]==0x65 && (at[1]&0xF8)==0x48 && at[2]==0x8b && (at[3]&0xC7)==0x04 && at[4]==0x25 &&
+           !at[5] && !at[6] && !at[7] && !at[8];
+}
 static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
-    static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
+    enum { LOAD_SIZE=9 };
     uint32_t displacement=runtime_thread_tcb_offset();
     uint64_t patched=0;
     for (uint64_t s=0;s<count;++s) {
-        if (!(segments[s].flags&1) || segments[s].size<sizeof(load)) continue;
-        unsigned char *at=image+segments[s].address, *end=at+segments[s].size-sizeof(load);
+        if (!(segments[s].flags&1) || segments[s].size<LOAD_SIZE) continue;
+        unsigned char *at=image+segments[s].address, *end=at+segments[s].size-LOAD_SIZE;
         for (; at<=end; ++at)
-            if (at[0]==0x65 && !memcmp(at,load,sizeof(load))) { memcpy(at+5,&displacement,4); ++patched; at+=sizeof(load)-1; }
+            if (is_tcb_load(at)) { memcpy(at+5,&displacement,4); ++patched; at+=LOAD_SIZE-1; }
     }
     return patched;
 }

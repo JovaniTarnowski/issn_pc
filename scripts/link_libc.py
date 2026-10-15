@@ -50,7 +50,9 @@ def module(path):
     def identity(name):
         parts = name.split('#')
         if len(parts) != 3:
-            raise ValueError(f'unsupported symbol encoding {name!r}')
+            # issn: plain names (compilerrt_abort_impl in older SDKs' libc.prx) are not linkable,
+            # as in link_modules.py.
+            return None
         n, lib, mod = parts
         return (n, libraries[lib], modules[mod])
     symbols = []
