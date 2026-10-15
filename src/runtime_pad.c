@@ -5,7 +5,11 @@
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
- *   IJKL d-pad (I up, K down, J left, L right). */
+ *   IJKL d-pad (I up, K down, J left, L right), G shake (issn: the motion sensors of a pad
+ *   without them, for inFAMOUS Second Son's spray can).
+ *
+ * issn: the motion sensors of a DualShock 4/DualSense (SDL accelerometer and gyroscope) and the
+ * orientation integrated from the gyroscope; scePadSetLightBar colors the pad's light bar. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/gow3gpu.h"
@@ -14,6 +18,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
 
@@ -30,6 +35,8 @@ enum {
     /* Host-only sources, never shown to the game: a click on one side of the touchpad from a
      * button or key without a touch surface (play_click turns them into a touch and a click). */
     CLICK_LEFT=0x40000000, CLICK_RIGHT=0x80000000,
+    /* issn: shakes the pad (motion_shake) while held: keyboard G, or a mapped pad button. */
+    SHAKE=0x20000000,
 };
 typedef struct { uint16_t x, y; uint8_t id, reserve[3]; } PadTouch;
 typedef struct {
@@ -63,6 +70,87 @@ static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
+
+/* ---- issn: motion sensors and light bar ------------------------------------------------------
+ * PS4 pads report acceleration in G (1.0 = gravity) and angular velocity in rad/s, with the pad's
+ * axes: x to the right, y up, z toward the player; SDL uses the same axes, in m/s^2 and rad/s.
+ * GOW3_PAD_ACCEL_UNITS=ms2 passes m/s^2 unchanged (as shadPS4 does) in case a game expects it.
+ * Orientation: the gyroscope integrated per read (scePadResetOrientation starts it again). */
+#define STANDARD_GRAVITY 9.80665f
+enum { SENSOR_ACCEL=1, SENSOR_GYRO=2 };
+static int motion_enabled=1;                       /* scePadSetMotionSensorState */
+static int sensors;                                /* SENSOR_* of the open gamepad */
+static float orientation_q[4]={0.0f,0.0f,0.0f,1.0f}; /* x y z w */
+static uint64_t orientation_time;
+static struct { uint8_t rgb[3], sent[3]; int set, applied; } light;
+
+static float accel_scale(void) {
+    static int mode=-1;
+    if (mode<0) { const char *u=getenv("GOW3_PAD_ACCEL_UNITS"); mode=u && !strcmp(u,"ms2"); }
+    return mode ? 1.0f : 1.0f/STANDARD_GRAVITY;
+}
+
+/* q' = q + dt/2 * q*(w,0), normalized (the same integration as shadPS4's pad). dt over 1 s (a
+ * pause, the first read) keeps the orientation. */
+static void integrate_orientation(float q[4], const float w[3], float dt) {
+    if (dt<=0.0f || dt>1.0f) return;
+    const float x=q[0], y=q[1], z=q[2], qw=q[3];
+    const float dx=0.5f*( qw*w[0] + y*w[2] - z*w[1]);
+    const float dy=0.5f*( qw*w[1] + z*w[0] - x*w[2]);
+    const float dz=0.5f*( qw*w[2] + x*w[1] - y*w[0]);
+    const float dw=0.5f*(-x*w[0] - y*w[1] - z*w[2]);
+    q[0]+=dx*dt; q[1]+=dy*dt; q[2]+=dz*dt; q[3]+=dw*dt;
+    const float n=sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    if (n>0.0f) for (int i=0;i<4;++i) q[i]/=n;
+}
+
+/* A vertical shake at 6 Hz, 2.5 G around gravity: what shaking a spray can reads like. */
+static void motion_shake(float accel[3], uint64_t now, float scale) {
+    const float t=(float)(now%1000000u)/1e6f;
+    accel[0]=0.0f;
+    accel[1]=(1.0f+2.5f*sinf(2.0f*3.14159265f*6.0f*t))*STANDARD_GRAVITY*scale;
+    accel[2]=0.0f;
+}
+
+/* The pad's light bar takes the last color the game set (GOW3_LIGHTBAR=0 leaves it alone); sent
+ * again after a reconnection, and only when it changes. Called under lock. */
+static void apply_light(SDL_Gamepad *g) {
+    static int enabled=-1;
+    if (enabled<0) { const char *e=getenv("GOW3_LIGHTBAR"); enabled=!(e && e[0]=='0'); }
+    if (!g || !enabled || !light.set) return;
+    if (light.applied && !memcmp(light.sent,light.rgb,3)) return;
+    if (SDL_SetGamepadLED(g,light.rgb[0],light.rgb[1],light.rgb[2])) {
+        memcpy(light.sent,light.rgb,3); light.applied=1;
+    }
+}
+
+/* Called under lock with the gamepad just opened: its motion sensors, its light bar. */
+static void open_sensors(SDL_Gamepad *g) {
+    sensors=0;
+    if (SDL_GamepadHasSensor(g,SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,true)) sensors|=SENSOR_ACCEL;
+    if (SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true)) sensors|=SENSOR_GYRO;
+    printf("Runtime: gamepad motion sensors: %s%s%s\n",sensors ? "" : "none",
+           (sensors & SENSOR_ACCEL) ? "accelerometer " : "", (sensors & SENSOR_GYRO) ? "gyroscope" : "");
+    light.applied=0;
+    apply_light(g);
+}
+
+/* Acceleration, angular velocity and orientation of this read; under lock. */
+static void sample_motion(PadData *d, SDL_Gamepad *g) {
+    const float scale=accel_scale();
+    d->acceleration[0]=0.0f; d->acceleration[1]=STANDARD_GRAVITY*scale; d->acceleration[2]=0.0f;
+    float w[3]={0.0f,0.0f,0.0f};
+    if (g && motion_enabled) {
+        float a[3];
+        if ((sensors & SENSOR_ACCEL) && SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,a,3))
+            for (int i=0;i<3;++i) d->acceleration[i]=a[i]*scale;
+        if ((sensors & SENSOR_GYRO) && SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,w,3))
+            for (int i=0;i<3;++i) d->angular_velocity[i]=w[i];
+    }
+    if (orientation_time) integrate_orientation(orientation_q,d->angular_velocity,(float)(d->timestamp-orientation_time)/1e6f);
+    orientation_time=d->timestamp;
+    memcpy(d->orientation,orientation_q,sizeof(orientation_q));
+}
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -113,7 +201,10 @@ static SDL_Gamepad *current_gamepad(void) {
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
         if (ids && count>0) {
             gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+            if (gamepad) {
+                ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad));
+                open_sensors(gamepad);
+            }
         }
         SDL_free(ids);
     }
@@ -131,7 +222,7 @@ static const struct { const char *name; uint32_t ps; } ps_names[]={
     {"cross",BTN_CROSS}, {"circle",BTN_CIRCLE}, {"square",BTN_SQUARE}, {"triangle",BTN_TRIANGLE},
     {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
     {"options",BTN_OPTIONS}, {"touchpad",CLICK_LEFT}, {"touchpad_left",CLICK_LEFT}, {"touchpad_right",CLICK_RIGHT},
-    {"up",BTN_UP}, {"down",BTN_DOWN}, {"left",BTN_LEFT}, {"right",BTN_RIGHT},
+    {"up",BTN_UP}, {"down",BTN_DOWN}, {"left",BTN_LEFT}, {"right",BTN_RIGHT}, {"shake",SHAKE},
 };
 typedef struct { int source; uint32_t ps; } ButtonSource;
 typedef struct { ButtonSource entries[48]; size_t count; } ButtonMap;
@@ -144,14 +235,16 @@ static ButtonMap pad_map={{
     {SDL_GAMEPAD_BUTTON_TOUCHPAD,BTN_TOUCHPAD},
     {SDL_GAMEPAD_BUTTON_DPAD_UP,BTN_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN,BTN_DOWN},
     {SDL_GAMEPAD_BUTTON_DPAD_LEFT,BTN_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,BTN_RIGHT},
-},15};
+    {SDL_GAMEPAD_BUTTON_MISC1,SHAKE},
+},16};
 static ButtonMap key_map={{
     {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
     {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
     {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
     {SDL_SCANCODE_RETURN,BTN_OPTIONS}, {SDL_SCANCODE_TAB,CLICK_LEFT}, {SDL_SCANCODE_BACKSPACE,CLICK_RIGHT},
     {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
-},17};
+    {SDL_SCANCODE_G,SHAKE},
+},18};
 
 static char *trim(char *text) {
     while (*text==' ' || *text=='\t') ++text;
@@ -188,7 +281,10 @@ static int apply_button_map(ButtonMap *map, const char *spec, bool keyboard) {
             continue;
         }
         size_t kept=0;
-        for (size_t i=0;i<map->count;++i) if (map->entries[i].ps!=ps) map->entries[kept++]=map->entries[i];
+        /* issn: the default shake source yields to a button mapped on it (misc1 on the pad). */
+        for (size_t i=0;i<map->count;++i)
+            if (map->entries[i].ps!=ps && !(map->entries[i].ps==SHAKE && map->entries[i].source==source))
+                map->entries[kept++]=map->entries[i];
         map->count=kept;
         if (map->count<sizeof(map->entries)/sizeof(*map->entries)) map->entries[map->count++]=(ButtonSource){source,ps};
         ++used;
@@ -215,6 +311,7 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
+    sample_motion(d,g);
     if (gow3gpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     load_button_maps();
@@ -375,6 +472,10 @@ static void sample(PadData *d) {
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
+    if (d->buttons & SHAKE) {
+        d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
+        motion_shake(d->acceleration,d->timestamp,accel_scale());
+    }
     play_click(d);
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;
@@ -442,16 +543,49 @@ static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag
 
 static ABI int32_t pad_light_bar(int32_t handle, const uint8_t *rgb) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
-    (void)rgb; return 0;
+    if (!rgb) return ERR_INVALID_ARG;
+    pthread_mutex_lock(&lock);
+    memcpy(light.rgb,rgb,3); light.set=1;
+    apply_light(gamepad);
+    pthread_mutex_unlock(&lock);
+    return 0;
 }
+/* Back to the PS4's color for user 1 (blue). */
+static ABI int32_t pad_reset_light_bar(int32_t handle) {
+    static const uint8_t user1[3]={0,0,255};
+    return pad_light_bar(handle,user1);
+}
+static ABI int32_t pad_motion_sensor_state(int32_t handle, uint8_t enable) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    motion_enabled=enable!=0;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_reset_orientation(int32_t handle) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    orientation_q[0]=orientation_q[1]=orientation_q[2]=0.0f; orientation_q[3]=1.0f;
+    orientation_time=0;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_get_handle(int32_t user, int32_t type, int32_t index) {
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    if (user!=1 || (type!=0 && type!=2) || index) return ERR_INVALID_ARG;
+    return opened ? PAD_HANDLE : ERR_INVALID_HANDLE;
+}
+static ABI int32_t pad_light_bar_blinking(int32_t handle, const void *param) { (void)param; return pad_ok_handle(handle); }
 static const RuntimeExport exports[]={
-    {"scePadSetLightBar",pad_light_bar}, {"scePadResetLightBar",pad_ok_handle},
+    {"scePadSetLightBar",pad_light_bar}, {"scePadResetLightBar",pad_reset_light_bar},
+    {"scePadSetLightBarBlinking",pad_light_bar_blinking}, {"scePadSetLightBarBaseBrightness",pad_ok_handle_flag},
+    {"scePadGetHandle",pad_get_handle},
     {"scePadInit",pad_init}, {"scePadOpen",pad_open}, {"scePadClose",pad_close},
     {"scePadReadState",pad_read_state}, {"scePadRead",pad_read},
     {"scePadGetControllerInformation",pad_info}, {"scePadSetVibration",pad_vibration},
-    {"scePadResetOrientation",pad_ok_handle},
+    {"scePadResetOrientation",pad_reset_orientation},
     {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
-    {"scePadSetMotionSensorState",pad_ok_handle_flag},
+    {"scePadSetMotionSensorState",pad_motion_sensor_state},
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }

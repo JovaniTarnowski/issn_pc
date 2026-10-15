@@ -30,8 +30,27 @@ static int touch_at(const PadData *d, int x) {
     return d->touch_count==1 && d->touches[0].x==x && d->touches[0].y==471;
 }
 static void pump(void) { SDL_UpdateJoysticks(); SDL_UpdateGamepads(); }
+static int near(float a, float b, float tolerance) { return fabsf(a-b)<=tolerance; }
+/* issn: the light bar of the virtual pad, as the game set it through SDL. */
+static uint8_t led[3]; static int led_calls;
+static bool set_led(void *userdata, Uint8 r, Uint8 g, Uint8 b) {
+    (void)userdata; led[0]=r; led[1]=g; led[2]=b; ++led_calls; return true;
+}
 
 int main(void) {
+    /* issn: the orientation integrates the gyroscope: 90 degrees about y in 1 s. */
+    {
+        float q[4]={0,0,0,1};
+        const float w[3]={0.0f,1.5707963f,0.0f};
+        for (int i=0;i<100;++i) integrate_orientation(q,w,0.01f);
+        assert(near(q[0],0.0f,1e-3f) && near(q[1],0.70711f,2e-3f) && near(q[2],0.0f,1e-3f) && near(q[3],0.70711f,2e-3f));
+        integrate_orientation(q,w,5.0f); /* a pause: kept */
+        assert(near(q[1],0.70711f,2e-3f));
+        float a[3];
+        float lowest=10.0f, highest=-10.0f;
+        for (uint64_t t=0;t<200000;t+=5000) { motion_shake(a,t,1.0f/STANDARD_GRAVITY); if (a[1]<lowest) lowest=a[1]; if (a[1]>highest) highest=a[1]; }
+        assert(near(highest,3.5f,0.05f) && near(lowest,-1.5f,0.05f) && a[0]==0.0f && a[2]==0.0f);
+    }
     const char *tmp=getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
     char path[1024];
     snprintf(path,sizeof(path),"%s/gow3-pad-test-XXXXXX",tmp);
@@ -125,6 +144,10 @@ int main(void) {
     desc.product_id=0x6189;
     desc.ntouchpads=1;
     desc.touchpads=&touch;
+    SDL_VirtualJoystickSensorDesc sensor_desc[2]={{SDL_SENSOR_ACCEL,250.0f},{SDL_SENSOR_GYRO,250.0f}};
+    desc.nsensors=2;
+    desc.sensors=sensor_desc;
+    desc.SetLED=set_led;
     SDL_JoystickID id=SDL_AttachVirtualJoystick(&desc);
     assert(id!=0);
     SDL_Joystick *joystick=SDL_OpenJoystick(id);
@@ -184,11 +207,64 @@ int main(void) {
     usleep(220000);
     data=read_pad();
     assert(data.buttons==0 && data.touch_count==0);
+
+    /* issn: the pad's motion sensors, in G and rad/s, and the orientation from the gyroscope. */
+    assert(sensors==(SENSOR_ACCEL|SENSOR_GYRO));
+    const float tilt[3]={0.0f,STANDARD_GRAVITY,0.0f}, spin[3]={0.0f,1.5707963f,0.0f}, still[3]={0,0,0};
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_ACCEL,SDL_GetTicksNS(),tilt,3));
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,SDL_GetTicksNS(),spin,3));
+    pump();
+    assert(pad_reset_orientation(1)==0);
+    data=read_pad();
+    assert(near(data.acceleration[1],1.0f,1e-3f) && near(data.angular_velocity[1],1.5707963f,1e-4f));
+    usleep(200000);
+    data=read_pad(); /* 0.2 s at 90 degrees/s: 18 degrees about y */
+    assert(data.orientation[1]>0.10f && data.orientation[1]<0.25f && data.orientation[3]>0.96f);
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,SDL_GetTicksNS(),still,3));
+    pump();
+    assert(pad_reset_orientation(1)==0);
+    data=read_pad();
+    assert(data.orientation[3]==1.0f && data.angular_velocity[1]==0.0f);
+    /* scePadSetMotionSensorState(false): a pad at rest. */
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,SDL_GetTicksNS(),spin,3));
+    pump();
+    assert(pad_motion_sensor_state(1,0)==0);
+    data=read_pad();
+    assert(data.angular_velocity[1]==0.0f && near(data.acceleration[1],1.0f,1e-6f));
+    assert(pad_motion_sensor_state(1,1)==0);
+    assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,SDL_GetTicksNS(),still,3));
+    pump();
+
+    /* The shake source (G, a mapped button, the pad file's "shake"): motion, never a button. */
+    inject(path,"shake");
+    float lowest=10.0f, highest=-10.0f;
+    for (int i=0;i<12;++i) {
+        data=read_pad();
+        assert(!(data.buttons & SHAKE));
+        if (data.acceleration[1]<lowest) lowest=data.acceleration[1];
+        if (data.acceleration[1]>highest) highest=data.acceleration[1];
+        usleep(15000);
+    }
+    assert(highest-lowest>2.0f);
+    inject(path,"");
+    data=read_pad();
+    assert(near(data.acceleration[1],1.0f,1e-3f));
+
+    /* scePadSetLightBar reaches the pad once per color; scePadResetLightBar is user 1's blue. */
+    const uint8_t red[3]={255,16,0};
+    assert(pad_light_bar(1,red)==0 && led[0]==255 && led[1]==16 && led[2]==0);
+    const int calls=led_calls;
+    assert(pad_light_bar(1,red)==0 && led_calls==calls);
+    assert(pad_reset_light_bar(1)==0 && led[0]==0 && led[1]==0 && led[2]==255);
+    assert(pad_light_bar(1,NULL)==ERR_INVALID_ARG && pad_light_bar(7,red)==ERR_INVALID_HANDLE);
+    assert(pad_get_handle(1,0,0)==1 && pad_get_handle(2,0,0)==ERR_INVALID_ARG);
+
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
     unlink(path);
-    puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture");
+    puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture, "
+         "motion sensors, orientation, shake, light bar");
 }

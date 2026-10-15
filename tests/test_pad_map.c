@@ -51,6 +51,13 @@ int main(void) {
     assert(pressed_by(&pad,SDL_GAMEPAD_BUTTON_BACK)==0 && pressed_by(&pad,SDL_GAMEPAD_BUTTON_GUIDE)==CLICK_RIGHT);
     assert(pressed_by(&pad,SDL_GAMEPAD_BUTTON_MISC1)==0 && pressed_by(&pad,SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1)==CLICK_LEFT);
     assert(apply_button_map(&pad,"cross=Space",false)==0); /* a key name is no gamepad button */
+    /* issn: shake is misc1 and G by default, yields to a button mapped there, and can move. */
+    assert(pressed_by(&pad_map,SDL_GAMEPAD_BUTTON_MISC1)==SHAKE && pressed_by(&key_map,SDL_SCANCODE_G)==SHAKE);
+    ButtonMap shake=pad_map;
+    assert(apply_button_map(&shake,"shake=leftstick",false)==1);
+    assert(pressed_by(&shake,SDL_GAMEPAD_BUTTON_MISC1)==0 && pressed_by(&shake,SDL_GAMEPAD_BUTTON_LEFT_STICK)==(BTN_L3|SHAKE));
+    ButtonMap keys_shake=key_map;
+    assert(apply_button_map(&keys_shake,"cross=G",true)==1 && pressed_by(&keys_shake,SDL_SCANCODE_G)==BTN_CROSS);
     /* Keyboard: each side has a key of its own. */
     assert(pressed_by(&key_map,SDL_SCANCODE_TAB)==CLICK_LEFT && pressed_by(&key_map,SDL_SCANCODE_BACKSPACE)==CLICK_RIGHT);
     ButtonMap sides=key_map;

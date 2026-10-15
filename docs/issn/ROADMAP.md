@@ -83,6 +83,23 @@ fila de readback, pipelines assíncronos, occlusion queries reais, e os reworks 
 shadPS4 oficial. O modo PS4 Pro (e o patch do checkerboard) também fica para depois: o port roda
 o jogo no modo PS4 normal.
 
+### Controle (DualShock 4 / DualSense)
+
+O Second Son usa mais o controle do PS4 que o God of War III. Feito, sem depender do jogo
+(`src/runtime_pad.c`, testes `tests/test_pad.c` e `tests/test_pad_map.c` com um controle
+virtual do SDL):
+
+| Recurso | Como fica no PC |
+|---|---|
+| Touchpad (dedos e clique) | já vinha do port do GOW3: dedos reais do DS4/DualSense |
+| Sensores de movimento | acelerômetro (em G) e giroscópio (rad/s) do controle; orientação integrada do giroscópio; `scePadSetMotionSensorState` e `scePadResetOrientation` funcionam |
+| Chacoalhar (lata de spray) | tecla **G**, ou Share (Xbox Series) / Mute (DualSense); mapeável em Controles |
+| Light bar | a cor que o jogo pede vai para o controle (karma), só quando muda; `GOW3_LIGHTBAR=0` desliga |
+
+A confirmar com o jogo: a unidade da aceleração (G, como no SDK; `GOW3_PAD_ACCEL_UNITS=ms2`
+passa m/s² como o shadPS4) e o eixo do chacoalhar que o jogo espera. Ainda não: alto-falante do
+controle (áudio no port PAD_SPK) e inclinar com o teclado.
+
 ### Riscos conhecidos
 
 | Risco | Por que | Plano |

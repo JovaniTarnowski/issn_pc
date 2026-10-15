@@ -20,6 +20,11 @@ Starting
    then Run anyway: the program is not digitally signed.
 3. Choose the game folder (the one with eboot.bin), then click PLAY.
 
+Controller
+- DualShock 4 and DualSense: touchpad, motion sensors (shake and tilt the spray can) and the
+  light bar work as on the PS4. Other pads and the keyboard: G shakes (Share on an Xbox Series
+  pad, Mute on a DualSense); change it on the launcher's Controls page.
+
 Data
 - Saves, shader cache and the log: user\ next to inFAMOUS Second Son.exe.
 - Settings: issn.ini next to inFAMOUS Second Son.exe; launcher options in %APPDATA%\issn-launcher.

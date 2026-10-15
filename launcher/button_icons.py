@@ -24,7 +24,7 @@ GAME_BUTTONS = {'cross': 'a', 'circle': 'b', 'square': 'x', 'triangle': 'y', 'l1
                 'r1': 'rightshoulder', 'l2': 'lefttrigger', 'r2': 'righttrigger', 'l3': 'leftstick',
                 'r3': 'rightstick', 'options': 'start', 'touchpad_left': 'touchpad',
                 'touchpad_right': 'touchpad', 'up': 'dpup', 'down': 'dpdown', 'left': 'dpleft',
-                'right': 'dpright'}
+                'right': 'dpright', 'shake': 'misc1'}
 
 INK, DIM, BODY = '#e6e0d8', '#5a5250', '#262020'
 
