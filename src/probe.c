@@ -141,6 +141,26 @@ static void abort_report(int sig) {
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
 }
+/* issn: a C library function given an invalid parameter (a closed descriptor, an unknown lseek
+ * origin) ends the process by fast fail (0xC0000409) unless a handler returns: then the call
+ * fails with EINVAL, as the same call does on Linux and on the PS4. Each of the first 20 is
+ * reported with the stack of the caller. */
+static void invalid_parameter(const wchar_t *expression, const wchar_t *function, const wchar_t *file,
+                              unsigned int line, uintptr_t reserved) {
+    (void)expression; (void)function; (void)file; (void)line; (void)reserved;
+    static volatile LONG reported;
+    if (InterlockedIncrement(&reported)>20) return;
+    fprintf(stderr,"Runtime: C library call with an invalid parameter (EINVAL) on thread %lu; stack:\n",
+            GetCurrentThreadId());
+    void *frames[24];
+    const USHORT n=RtlCaptureStackBackTrace(1,24,frames,NULL);
+    char where[MAX_PATH+64];
+    for (USHORT i=0;i<n;++i) {
+        describe_address(where,sizeof(where),(uintptr_t)frames[i]);
+        fprintf(stderr,"  #%u %s\n",i,where);
+    }
+    fflush(stderr);
+}
 static HMODULE gpu_module; /* the GPU library's DLL: its faults are ours too */
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
@@ -783,6 +803,7 @@ int main(int argc, char **argv) {
                        (LPCSTR)(uintptr_t)gow3gpu_init,&gpu_module);
     if (gpu_module==GetModuleHandleA(NULL)) gpu_module=NULL;
     signal(SIGABRT,abort_report);
+    _set_invalid_parameter_handler(invalid_parameter);
     _set_abort_behavior(0,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
     if (getenv("GOW3_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
