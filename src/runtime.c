@@ -76,6 +76,7 @@ void runtime_report(void) {
     runtime_mutex_report();
     runtime_rwlock_report();
     runtime_sema_report();
+    runtime_eventflag_report();
     runtime_content_report();
     runtime_memory_report();
     runtime_ajm_report();
@@ -229,6 +230,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (content) return content;
     uintptr_t timer = runtime_time_resolve(name);
     if (timer) return timer;
+    uintptr_t eventflag = runtime_eventflag_resolve(name); /* issn */
+    if (eventflag) return eventflag;
     uintptr_t sema = runtime_sema_resolve(name);
     if (sema) return sema;
     uintptr_t rwlock = runtime_rwlock_resolve(name);
@@ -258,10 +261,18 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
 };
-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
+/* issn: every name the runtime exports, as "NID#library" in the libraries that export it on the
+ * PS4 (tools/issn/gen_export_nids.py), so a function is found for any game, not only for the
+ * imports import_names.inc was written from. */
+static const struct { const char *nid, *symbol; } export_nids[]={
+#include "runtime_export_nids.inc"
+};
+/* Symbol name for a scoped NID, or NULL when the runtime knows no name for it. */
 const char *runtime_symbol(const char *nid) {
     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+    for (size_t i=0;i<sizeof(export_nids)/sizeof(*export_nids);++i)
+        if (!strcmp(nid,export_nids[i].nid)) return export_nids[i].symbol;
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or
