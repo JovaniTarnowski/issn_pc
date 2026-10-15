@@ -772,7 +772,11 @@ public:
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
+        // issn: data larger than a chunk goes to its own block (RecordData); only the command
+        // that uses it needs room here.
+        if (bytes + 1024 > RecordChunk::Capacity) {
+            bytes = 0;
+        }
         if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
             full_chunks.push_back(std::move(record_chunk));
             record_chunk = AcquireChunk();
@@ -788,6 +792,18 @@ public:
         }
         // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
+        if (bytes + alignof(T) + 1024 > RecordChunk::Capacity) {
+            // issn: more than a chunk holds (the upload regions of an image with thousands of
+            // mips and layers): a block of its own, freed once the recording thread has run
+            // every command recorded so far (SyncRecording).
+            ReserveRecordData(0);
+            auto block = std::make_unique<std::byte[]>(bytes);
+            auto* dst = reinterpret_cast<T*>(block.get());
+            std::memcpy(dst, data.data(), bytes);
+            std::scoped_lock lk{oversized_mutex};
+            oversized_data.push_back(std::move(block));
+            return {dst, data.size()};
+        }
         ReserveRecordData(bytes + alignof(T));
         auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
         std::memcpy(dst, data.data(), bytes);
@@ -917,6 +933,9 @@ private:
     // gow3: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
+    std::mutex oversized_mutex;
+    std::vector<std::unique_ptr<std::byte[]>> oversized_data; ///< see RecordData
+
     std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;

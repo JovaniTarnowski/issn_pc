@@ -34,8 +34,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 8u; // gow3: interpolated integer fix (Pascal);
-                                               // issn: legacy multiply-add, upstream fixes
+static constexpr u32 ShaderBinaryVersion = 9u; // gow3: interpolated integer fix (Pascal);
+                                               // issn: legacy multiply-add, upstream fixes;
+                                               // 1D images as 2D, cube math in SPIR-V
 static constexpr u32 ShaderMetaVersion = 7u; // gow3: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // gow3: Info layout (ImageResource::needs_native)
 } // namespace Serialization

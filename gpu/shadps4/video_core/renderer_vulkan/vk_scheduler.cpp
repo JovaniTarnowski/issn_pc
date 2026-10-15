@@ -306,6 +306,10 @@ void Scheduler::SyncRecording() {
     Gow3Stats::WaitTimer timer{Gow3Stats::sync_recording_ns};
     std::unique_lock lk{recorder_mutex};
     recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
+    lk.unlock();
+    // Every recorded command has run: the oversized data blocks they read are done with.
+    std::scoped_lock oversized_lk{oversized_mutex};
+    oversized_data.clear();
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
