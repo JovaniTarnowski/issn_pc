@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include "../src/runtime_pad.c"
+volatile int runtime_snapshot_request; /* runtime_thread.c */
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
 #endif

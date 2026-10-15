@@ -109,4 +109,7 @@ void runtime_thread_attach_host(const char *name);
 /* issn: a guest thread's registers and rbp frame chain, for the Windows watchdog (probe.c). */
 typedef struct { char name[32]; uint32_t tid, depth; uint64_t rdi, rsi, frames[24]; } ThreadSnapshot;
 size_t runtime_thread_snapshot(ThreadSnapshot *out, size_t capacity);
+/* issn: F10 (runtime_pad.c) asks the loader's watchdog thread for the stacks of every guest
+ * thread, printed without stopping the game (a scene that waits forever while it renders). */
+extern volatile int runtime_snapshot_request;
 #endif

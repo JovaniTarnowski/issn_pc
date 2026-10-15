@@ -405,34 +405,48 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
 }
 #endif
 #ifdef _WIN32
+static void print_thread_stacks(const char *title) {
+    static ThreadSnapshot snaps[256];
+    const size_t n=runtime_thread_snapshot(snaps,sizeof(snaps)/sizeof(*snaps));
+    fprintf(stderr,"%s; thread stacks (%zu guest threads):\n",title,n);
+    char where[MAX_PATH+64];
+    for (size_t i=0;i<n;++i) {
+        fprintf(stderr,"  thread '%s' tid=%u rdi=%016llx rsi=%016llx\n",snaps[i].name,snaps[i].tid,
+                (unsigned long long)snaps[i].rdi,(unsigned long long)snaps[i].rsi);
+        for (uint32_t d=0;d<snaps[i].depth;++d) {
+            const uint64_t rip=snaps[i].frames[d], base=(uint64_t)(uintptr_t)image;
+            if (image && rip>=base && rip-base<image_size_for_watchdog) {
+                fprintf(stderr,"    #%u guest 0x%llx\n",d,(unsigned long long)(rip-base));
+            } else {
+                /* issn: host frames as module+offset (runtime functions, system waits). */
+                describe_address(where,sizeof(where),(uintptr_t)rip);
+                fprintf(stderr,"    #%u host  %s\n",d,where);
+            }
+        }
+    }
+    fflush(NULL);
+}
 static DWORD WINAPI watchdog_thread(void *arg) {
     /* issn: with the GPU the timeout counts seconds without a new frame (a hang, as the game
      * freezing on a scene while its music plays), not the total time; before the GPU starts and
-     * without it, from the start. */
+     * without it, from the start. 0: no timeout. It also serves F10's snapshots (the game goes
+     * on). */
     const unsigned seconds=*(unsigned *)arg;
     uint64_t last_frames=0;
-    for (unsigned still=0; still<seconds;) {
+    for (unsigned still=0; !seconds || still<seconds;) {
         Sleep(1000);
+        if (runtime_snapshot_request) {
+            runtime_snapshot_request=0;
+            print_thread_stacks("F10 snapshot");
+            if (gpu_enabled) gow3gpu_dump_gpu_state();
+        }
         const uint64_t frames=gpu_enabled ? gow3gpu_frame_count() : 0;
         if (frames!=last_frames) { last_frames=frames; still=0; }
         else ++still;
     }
     if (gpu_enabled) fprintf(stderr,"STOP: no new frame for %u seconds (frame %llu)\n",seconds,
                              (unsigned long long)last_frames);
-    static ThreadSnapshot snaps[256];
-    const size_t n=runtime_thread_snapshot(snaps,sizeof(snaps)/sizeof(*snaps));
-    fprintf(stderr,"STOP: watchdog timeout; thread stacks (%zu guest threads):\n",n);
-    for (size_t i=0;i<n;++i) {
-        fprintf(stderr,"  thread '%s' tid=%u rdi=%016llx rsi=%016llx\n",snaps[i].name,snaps[i].tid,
-                (unsigned long long)snaps[i].rdi,(unsigned long long)snaps[i].rsi);
-        for (uint32_t d=0;d<snaps[i].depth;++d) {
-            const uint64_t rip=snaps[i].frames[d], base=(uint64_t)(uintptr_t)image;
-            if (image && rip>=base && rip-base<image_size_for_watchdog)
-                fprintf(stderr,"    #%u guest 0x%llx\n",d,(unsigned long long)(rip-base));
-            else
-                fprintf(stderr,"    #%u host  0x%016llx\n",d,(unsigned long long)rip);
-        }
-    }
+    print_thread_stacks("STOP: watchdog timeout");
     watchdog_extra();
     _exit(124);
     return 0;
@@ -826,7 +840,7 @@ int main(int argc, char **argv) {
     }
     /* issn: the watchdog on Windows: after --timeout seconds, the registers and frame chain of
      * every guest thread (runtime_thread_snapshot), then exit as on Linux. */
-    if (timeout_seconds) {
+    {   /* Always running: F10 snapshots; the timeout only when given. */
         static unsigned seconds;
         seconds=(unsigned)timeout_seconds;
         HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,&seconds,0,NULL);

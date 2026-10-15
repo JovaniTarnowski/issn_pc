@@ -405,6 +405,7 @@ void runtime_thread_report(void) {
 }
 
 
+volatile int runtime_snapshot_request; /* issn: F10 (runtime.h) */
 #ifdef _WIN32
 /* issn: the watchdog's view of every live guest thread (Windows has no signal to make a thread
  * dump itself): each one is suspended in turn, its registers and rbp frame chain copied with

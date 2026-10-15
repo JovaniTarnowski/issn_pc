@@ -375,6 +375,16 @@ static void sample_host(PadData *d) {
     sample_motion(d,g);
     if (gow3gpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    {   /* issn: F10 asks for a snapshot of the guest threads (see runtime_snapshot_request). */
+        static bool f10_was_down;
+        const bool f10=k && k[SDL_SCANCODE_F10];
+        if (f10 && !f10_was_down) {
+            runtime_snapshot_request=1;
+            printf("Runtime: F10: thread snapshot requested\n");
+            fflush(stdout);
+        }
+        f10_was_down=f10;
+    }
     load_button_maps();
     if (g) {
         for (size_t i=0;i<pad_map.count;++i)
