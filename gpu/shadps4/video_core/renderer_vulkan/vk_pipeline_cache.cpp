@@ -79,6 +79,19 @@ struct AsyncGraphicsCompilation {
     bool failure_logged = false;
 };
 
+// issn: a compute pipeline built on a compiler thread (GOW3_ASYNC_COMPUTE); its dispatches are
+// skipped until it is ready, as graphics draws are with async shaders.
+struct AsyncComputeCompilation {
+    AsyncJob<std::shared_ptr<AsyncComputeCompilation>> job;
+    std::unique_ptr<Shader::Info> info;
+    std::vector<u32> user_data;
+    const Shader::Info* live_info = nullptr;
+    vk::ShaderModule module;
+    ComputePipeline::SerializationSupport data;
+    std::unique_ptr<ComputePipeline> pipeline;
+    bool failure_logged = false;
+};
+
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
 constexpr static std::array DescriptorHeapSizes = {
@@ -630,12 +643,46 @@ void PipelineCache::PublishGraphics(bool wait) {
     }
 }
 
+void PipelineCache::PublishCompute(bool wait) {
+    for (auto it = pending_compute.begin(); it != pending_compute.end();) {
+        auto build = it.value();
+        if (wait) {
+            build->job.Wait();
+        }
+        auto result = build->job.Poll();
+        if (!result) {
+            if (build->job.Failed() && !build->failure_logged) {
+                LOG_ERROR(Render_Vulkan, "issn: compute pipeline {:#x} compilation failed: {}",
+                          std::hash<ComputePipelineKey>{}(it.key()), build->job.Error());
+                build->failure_logged = true;
+            }
+            ++it;
+            continue;
+        }
+        const auto key = it.key();
+        build->pipeline->PublishStage(build->live_info);
+        RegisterPipelineData(key, build->data);
+        compute_pipelines.insert_or_assign(key, std::move(build->pipeline));
+        ++num_new_pipelines;
+        it = pending_compute.erase(it);
+    }
+}
+
+bool PipelineCache::AsyncComputeEnabled() const {
+    static const bool wanted = [] {
+        const char* env = std::getenv("GOW3_ASYNC_COMPUTE");
+        return env != nullptr && env[0] == '1';
+    }();
+    return wanted && AsyncCompilation();
+}
+
 void PipelineCache::FinishCompilations() {
     if (compiler) {
         capture_compiler->Stop();
         compiler->Stop();
         PublishShaders(true);
         PublishGraphics(true);
+        PublishCompute(true);
         std::vector<vk::PipelineCache> sources;
         for (const auto& cache : worker_pipeline_caches) {
             sources.push_back(*cache);
@@ -801,8 +848,38 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     PublishShaders();
     PublishGraphics();
+    PublishCompute();
     PumpWarmUp();
     if (!RefreshComputeKey()) {
+        return nullptr;
+    }
+    if (AsyncComputeEnabled() && !EmulatorSettings.IsShaderCollect()) {
+        const auto found = compute_pipelines.find(compute_key);
+        if (found != compute_pipelines.end()) {
+            return found->second.get();
+        }
+        if (!pending_compute.contains(compute_key) && compiler->HasCapacity()) {
+            SeedWorkerCaches();
+            auto build = std::make_shared<AsyncComputeCompilation>();
+            build->live_info = sel.infos[0];
+            build->info = std::make_unique<Shader::Info>(*sel.infos[0]);
+            build->user_data.assign(sel.infos[0]->user_data.begin(), sel.infos[0]->user_data.end());
+            build->info->user_data = build->user_data;
+            build->module = sel.modules[0];
+            const auto key = compute_key;
+            const bool queued = build->job.Start(*compiler, [this, build, key] {
+                PhaseTimer compile{g_gow3_async_ns};
+                build->pipeline = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile,
+                    *worker_pipeline_caches[AsyncCompiler::WorkerIndex()], key, *build->info,
+                    build->module, build->data, false);
+                return build;
+            });
+            if (queued) {
+                pending_compute.emplace(compute_key, std::move(build));
+            }
+        }
+        ++g_gow3_pending_draws;
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
@@ -1331,6 +1408,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                                                              std::span<const u32> spv_code) {
     PublishShaders(true);
     PublishGraphics(true);
+    PublishCompute(true);
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

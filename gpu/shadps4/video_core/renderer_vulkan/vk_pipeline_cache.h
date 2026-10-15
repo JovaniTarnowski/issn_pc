@@ -43,6 +43,7 @@ class Scheduler;
 class ShaderCache;
 struct AsyncShaderCompilation;
 struct AsyncGraphicsCompilation;
+struct AsyncComputeCompilation;
 
 struct Program {
     struct Module {
@@ -182,6 +183,8 @@ private:
                      std::optional<Shader::StageSpecialization> specialization = {});
     void PublishShaders(bool wait = false);
     void PublishGraphics(bool wait = false);
+    void PublishCompute(bool wait = false);
+    bool AsyncComputeEnabled() const;
     void FinishCompilations();
     void SeedWorkerCaches();
     bool CheckCacheProfile();
@@ -232,6 +235,8 @@ private:
     /// gow3: StartBackgroundWarmUp state; owned here, deleted by StopWarmUp.
     BackgroundWarmup* background = nullptr;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsCompilation>> pending_graphics;
+    /// issn: GOW3_ASYNC_COMPUTE: compute pipelines built on the compiler threads too.
+    tsl::robin_map<ComputePipelineKey, std::shared_ptr<AsyncComputeCompilation>> pending_compute;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     std::vector<Program*> pending_programs;
     /// gow3: exclusive for program/permutation insertions, shared for worker lookups.
