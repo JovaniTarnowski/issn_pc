@@ -9,6 +9,9 @@
 #endif
 #include "gow3_toggles.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <atomic>
 #include <condition_variable>
 #include <boost/asio/io_context.hpp>
@@ -211,6 +214,23 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int gow3gpu_init(const Gow3GpuConfig* config) {
+    // issn: an exception nobody catches (a worker thread, the shader compiler) ends the process
+    // through std::terminate: name it before the loader's abort report prints the stack.
+    std::set_terminate([] {
+        std::string what = "no exception in flight";
+        if (const auto exception = std::current_exception()) {
+            try {
+                std::rethrow_exception(exception);
+            } catch (const std::exception& e) {
+                what = std::string{"exception: "} + e.what();
+            } catch (...) {
+                what = "exception of unknown type";
+            }
+        }
+        std::fprintf(stderr, "STOP: std::terminate (%s)\n", what.c_str());
+        std::fflush(stderr);
+        std::abort();
+    });
     Gow3Settings::Load();
 #ifdef GOW3_PGO_GENERATE
     StartProfileWriter();

@@ -319,12 +319,34 @@ def main():
                    '--user', str(user_dir),
                    '--timeout', env.get('GOW3_TIMEOUT', '0'), *isa_args, *glyph_args, *args]
         # No stdin: an inherited pipe (shells such as Git Bash) cost the game its console output.
-        return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+        code = subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+        report_exit(code)
+        return code
     finally:
         if mod_view:
             shutil.rmtree(mod_view, ignore_errors=True)
         if update_view:
             game_update.remove_view(update_view)
+
+
+# Windows exit codes of a process that ended without its own report.
+EXIT_CODES = {
+    0xC0000005: 'access violation outside the loader\'s handler',
+    0xC00000FD: 'stack overflow',
+    0xC0000409: 'fast fail (stack buffer overrun check, abort or an invalid parameter)',
+    0xC0000374: 'heap corruption',
+    0xC000001D: 'illegal instruction',
+    0xE0000008: 'out of memory',
+}
+
+
+def report_exit(code):
+    """Prints the probe's exit code when it is not a normal one (Windows status codes)."""
+    status = code & 0xffffffff
+    if status in (0, 1, 3, 124) or status < 256:
+        return
+    print(f'issn-probe ended with status 0x{status:08X}' +
+          (f' ({EXIT_CODES[status]})' if status in EXIT_CODES else ''), file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':

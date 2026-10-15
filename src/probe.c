@@ -18,6 +18,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <signal.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -125,6 +126,22 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+/* issn: abort() (a failed C++ runtime check, std::terminate after an uncaught exception) ends
+ * the process silently on Windows (fast fail): report where it came from. */
+static void abort_report(int sig) {
+    (void)sig;
+    fprintf(stderr,"STOP: abort() on thread %lu; stack:\n",GetCurrentThreadId());
+    void *frames[48];
+    const USHORT n=RtlCaptureStackBackTrace(1,48,frames,NULL);
+    char where[MAX_PATH+64];
+    for (USHORT i=0;i<n;++i) {
+        describe_address(where,sizeof(where),(uintptr_t)frames[i]);
+        fprintf(stderr,"  #%u %s\n",i,where);
+    }
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),3);
+}
+static HMODULE gpu_module; /* the GPU library's DLL: its faults are ours too */
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -200,7 +217,8 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
         uintptr_t rip=(uintptr_t)info->ContextRecord->Rip;
         HMODULE self=GetModuleHandleA(NULL), module=NULL;
         int ours=(image && rip-(uintptr_t)image<0x20000000) ||
-                 (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
+                 (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) &&
+                  (module==self || (gpu_module && module==gpu_module))) ||
                  !module;
         if (ours) return fatal_exception(info);
     }
@@ -761,6 +779,11 @@ int main(int argc, char **argv) {
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, vectored_fault);
     SetUnhandledExceptionFilter(unhandled_fault);
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)(uintptr_t)gow3gpu_init,&gpu_module);
+    if (gpu_module==GetModuleHandleA(NULL)) gpu_module=NULL;
+    signal(SIGABRT,abort_report);
+    _set_abort_behavior(0,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
     if (getenv("GOW3_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;
