@@ -1,8 +1,12 @@
-inFAMOUS Second Son for PC (issn_pc) - IN DEVELOPMENT, NOT PLAYABLE YET
-=======================================================================
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.1.0
+======================================================
+
+A test build for a few testers: the game plays from the start, with stutter (shaders compiled as
+they are first used), about 25-30 FPS and some cut or broken effects. Please report how far you
+get and what goes wrong (see Reporting problems).
 
 No game files are included. You need your own dump of inFAMOUS Second Son, made from your own
-copy of the game on your own PS4: CUSA00004 (US) or CUSA00223 (EU), base game version 01.00, as
+copy of the game on your own PS4: CUSA00004 (Europe) or CUSA00223, base game version 01.00, as
 a folder that contains eboot.bin, sce_module and sce_sys. How to dump it: docs/issn/DUMP.md.
 
 Built on the God of War III Remastered port (gow3_pc, by Felipe Prado), which comes from
@@ -22,8 +26,14 @@ Starting
 
 Controller
 - DualShock 4 and DualSense: touchpad, motion sensors (shake and tilt the spray can) and the
-  light bar work as on the PS4. Other pads and the keyboard: G shakes (Share on an Xbox Series
-  pad, Mute on a DualSense); change it on the launcher's Controls page.
+  light bar work as on the PS4.
+- Pads without a touchpad or motion sensors (Xbox, 8BitDo, ...):
+  - Spray can: L3 + R3 together (or H) holds the pad like the spray can; L1 shakes it, the right
+    stick aims. L3 + R3 again ends it.
+  - Touchpad swipe (lift, push): hold Select/Back and push the right stick that way.
+  - Two fingers on the touchpad (lifting the tree): hold Select/Back + RB (R1).
+  - Touchpad click: Select/Back.
+- Text and voices are in English.
 
 Data
 - Saves, shader cache and the log: user\ next to inFAMOUS Second Son.exe.
@@ -31,7 +41,11 @@ Data
 - Generated files (prepared game image, patches): out\.
 - The game process is bin\issn-probe.exe (for RTSS, Afterburner or ReShade with Vulkan).
 
-Problems
+Reporting problems
+- Send user\last_run.log (written each time the game runs) with a screenshot or a short video,
+  and say where in the game it happened.
+- If the game freezes, press F10 once, wait a few seconds, then close it: the log then shows
+  what each thread was doing.
 - The game does not open: check the Log page, and send user\last_run.log with your report.
 - Check your dump: python tools\issn\inspect_dump.py "<game folder>".
 

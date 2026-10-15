@@ -57,7 +57,7 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEW_GROUP = {} if WINDOWS else {'start_new_session': True}
 UI_FONT, MONO_FONT, SERIF_FONT = 'Segoe UI', 'Consolas', 'Georgia'
 # This build; GitHub release tags are windows-v<VERSION>.
-VERSION = '2.2.0'
+VERSION = '0.1.0'
 # issn: no releases of this port yet. The God of War III port's releases must never be
 # installed over it, so the update check is off until RELEASES_API names this port's repository.
 RELEASES_API = ''
