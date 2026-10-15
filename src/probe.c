@@ -938,6 +938,7 @@ int main(int argc, char **argv) {
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
     image = allocate(round_page(size) + stub_area);
     image_size_for_watchdog=size;
+    fprintf(stderr,"Guest image at %p (%zu bytes)\n",(void *)image,(size_t)size);
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);

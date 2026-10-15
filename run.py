@@ -319,7 +319,13 @@ def main():
                    '--user', str(user_dir),
                    '--timeout', env.get('GOW3_TIMEOUT', '0'), *isa_args, *glyph_args, *args]
         # No stdin: an inherited pipe (shells such as Git Bash) cost the game its console output.
-        code = subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+        if WINDOWS and env.get('GOW3_DEBUGGER') == '1':
+            # issn: a minimal debugger reports fast fails, which no handler in the process sees.
+            sys.path.insert(0, str(PORT / 'scripts'))
+            import windebug
+            code = windebug.run(command)
+        else:
+            code = subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
         report_exit(code)
         return code
     finally:
