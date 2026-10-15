@@ -106,4 +106,7 @@ void runtime_savedata_report(void);
 int runtime_savedata_param(int32_t user, const char *dir, void *param);
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
 void runtime_thread_attach_host(const char *name);
+/* issn: a guest thread's registers and rbp frame chain, for the Windows watchdog (probe.c). */
+typedef struct { char name[32]; uint32_t tid, depth; uint64_t rdi, rsi, frames[24]; } ThreadSnapshot;
+size_t runtime_thread_snapshot(ThreadSnapshot *out, size_t capacity);
 #endif

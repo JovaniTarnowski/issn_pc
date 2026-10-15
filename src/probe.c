@@ -345,6 +345,29 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
+#ifdef _WIN32
+static size_t image_size_for_watchdog;
+static DWORD WINAPI watchdog_thread(void *arg) {
+    Sleep(*(unsigned *)arg*1000u);
+    static ThreadSnapshot snaps[256];
+    const size_t n=runtime_thread_snapshot(snaps,sizeof(snaps)/sizeof(*snaps));
+    fprintf(stderr,"STOP: watchdog timeout; thread stacks (%zu guest threads):\n",n);
+    for (size_t i=0;i<n;++i) {
+        fprintf(stderr,"  thread '%s' tid=%u rdi=%016llx rsi=%016llx\n",snaps[i].name,snaps[i].tid,
+                (unsigned long long)snaps[i].rdi,(unsigned long long)snaps[i].rsi);
+        for (uint32_t d=0;d<snaps[i].depth;++d) {
+            const uint64_t rip=snaps[i].frames[d], base=(uint64_t)(uintptr_t)image;
+            if (image && rip>=base && rip-base<image_size_for_watchdog)
+                fprintf(stderr,"    #%u guest 0x%llx\n",d,(unsigned long long)(rip-base));
+            else
+                fprintf(stderr,"    #%u host  0x%016llx\n",d,(unsigned long long)rip);
+        }
+    }
+    fflush(NULL);
+    _exit(124);
+    return 0;
+}
+#endif
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
     FILE *f=fopen(path,"rb");
@@ -725,7 +748,14 @@ int main(int argc, char **argv) {
         if (!SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy,&strict,sizeof(strict)))
             fprintf(stderr,"GOW3_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
     }
-    (void)timeout_seconds; /* no watchdog on Windows */
+    /* issn: the watchdog on Windows: after --timeout seconds, the registers and frame chain of
+     * every guest thread (runtime_thread_snapshot), then exit as on Linux. */
+    if (timeout_seconds) {
+        static unsigned seconds;
+        seconds=(unsigned)timeout_seconds;
+        HANDLE watchdog=CreateThread(NULL,0,watchdog_thread,&seconds,0,NULL);
+        if (watchdog) CloseHandle(watchdog);
+    }
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -843,6 +873,9 @@ int main(int argc, char **argv) {
     /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
     image = allocate(round_page(size) + stub_area);
+#ifdef _WIN32
+    image_size_for_watchdog=size;
+#endif
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);

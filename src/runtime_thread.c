@@ -47,6 +47,9 @@ typedef struct GuestThread {
     char name[32];
     int detached, finished, joined, host_owned;
 #ifdef _WIN32
+    HANDLE native; /* issn: this thread's own handle, for the watchdog (runtime_thread_snapshot) */
+#endif
+#ifdef _WIN32
     gow3_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
     jmp_buf exit_jump;
@@ -102,6 +105,12 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
+#ifdef _WIN32
+    if (!t->native && !DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&t->native,
+                                       THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_LIMITED_INFORMATION,
+                                       FALSE,0))
+        t->native=NULL;
+#endif
     set_gs(tcb);
     current=t;
 }
@@ -395,3 +404,41 @@ void runtime_thread_report(void) {
     pthread_mutex_unlock(&lock);
 }
 
+
+#ifdef _WIN32
+/* issn: the watchdog's view of every live guest thread (Windows has no signal to make a thread
+ * dump itself): each one is suspended in turn, its registers and rbp frame chain copied with
+ * ReadProcessMemory (a bad frame cannot fault), and resumed before the next. Nothing that takes a
+ * lock another thread may hold (stdio, the heap) runs while a thread is suspended: the caller
+ * prints the copies afterwards. Returns the number of threads written to `out`. */
+size_t runtime_thread_snapshot(ThreadSnapshot *out, size_t capacity) {
+    size_t count=0;
+    const DWORD self=GetCurrentThreadId();
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t && count<capacity;t=t->next) {
+        if (t->finished || !t->native || GetThreadId(t->native)==self) continue;
+        ThreadSnapshot *snap=&out[count];
+        memset(snap,0,sizeof(*snap));
+        memcpy(snap->name,t->name,sizeof(snap->name));
+        snap->tid=GetThreadId(t->native);
+        if (SuspendThread(t->native)==(DWORD)-1) continue;
+        CONTEXT context; memset(&context,0,sizeof(context));
+        context.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER;
+        if (GetThreadContext(t->native,&context)) {
+            uint64_t rip=context.Rip, rbp=context.Rbp;
+            snap->rdi=context.Rdi; snap->rsi=context.Rsi;
+            for (;snap->depth<sizeof(snap->frames)/sizeof(*snap->frames);) {
+                snap->frames[snap->depth++]=rip;
+                uint64_t frame[2]; SIZE_T read=0;
+                if (!rbp || !ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)rbp,frame,sizeof(frame),&read) ||
+                    read!=sizeof(frame) || frame[0]<=rbp) break;
+                rbp=frame[0]; rip=frame[1];
+            }
+        }
+        ResumeThread(t->native);
+        ++count;
+    }
+    pthread_mutex_unlock(&lock);
+    return count;
+}
+#endif
