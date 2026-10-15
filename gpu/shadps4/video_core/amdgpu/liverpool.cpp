@@ -1404,6 +1404,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
+
+        // issn: a type-2 packet (padding) is one dword. Read as a type-3 header it claims two,
+        // so the last dword of a submission (inFAMOUS Second Son ends each one with 0x80000000)
+        // looked split across the ring: it was buffered and glued in front of the next
+        // submission, whose first dword (its INDIRECT_BUFFER header) was then skipped. The
+        // compute fence that buffer writes never came and the render thread waited forever.
+        if (header->type == 2 && queue.tmp_dwords == 0) {
+            acb = NextPacket(acb, 1);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += 1;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
         u32 next_dw_off = header->type3.NumWords() + 1;
 
         // If we have a buffered packet, use it.
