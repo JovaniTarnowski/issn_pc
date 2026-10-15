@@ -19,7 +19,7 @@
 namespace {
 
 constexpr char ProjectId[] = "42359704-c9f3-4806-9fb5-d469000fdb8a";
-constexpr char EngineVersion[] = "gow3-windows";
+constexpr char EngineVersion[] = "issn-windows";
 
 struct State {
     Gow3DlssLogFn log{};

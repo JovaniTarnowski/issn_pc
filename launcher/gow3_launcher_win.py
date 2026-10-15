@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""God of War III (gow3) launcher for Windows and Linux (Tkinter).
+"""inFAMOUS Second Son (issn) launcher for Windows and Linux (Tkinter), from the God of War III
+(gow3_pc) launcher.
 
-Every setting of the port in one window: the game folder and saves, gow3.ini (upscaler,
+Every setting of the port in one window: the game folder and saves, issn.ini (upscaler,
 preset, output, effects), start-up options passed to run.py as environment variables
 (frame rate, presentation, HDR, ...), mods, third-party patches and controls.
-Launcher options live in %APPDATA%/gow3-launcher/settings.json (~/.config/gow3-launcher on Linux).
+Launcher options live in %APPDATA%/issn-launcher/settings.json (~/.config/issn-launcher on Linux).
 
-Frozen with PyInstaller (packaging/windows/package.sh) the same God of War III.exe also runs the
+Frozen with PyInstaller (packaging/windows/package.sh) the same inFAMOUS Second Son.exe also runs the
 game without the window (`--play`), run.py (`--run`) and the preparation scripts (`--script`),
 so a packaged port needs no Python installation.
 """
@@ -46,10 +47,10 @@ from patches import game_profile, game_sfo  # noqa: E402  (scripts/)
 from prepare import load_sfo  # noqa: E402  (scripts/)
 DATA_DIR = Path(os.environ.get('GOW3_DATA_DIR', PORT_DIR))
 CONFIG_DIR = (Path(os.environ.get('APPDATA', Path.home())) if WINDOWS else
-              Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')) / 'gow3-launcher'
+              Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')) / 'issn-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 MOD_PRESETS = DATA_DIR / 'mods_presets.json'
-APP_NAME = 'God of War III'
+APP_NAME = 'inFAMOUS Second Son'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 # The game and everything it starts form one process group, ended together (GameJob).
@@ -57,13 +58,17 @@ NEW_GROUP = {} if WINDOWS else {'start_new_session': True}
 UI_FONT, MONO_FONT, SERIF_FONT = 'Segoe UI', 'Consolas', 'Georgia'
 # This build; GitHub release tags are windows-v<VERSION>.
 VERSION = '2.2.0'
-RELEASES_API = 'https://api.github.com/repos/FelipePrado0/gow3_pc/releases/latest'
-RELEASES_PAGE = 'https://github.com/FelipePrado0/gow3_pc/releases/latest'
-UPDATE_DIR = Path(tempfile.gettempdir()) / 'gow3-update'
+# issn: no releases of this port yet. The God of War III port's releases must never be
+# installed over it, so the update check is off until RELEASES_API names this port's repository.
+RELEASES_API = ''
+RELEASES_PAGE = ''
+UPDATES = bool(RELEASES_API)
+UPDATE_DIR = Path(tempfile.gettempdir()) / 'issn-update'
 # Never copied over an installation by an update (the package does not hold them either).
-USER_FILES = ('user', 'out', 'mods', 'gow3.ini', 'mods.json', 'mods_presets.json', 'patches.json', 'last_run.log')
-# The God of War face for titles, next to gow3.ico; main() registers it for this process only.
-FONT_FILE = PORT_DIR / 'launcher' / 'gowfont.ttf'
+USER_FILES = ('user', 'out', 'mods', 'issn.ini', 'mods.json', 'mods_presets.json', 'patches.json', 'last_run.log')
+# A display face for titles (launcher/issn_font.ttf, none shipped yet: titles use the serif);
+# main() registers it for this process only.
+FONT_FILE = PORT_DIR / 'launcher' / 'issn_font.ttf'
 FR_PRIVATE = 0x10
 
 
@@ -120,7 +125,7 @@ def find_tool(name):
 
 
 def parse_gpu_list(text):
-    """One tuple per line of `gow3-gpu-capabilities --list`: index, name, type and, from the tools
+    """One tuple per line of `issn-gpu-capabilities --list`: index, name, type and, from the tools
     that print them, the game's multisampling default on that driver ('off' or 'on') and '1' on
     the GPU the game picks without GOW3_GPU_ID. Other lines are skipped."""
     rows = [line.split('\t') for line in text.splitlines()]
@@ -145,7 +150,7 @@ def no_msaa_options(gpus, gpu_id):
 
 def list_gpus():
     """The Vulkan GPUs in the order the game numbers them, or [] when the tool cannot tell."""
-    tool = find_tool('gow3-gpu-capabilities' + ('.exe' if WINDOWS else ''))
+    tool = find_tool('issn-gpu-capabilities' + ('.exe' if WINDOWS else ''))
     if not tool:
         return []
     try:
@@ -287,7 +292,7 @@ def heading_text(text, every_language=False):
 
 
 # ---------------------------------------------------------------------------------------------
-# Settings. gow3.ini keys (the game reads them, the in-game menu edits them) and the
+# Settings. issn.ini keys (the game reads them, the in-game menu edits them) and the
 # launcher's own settings.json (passed to run.py as environment variables).
 
 INI_FLAGS = {'cheat_double_jumps', 'cheat_very_hard', 'object_motion', 'show_fps', 'vsync', 'async_shaders', 'deferred_readback',
@@ -304,7 +309,7 @@ FPS_LIMITS = [('30', ('30',)), ('60', ('60',)), ('120', ('120',)), ('240', ('240
 # The sidebar's pages, top to bottom, and the methods that refresh a page's lists when it is shown.
 PAGES = ('home', 'graphics', 'performance', 'game', 'advanced')
 PAGE_REFRESH = {'home': ('refresh_status',), 'game': ('refresh_lists', 'refresh_game_patches')}
-APP_DEFAULTS = {'ui_language': 'en', 'game_dir': os.environ.get('GOW3_GAME_DIR', str(PORT_DIR.parent / 'CUSA01623') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False,
+APP_DEFAULTS = {'ui_language': 'en', 'game_dir': os.environ.get('GOW3_GAME_DIR', str(PORT_DIR.parent / 'CUSA00004') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False,
                 'video_backend': 'auto', 'gamemode': False, 'mangohud': False, 'desktop_integration': True, 'user_dir': '',
                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
                 'player_name': '', 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'no_msaa': '', 'stream_memory': 'cached',
@@ -416,7 +421,7 @@ def load_json(path, default):
 
 
 def ini_path():
-    return Path(os.environ.get('GOW3_CONFIG', DATA_DIR / 'gow3.ini'))
+    return Path(os.environ.get('GOW3_CONFIG', DATA_DIR / 'issn.ini'))
 
 
 def load_ini():
@@ -558,7 +563,7 @@ def describe_missing(missing):
 
 
 def ready_to_play(game_dir, update_dir=''):
-    """Whether --play (Steam, "Play God of War III.exe") may start the game at once; anything
+    """Whether --play (Steam, "Play inFAMOUS Second Son.exe") may start the game at once; anything
     the Play button would refuse opens the launcher window instead."""
     if update_dir and same_folder(update_dir, game_dir or '.'):
         return False
@@ -650,7 +655,7 @@ DESKTOP_MARKER = 'X-GOW3-Integration=true'
 
 def desktop_entry(command, icon, marker=False):
     """The menu entry; its StartupWMClass is the application id of the launcher and of the game window."""
-    return ('[Desktop Entry]\nType=Application\nName=God of War III Remastered\n'
+    return ('[Desktop Entry]\nType=Application\nName=inFAMOUS Second Son\n'
             f'Exec={command}\nIcon={icon}\nTerminal=false\nCategories=Game;\nStartupWMClass=gow3\n'
             + (DESKTOP_MARKER + '\n' if marker else ''))
 
@@ -668,7 +673,7 @@ def integrate_desktop(enabled, appimage, icon_source, data_dir, home=None):
             return None
         if not appimage or (entry.is_file() and not ours):
             return None
-        icon = Path(data_dir) / 'gow3.png'
+        icon = Path(data_dir) / 'issn.png'
         icon.parent.mkdir(parents=True, exist_ok=True)
         if not icon.is_file() or icon.read_bytes() != Path(icon_source).read_bytes():
             shutil.copyfile(icon_source, icon)
@@ -683,7 +688,7 @@ def integrate_desktop(enabled, appimage, icon_source, data_dir, home=None):
 
 def steam_icon(game):
     """Picture of the Steam shortcut's icon: the launcher's own on Linux, the game's on Windows."""
-    return Path(game) / 'sce_sys' / 'icon0.png' if WINDOWS else PORT_DIR / 'launcher' / 'gow3.png'
+    return Path(game) / 'sce_sys' / 'icon0.png' if WINDOWS else PORT_DIR / 'launcher' / 'issn.png'
 
 
 def steam_launch_command():
@@ -771,9 +776,9 @@ def game_environment(s):
 # ---------------------------------------------------------------------------------------------
 # The window.
 
-# God of War III's own colors: near black, ash and blood red (no gold or orange).
-BG, PANEL, CARD, LINE = '#0d0b0b', '#161212', '#1d1717', '#2a2222'
-TEXT, MUTED, ACCENT, ACCENT_HI = '#e6e0d8', '#8a817a', '#a4161a', '#c81e25'
+# inFAMOUS Second Son: night asphalt and the ember orange of smoke powers.
+BG, PANEL, CARD, LINE = '#0b0c0e', '#131519', '#1a1d22', '#262a31'
+TEXT, MUTED, ACCENT, ACCENT_HI = '#e7e5e2', '#8a8f97', '#d4461b', '#ff6a2c'
 RESOLUTION_CHOICES = [('native', ('Native (1080p)',)), ('480p', ('480p',)), ('720p', ('720p',)),
                       ('1440p', ('1440p',)), ('1800p', ('1800p',)), ('4K', ('4K',))]
 ENGINE_FPS_CHOICES = [('60', ('60 (original)',)), ('120', ('120',)), ('240', ('240',))]
@@ -855,7 +860,7 @@ class Launcher:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
         root.after(500, self.watch_changes)
-        if WINDOWS and self.app.get('check_updates', True):
+        if WINDOWS and UPDATES and self.app.get('check_updates', True):
             threading.Thread(target=self.check_update, daemon=True).start()
 
     def meta_dir(self):
@@ -866,7 +871,7 @@ class Launcher:
 
     def set_icon(self):
         game_icon = Path(self.meta_dir() or '.') / 'sce_sys' / 'icon0.png'
-        self.icon = window_icon(self.root, self.tk, game_icon, PORT_DIR / 'launcher' / 'gow3.png',
+        self.icon = window_icon(self.root, self.tk, game_icon, PORT_DIR / 'launcher' / 'issn.png',
                                 CONFIG_DIR / 'game_icon.ico')
 
     # ---- look --------------------------------------------------------------------------------
@@ -1291,9 +1296,9 @@ class Launcher:
         self.section(f, _('Folders'))
         self.folder(f, 'game_dir', _('Game folder', 'Папка игры'),
                     _('Choose the folder with eboot.bin', 'Выберите папку с eboot.bin'),
-                    _('Your own dump of the game (eboot.bin, sce_module, sce_sys): God of War III Remastered, '
+                    _('Your own dump of the game (eboot.bin, sce_module, sce_sys): inFAMOUS Second Son, '
                       'any region and version.',
-                      'Ваш дамп игры (eboot.bin, sce_module, sce_sys): God of War III Remastered, '
+                      'Ваш дамп игры (eboot.bin, sce_module, sce_sys): inFAMOUS Second Son, '
                       'любой регион и версия.'), on_change=self.game_changed)
         self.folder(f, 'update_dir', _('Update folder (optional)'),
                     _('Choose the folder of the update (eboot.bin, sce_sys)'),
@@ -1355,7 +1360,7 @@ class Launcher:
 
     def build_patches(self, f):
         """Community patches of the selected game's built-in XML and third-party patch files, on the
-        Game page. Resolution and frame rate patches follow Performance (gow3.ini; run.py adds them)."""
+        Game page. Resolution and frame rate patches follow Performance (issn.ini; run.py adds them)."""
         self.section(f, _('Game patches', 'Патчи игры'))
         self.game_patch_frame = self.ttk.Frame(f)
         self.game_patch_frame.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we')
@@ -1403,7 +1408,7 @@ class Launcher:
 
     def store_game_patches(self):
         """The page's selection into settings (the whole list for this game, without the resolution
-        and frame rate patches: run.py adds those from gow3.ini)."""
+        and frame rate patches: run.py adds those from issn.ini)."""
         if not self.game_patch_title:
             return
         self.app.setdefault('game_patches', {})[self.game_patch_title] = \
@@ -1538,12 +1543,12 @@ class Launcher:
         self.row(f, _('Launcher language', 'Язык лаунчера'), self.choice(f, 'ui_language', 'app', UI_LANGUAGES),
                  _('Applies when the launcher opens again.', 'Применится при следующем открытии лаунчера.'))
         self.check(f, 'close_on_play', 'app', _('Close the launcher when the game starts', 'Закрывать лаунчер при запуске игры'))
-        if WINDOWS:
+        if WINDOWS and UPDATES:
             self.check(f, 'check_updates', 'app', _('Check for updates when the launcher opens',
                                                     'Проверять обновления при открытии лаунчера'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
-        if WINDOWS:
+        if WINDOWS and UPDATES:
             ttk.Button(holder, text=_('Check for updates', 'Проверить обновления'),
                        command=lambda: threading.Thread(target=self.check_update, args=(True,), daemon=True).start()
                        ).pack(side='left')
@@ -1556,7 +1561,7 @@ class Launcher:
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
         ttk.Button(holder, text=_('Port folder', 'Папка порта'), command=lambda: self.open_path(DATA_DIR)).pack(side='left')
-        ttk.Button(holder, text='gow3.ini', command=lambda: self.open_path(ini_path())).pack(side='left', padx=6)
+        ttk.Button(holder, text='issn.ini', command=lambda: self.open_path(ini_path())).pack(side='left', padx=6)
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Clear shader cache', 'Очистить кэш шейдеров'), command=self.clear_cache).pack(side='left')
@@ -1758,7 +1763,7 @@ class Launcher:
             self.refresh_lists()
 
     def gather(self):
-        """What collect() writes, as data: settings.json, the gow3.ini values, the mods selection and
+        """What collect() writes, as data: settings.json, the issn.ini values, the mods selection and
         the third-party patches selection. Reads the window and changes nothing."""
         app, ini = dict(self.app), dict(self.ini)
         if self.game_patch_title:
@@ -1783,7 +1788,7 @@ class Launcher:
         return {'app': app, 'ini': ini, 'mods': mods, 'patches': patches}
 
     def collect(self):
-        """Writes settings.json, gow3.ini, mods.json and patches.json."""
+        """Writes settings.json, issn.ini, mods.json and patches.json."""
         state = self.gather()
         _disk, lines = load_ini()
         persisted = {line.split('=', 1)[0].strip() for line in lines
@@ -1916,8 +1921,8 @@ class Launcher:
         if not self.collect():
             return
         if not game_info(self.app['game_dir']):
-            self.messagebox.showerror(APP_NAME, _('Choose the game folder with eboot.bin (CUSA01623).',
-                                                  'Выберите папку игры с eboot.bin (CUSA01623).'))
+            self.messagebox.showerror(APP_NAME, _('Choose the game folder with eboot.bin (CUSA00004).',
+                                                  'Выберите папку игры с eboot.bin (CUSA00004).'))
             self.show('game')
             return
         if not self.offer_system_files():
@@ -2104,7 +2109,7 @@ class Launcher:
                 shutil.rmtree(UPDATE_DIR, ignore_errors=True)
                 UPDATE_DIR.mkdir(parents=True, exist_ok=True)
                 archive = UPDATE_DIR / 'update.zip'
-                request = urllib.request.Request(url, headers={'User-Agent': 'gow3-launcher'})
+                request = urllib.request.Request(url, headers={'User-Agent': 'issn-launcher'})
                 with urllib.request.urlopen(request, timeout=60) as response, open(archive, 'wb') as out:
                     total, done, shown = int(response.headers.get('Content-Length') or 0), 0, -1
                     while chunk := response.read(1 << 20):
@@ -2117,11 +2122,11 @@ class Launcher:
                 with zipfile.ZipFile(archive) as package:
                     package.extractall(UPDATE_DIR / 'new')
                 archive.unlink()
-                new = next((p.parent for p in (UPDATE_DIR / 'new').rglob('God of War III.exe')), None)
+                new = next((p.parent for p in (UPDATE_DIR / 'new').rglob('inFAMOUS Second Son.exe')), None)
                 if not new:
-                    raise OSError('God of War III.exe is missing from the download')
+                    raise OSError('inFAMOUS Second Son.exe is missing from the download')
                 # The new launcher copies itself over this installation once this one has closed.
-                subprocess.Popen([str(new / 'God of War III.exe'), '--install-update', str(PORT_DIR), str(os.getpid())],
+                subprocess.Popen([str(new / 'inFAMOUS Second Son.exe'), '--install-update', str(PORT_DIR), str(os.getpid())],
                                  cwd=str(new), stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
                 self.ui_calls.put(self.root.destroy)
             except (OSError, zipfile.BadZipFile) as failure:
@@ -2144,7 +2149,7 @@ class Launcher:
                                                  'минут будет подтормаживать, пока кэш собирается заново.'))
 
     def shortcut(self):
-        """God of War III.lnk on the desktop (a .desktop entry in the menu and on the desktop on Linux)."""
+        """inFAMOUS Second Son.lnk on the desktop (a .desktop entry in the menu and on the desktop on Linux)."""
         if not WINDOWS:
             self.linux_shortcut()
             return
@@ -2153,9 +2158,9 @@ class Launcher:
         else:  # a source tree: the launcher script with the windowless Python
             pythonw = Path(sys.executable).with_name('pythonw.exe')
             target = str(pythonw if pythonw.exists() else sys.executable)
-            arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'gow3.ico'
+            arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'issn.ico'
         script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath("Desktop")'
-                  '+"\\God of War III.lnk");'
+                  '+"\\inFAMOUS Second Son.lnk");'
                   f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
                   + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
         result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
@@ -2169,10 +2174,10 @@ class Launcher:
         launcher = os.environ.get('APPIMAGE') or (sys.executable if FROZEN else '')
         command = f'"{launcher}"' if launcher else f'python3 "{Path(__file__).resolve()}"'
         icon_dir = Path.home() / '.local' / 'share' / 'icons'
-        icon = icon_dir / 'gow3.png'
+        icon = icon_dir / 'issn.png'
         try:
             icon_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(PORT_DIR / 'launcher' / 'gow3.png', icon)
+            shutil.copyfile(PORT_DIR / 'launcher' / 'issn.png', icon)
         except OSError:
             icon = 'gow3'
         entry = desktop_entry(command, icon)
@@ -2190,7 +2195,7 @@ class Launcher:
                     continue
                 folder.mkdir(parents=True, exist_ok=True)
                 # In the applications menu the file is named after the window's application id.
-                target = folder / ('gow3.desktop' if folder == folders[0] else 'God of War III.desktop')
+                target = folder / ('gow3.desktop' if folder == folders[0] else 'inFAMOUS Second Son.desktop')
                 target.write_text(entry, encoding='utf-8')
                 target.chmod(0o755)
                 created.append(str(target))
@@ -2205,8 +2210,8 @@ class Launcher:
             return
         game = self.var('game_dir', 'app').get()
         if not game_info(game):
-            self.messagebox.showerror(APP_NAME, _('Choose the game folder with eboot.bin (CUSA01623).',
-                                                  'Выберите папку игры с eboot.bin (CUSA01623).'))
+            self.messagebox.showerror(APP_NAME, _('Choose the game folder with eboot.bin (CUSA00004).',
+                                                  'Выберите папку игры с eboot.bin (CUSA00004).'))
             return
         self.root.configure(cursor='watch')
         self.root.update_idletasks()
@@ -2236,7 +2241,7 @@ class Launcher:
 
 
 class GameJob:
-    """A Windows job holding run.py and everything it starts: gow3-probe.exe and the launches made
+    """A Windows job holding run.py and everything it starts: issn-probe.exe and the launches made
     by the in-game restart (no longer descendants of the first process)."""
 
     def __init__(self, process):
@@ -2340,8 +2345,10 @@ def version_tuple(text):
 
 def latest_release():
     """(version, zip URL, page URL) of the newest GitHub release."""
+    if not UPDATES:
+        raise OSError('this port has no releases yet')
     request = urllib.request.Request(RELEASES_API, headers={'Accept': 'application/vnd.github+json',
-                                                            'User-Agent': 'gow3-launcher'})
+                                                            'User-Agent': 'issn-launcher'})
     with urllib.request.urlopen(request, timeout=15) as response:
         release = json.load(response)
     version = '.'.join(re.findall(r'\d+', release['tag_name']))
@@ -2373,7 +2380,7 @@ def install_update(target, wait_pid):
             'Не удалось установить обновление. Скачайте его со страницы релизов.'), APP_NAME, 0x10)
         open_url(RELEASES_PAGE)
         return 1
-    subprocess.Popen([str(target / 'God of War III.exe')], cwd=str(target))
+    subprocess.Popen([str(target / 'inFAMOUS Second Son.exe')], cwd=str(target))
     return 0
 
 
@@ -2386,7 +2393,7 @@ def main():
     LANG = settings.get('ui_language') or windows_language()
     if not WINDOWS:
         integrate_desktop(settings.get('desktop_integration', True), os.environ.get('APPIMAGE'),
-                          PORT_DIR / 'launcher' / 'gow3.png', DATA_DIR)
+                          PORT_DIR / 'launcher' / 'issn.png', DATA_DIR)
     if WINDOWS and args[:1] == ['--install-update'] and len(args) == 3:
         sys.exit(install_update(args[1], args[2]))
     if WINDOWS and FROZEN and UPDATE_DIR not in PORT_DIR.parents:

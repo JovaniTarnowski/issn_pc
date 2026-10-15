@@ -26,16 +26,16 @@ class DesktopIntegrationTest(unittest.TestCase):
         self.assertEqual(self.integrate(), self.entry)
         text = self.entry.read_text()
         self.assertIn('Exec="/games/gow3.AppImage"', text)
-        self.assertIn(f'Icon={self.data / "gow3.png"}', text)
+        self.assertIn(f'Icon={self.data / "issn.png"}', text)
         self.assertIn('StartupWMClass=gow3', text)
-        self.assertEqual((self.data / 'gow3.png').read_bytes(), b'png one')
+        self.assertEqual((self.data / 'issn.png').read_bytes(), b'png one')
 
     def test_a_moved_appimage_or_a_new_icon_updates_the_entry(self):
         self.integrate()
         self.icon.write_bytes(b'png two')
         self.integrate(appimage='/elsewhere/gow3.AppImage')
         self.assertIn('Exec="/elsewhere/gow3.AppImage"', self.entry.read_text())
-        self.assertEqual((self.data / 'gow3.png').read_bytes(), b'png two')
+        self.assertEqual((self.data / 'issn.png').read_bytes(), b'png two')
 
     def test_turning_it_off_removes_only_our_entry(self):
         self.integrate()

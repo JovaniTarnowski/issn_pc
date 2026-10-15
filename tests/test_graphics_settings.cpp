@@ -1,4 +1,4 @@
-// gow3.ini graphics keys (gow3_settings.cpp, gow3_graphics.h).
+// issn.ini graphics keys (gow3_settings.cpp, gow3_graphics.h).
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>

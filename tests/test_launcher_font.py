@@ -11,14 +11,16 @@ import gow3_launcher_win as launcher  # noqa: E402
 class FontFileTest(unittest.TestCase):
     def test_font_file_is_a_launcher_asset_under_port_dir(self):
         # Frozen builds find launcher assets next to the exe (PORT_DIR / 'launcher'), like gow3.ico.
-        self.assertEqual(launcher.FONT_FILE, launcher.PORT_DIR / 'launcher' / 'gowfont.ttf')
-        self.assertTrue(launcher.FONT_FILE.is_file())
+        self.assertEqual(launcher.FONT_FILE, launcher.PORT_DIR / 'launcher' / 'issn_font.ttf')
+        # issn: no title face is shipped yet (the God of War one went with the game's identity).
 
     def test_windows_package_ships_the_font(self):
         script = (ROOT / 'packaging' / 'windows' / 'package.sh').read_text(encoding='utf-8')
         copies = [line for line in script.splitlines()
-                  if 'launcher/gowfont.ttf' in line and '"$dest/launcher/"' in line]
-        self.assertTrue(copies, 'package.sh must copy launcher/gowfont.ttf into $dest/launcher/')
+                  if 'launcher/issn_font.ttf' in line and '"$dest/launcher/"' in line]
+        self.assertTrue(copies, 'package.sh must copy launcher/issn_font.ttf into $dest/launcher/')
+        self.assertTrue(all(line.startswith('[[ -f launcher/issn_font.ttf ]]') for line in copies),
+                        'only when the file exists: none is shipped yet')
 
 
 class RegisterFontTest(unittest.TestCase):

@@ -15,7 +15,7 @@ Nada é alterado na pasta do jogo. Saída: <out>/issn_report.md e <out>/issn_rep
 
 Uso:
   python tools/issn/inspect_dump.py "D:\\Jogos\\CUSA00004"
-  python tools/issn/inspect_dump.py "D:\\Jogos\\CUSA00004" --probe "C:\\...\\gow3-windows\\bin\\gow3-probe.exe"
+  python tools/issn/inspect_dump.py "D:\\Jogos\\CUSA00004" --probe out\\issn-probe.exe
 
 Com --probe, além da análise estática, prepara a imagem do jogo e roda o carregador real com
 --check-imports (a verificação definitiva, a mesma do port do GOW3).
@@ -154,7 +154,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('game', type=Path, help='pasta do jogo (com eboot.bin, sce_module e sce_sys)')
     parser.add_argument('--out', type=Path, default=REPO / 'out' / 'issn', help='onde gravar o relatório')
-    parser.add_argument('--probe', type=Path, help='gow3-probe.exe para a verificação definitiva')
+    parser.add_argument('--probe', type=Path, help='issn-probe.exe para a verificação definitiva')
     args = parser.parse_args()
     # The report is UTF-8 (Portuguese, the ✅/❌ marks): a pipe or file gets UTF-8 whatever the
     # code page (Windows Pythons write ANSI to pipes); a console shows it as is.

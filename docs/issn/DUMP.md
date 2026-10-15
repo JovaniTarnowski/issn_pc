@@ -107,10 +107,10 @@ Depois **arraste a pasta `CUSA00004` para cima de `tools\issn\diagnosticar.bat`*
 python tools\issn\inspect_dump.py "D:\Jogos\CUSA00004"
 ```
 
-Para a verificação completa, use o carregador do port do GOW3 que você já tem:
+Para a verificação completa, use o carregador que você compilou (`bash build.sh`):
 
 ```powershell
-python tools\issn\inspect_dump.py "D:\Jogos\CUSA00004" --probe "C:\Users\Joao\Downloads\gow3-windows\bin\gow3-probe.exe"
+python tools\issn\inspect_dump.py "D:\Jogos\CUSA00004" --probe out\issn-probe.exe
 ```
 
 O resultado fica em `out\issn\issn_report.md`. **Esse é o arquivo que eu preciso.** Ele diz se

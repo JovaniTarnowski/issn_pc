@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Prepares the game image and starts gow3-probe (Windows and Linux; run.sh wraps it on Linux).
+"""Prepares the game image and starts issn-probe (Windows and Linux; run.sh wraps it on Linux).
 
 Environment variables (GOW3_GAME_DIR, GOW3_DATA_DIR, GOW3_PATCHES, GOW3_MODS_*,
-GOW3_USER_DIR, ...). Extra arguments go to gow3-probe.
+GOW3_USER_DIR, ...). Extra arguments go to issn-probe.
 The in-game "Apply and restart" runs this script again through GOW3_RESTART_COMMAND;
 `--after PID` waits for the previous game process to end first (its GPU device and memory).
 """
@@ -56,7 +56,7 @@ def no_console():
 
 
 def parse_cpu_features(output):
-    """Instruction sets `gow3-probe --cpu-features` reports missing ([] when complete)."""
+    """Instruction sets `issn-probe --cpu-features` reports missing ([] when complete)."""
     for line in output.splitlines():
         if line.startswith('CPU: missing '):
             return [name.strip() for name in line[len('CPU: missing '):].split(',') if name.strip()]
@@ -154,7 +154,7 @@ def main():
     data = Path(env.get('GOW3_DATA_DIR', PORT))
     out = data / 'out'
     out.mkdir(parents=True, exist_ok=True)
-    env.setdefault('GOW3_CONFIG', str(data / 'gow3.ini'))
+    env.setdefault('GOW3_CONFIG', str(data / 'issn.ini'))
     # Values this script derived on the previous start ("Apply and restart" inherits them) are
     # derived again from the new options.
     for key in env.pop('GOW3_DERIVED', '').split(','):
@@ -169,9 +169,9 @@ def main():
     if not env.get('GOW3_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['GOW3_FSR411_DIR'] = str(data / 'fsr4_411')
 
-    probe = Path(env['GOW3_PROBE']) if env.get('GOW3_PROBE') else find_executable('gow3-probe' + EXE_SUFFIX)
+    probe = Path(env['GOW3_PROBE']) if env.get('GOW3_PROBE') else find_executable('issn-probe' + EXE_SUFFIX)
     if not probe or not probe.is_file():
-        fail(f'gow3-probe{EXE_SUFFIX} not found: build it with build.sh or use a packaged build.')
+        fail(f'issn-probe{EXE_SUFFIX} not found: build it with build.sh or use a packaged build.')
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
     if WINDOWS and not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
@@ -186,7 +186,7 @@ def main():
         sys.exit(20)
     missing = parse_cpu_features(features.stdout)
 
-    game = Path(env.get('GOW3_GAME_DIR', PORT.parent / 'CUSA01623'))
+    game = Path(env.get('GOW3_GAME_DIR', PORT.parent / 'CUSA00004'))
     if not (game / 'eboot.bin').is_file():
         fail(f'No eboot.bin in {game} (set GOW3_GAME_DIR).')
     update_view = None
@@ -236,8 +236,8 @@ def main():
         icon_file = game / 'sce_sys' / 'icon0.png'
         if not WINDOWS:
             env.setdefault('SDL_APP_ID', 'gow3')
-            if (PORT / 'launcher' / 'gow3.png').is_file():
-                icon_file = PORT / 'launcher' / 'gow3.png'
+            if (PORT / 'launcher' / 'issn.png').is_file():
+                icon_file = PORT / 'launcher' / 'issn.png'
         try:
             from PIL import Image
             with Image.open(icon_file) as icon:
@@ -246,14 +246,14 @@ def main():
         except (ImportError, OSError):
             pass
         # The temporal upscalers and motion vectors are not calibrated for this game yet: they stay
-        # off unless the launcher's experimental switch is on (then gow3.ini decides); linear
+        # off unless the launcher's experimental switch is on (then issn.ini decides); linear
         # image readbacks fix its corrupted textures.
         if env.get('GOW3_EXPERIMENTAL_UPSCALER') != '1':
             env.setdefault('GOW3_UPSCALER', 'none')
         env.setdefault('GOW3_READBACK_LINEAR', '1')
         if profile:
             names = selected_patches(profile[1], profile[2], env.get('GOW3_PATCHES', ''), env.get('GOW3_PATCHES_ONLY') == '1')
-            # gow3.ini decides the resolution and frame rate patches (in-game menu, launcher); their
+            # issn.ini decides the resolution and frame rate patches (in-game menu, launcher); their
             # names are God of War III's (issn: other games keep their patch file's choice).
             if profile[3] == 'God of War III':
                 names = graphics_options.patch_names(names, graphics)

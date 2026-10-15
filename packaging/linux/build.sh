@@ -5,23 +5,23 @@
 # players need no Python. Needs: ldd, patchelf, curl (appimagetool), python-pyinstaller, tk, pillow, iced-x86.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-[[ -f out/gow3-probe && -f out/gpu/libgow3gpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+[[ -f out/issn-probe && -f out/gpu/libgow3gpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 
 appdir=out/AppDir
 rm -rf "$appdir"
 share=$appdir/usr/share/gow3
 mkdir -p "$share/bin/gpu" "$appdir/usr/lib"
 
-install -m755 out/gow3-probe out/gow3-gpu-capabilities "$share/bin/"
+install -m755 out/issn-probe out/issn-gpu-capabilities "$share/bin/"
 install -m755 out/gpu/libgow3gpu.so "$share/bin/gpu/"
 cp run.py "$share/"
 cp -r scripts patches "$share/"
 mkdir -p "$share/launcher"
 # The icon of the AppImage, the launcher and the game window: packaging/linux/gow3.png when it
 # exists (a local choice), else the launcher's own.
-icon=launcher/gow3.png
+icon=launcher/issn.png
 [[ -f packaging/linux/gow3.png ]] && icon=packaging/linux/gow3.png
-install -m644 "$icon" "$share/launcher/gow3.png"
+install -m644 "$icon" "$share/launcher/issn.png"
 
 # The launcher also runs run.py (--run) and the preparation scripts (--script) itself, as on
 # Windows: the standard modules those scripts import come along as hidden imports.
@@ -32,10 +32,10 @@ for module in argparse base64 collections hashlib json re shutil struct tempfile
     hidden+=(--hidden-import "$module")
 done
 python3 -c 'import iced_x86' || { echo 'Need iced-x86: pip install iced-x86==1.21.0' >&2; exit 1; }
-python3 -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name gow3-launcher \
+python3 -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name issn-launcher \
     --distpath out/pyi-dist --workpath out/pyi-work --specpath out/pyi-work \
     --paths "$PWD/scripts" "${hidden[@]}" "$PWD/launcher/gow3_launcher_win.py"
-cp -r out/pyi-dist/gow3-launcher/. "$share/"
+cp -r out/pyi-dist/issn-launcher/. "$share/"
 find "$share" -name __pycache__ -prune -exec rm -r {} +
 install -m755 packaging/linux/AppRun "$appdir/AppRun"
 install -m644 packaging/linux/gow3.desktop "$appdir/gow3.desktop"
@@ -58,7 +58,7 @@ bundle() {
     done < <(ldd "$elf")
 }
 bundle out/gpu/libgow3gpu.so
-bundle out/gow3-probe
+bundle out/issn-probe
 # libstdc++/libgcc/libz come from the build host: the same glibc generation as the one that runs
 # the AppImage is assumed, and a newer libstdc++ than Mesa's is the safe direction.
 for name in libstdc++.so.6 libgcc_s.so.1; do

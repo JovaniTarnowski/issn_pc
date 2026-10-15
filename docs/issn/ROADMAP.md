@@ -38,7 +38,7 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 |---|---|---|---|
 | 0 | Estrutura do projeto, ferramenta de diagnóstico, guia de dump | ✅ feito | |
 | 1 | Dump do jogo e diagnóstico (`tools/issn/inspect_dump.py`) | ⏳ aguardando dump | dump |
-| 2 | Ambiente de build no Windows (MSYS2 CLANG64) e build do `gow3-probe` | ✅ feito (RX 9060 XT, Vulkan OK) | |
+| 2 | Ambiente de build no Windows (MSYS2 CLANG64) e build do `issn-probe` | ✅ feito (RX 9060 XT, Vulkan OK) | |
 | 3 | Primeiro boot: implementar as funções que faltam, uma a uma, até a primeira tela | a fazer | 1, 2 |
 | 4 | Gráficos: trazer as correções do fork do Ayoub para `gpu/shadps4` | 🟡 correções de renderização feitas; desempenho depois | 3 |
 | 5 | Áudio, vídeos (Bink/AvPlayer), controle e saves | a fazer | 3 |
@@ -56,7 +56,7 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 
 ### Etapa 3: método (o mesmo do GOW3)
 
-1. Rodar `gow3-probe --check-imports` e implementar o que estiver faltando, começando pelas
+1. Rodar `issn-probe --check-imports` e implementar o que estiver faltando, começando pelas
    bibliotecas que o jogo chama primeiro na inicialização (kernel, sysmodule, userservice).
 2. Rodar o jogo. A cada `STOP:` ou `Fault:` no `user/last_run.log`, implementar ou corrigir.
 3. Funções de serviços online (NP, trophies, PSN) entram como versões "vazias" que respondem

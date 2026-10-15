@@ -15,7 +15,7 @@ let
   assetDirs = [ "scripts" "patches" "fsr4_shaders" "launcher" ] ++ lib.optional fsr411 "fsr4_411";
   # Only what the package needs (the tree also holds builds, profiles and captures).
   wanted = [
-    "run.sh" "out" "out/gow3-probe" "out/gow3-gpu-capabilities" "out/gpu" "out/gpu/libgow3gpu.so"
+    "run.sh" "out" "out/issn-probe" "out/issn-gpu-capabilities" "out/gpu" "out/gpu/libgow3gpu.so"
   ] ++ assetDirs;
   src = builtins.path {
     name = "gow3-src";
@@ -95,8 +95,8 @@ pkgs.stdenv.mkDerivation {
     PY
       cp -r fsr4_411 $d/
     fi
-    install -m755 out/gow3-probe $d/bin/gow3-probe
-    install -m755 out/gow3-gpu-capabilities $d/bin/gow3-gpu-capabilities
+    install -m755 out/issn-probe $d/bin/issn-probe
+    install -m755 out/issn-gpu-capabilities $d/bin/issn-gpu-capabilities
     install -Dm755 out/gpu/libgow3gpu.so $d/bin/gpu/libgow3gpu.so
     runHook postInstall
   '';
@@ -106,7 +106,7 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/libexec
     gcc -O2 -Wall -Werror -static -L${pkgs.glibc.static}/lib -DTARGET="\"$out/libexec/gow3\"" \
       ${./gow3-entry.c} -o $out/bin/gow3
-    # The game (settings from the data directory's gow3.ini).
+    # The game (settings from the data directory's issn.ini).
     makeShellWrapper ${pkgs.python3}/bin/python3 $out/libexec/gow3 \
       ${common}      --add-flags "$out/share/gow3/launcher/gow3_vulkan.py ${pkgs.bash}/bin/bash $out/share/gow3/run.sh" \
       --set GOW3_PREBUILT 1 \
