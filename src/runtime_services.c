@@ -98,6 +98,13 @@ static ABI int32_t system_status(unsigned char *status) {
 static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
 static ABI int32_t safe_area(float *info) { if (!info) return SYSTEM_PARAMETER; *info=1.0f; return 0; } /* full screen */
+/* issn: string parameters; the system name is the only one (SCE_SYSTEM_SERVICE_PARAM_ID_SYSTEM_NAME). */
+static ABI int32_t system_param_string(int32_t id,char *buffer,size_t size) {
+    if (!buffer || !size) return SYSTEM_PARAMETER;
+    (void)id;
+    snprintf(buffer,size,"%s","PS4");
+    return 0;
+}
 static ABI int32_t disable_music_player(void) { return 0; }
 static ABI int32_t launch_browser(void) { note("SystemService: web browser request ignored (offline)"); return 0; }
 
@@ -524,6 +531,23 @@ static ABI int32_t playgo_close(int32_t handle) {
 }
 static ABI int32_t playgo_terminate(void) { playgo_handle=0; return 0; }
 
+/* issn: inFAMOUS Second Son. Nothing left to install: no time left, nothing to do. */
+static ABI int32_t playgo_eta(int32_t handle,const uint16_t *ids,uint32_t count,int64_t *eta) {
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    if (!ids || !eta) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    *eta=0; return 0;
+}
+static ABI int32_t playgo_get_todo(int32_t handle,void *list,uint32_t count,uint32_t *out) {
+    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
+    if (!list || !out) return PLAYGO_BAD_POINTER;
+    if (!count) return PLAYGO_BAD_SIZE;
+    *out=0; return 0;
+}
+static ABI int32_t playgo_language(int32_t handle,uint64_t mask) {
+    (void)mask; return handle==playgo_handle && handle ? 0 : PLAYGO_BAD_HANDLE;
+}
+
 /* ---- DiscMap: the game is fully installed, no disc bitmap exists ---- */
 #define DISC_MAP_NO_BITMAP ((int32_t)0x81100004)
 static ABI int32_t discmap_on_hdd(const char *path,int64_t offset,int64_t size,int32_t *result) {
@@ -553,6 +577,12 @@ static const RuntimeExport exports[]={
     {"sceSystemServiceReceiveEvent",system_event}, {"sceSystemServiceHideSplashScreen",hide_splash},
     {"sceSystemServiceLaunchWebBrowser",launch_browser},
     {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area}, {"sceSystemServiceDisableMusicPlayer",disable_music_player},
+    /* issn: inFAMOUS Second Son */
+    {"sceSystemServiceParamGetString",system_param_string}, {"sceSystemServiceShowDisplaySafeAreaSettings",ok_void},
+    {"sceNetCtlInit",ok_void}, {"sceNetCtlTerm",ok_void},
+    {"sceHttpSetRecvTimeOut",ok_void}, {"sceHttpSetSendTimeOut",ok_void}, {"sceHttpsLoadCert",ok_void},
+    {"sceHttpGetAllResponseHeaders",http_fail}, {"sceNpGetAccountCountry",np_signed_out},
+    {"scePlayGoGetEta",playgo_eta}, {"scePlayGoGetToDoList",playgo_get_todo}, {"scePlayGoSetLanguageMask",playgo_language},
     {"sceNetInit",net_init}, {"sceNetTerm",net_term}, {"sceNetErrnoLoc",net_errno_loc},
     {"sceNetPoolCreate",net_pool_create}, {"sceNetPoolDestroy",net_pool_destroy},
     {"sceNetEpollCreate",net_epoll_create}, {"sceNetEpollDestroy",net_epoll_destroy},

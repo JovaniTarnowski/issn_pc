@@ -77,7 +77,16 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
     if (hits) *hits=0;
     ++lists; return 0;
 }
+/* issn: one add-on's information (inFAMOUS Second Son asks for its DLC): none is installed. */
+#define NO_ENTITLEMENT ((int32_t)0x80d90007)
+static ABI int32_t addon_info(uint32_t service,const void *label,void *info) {
+    (void)service;
+    require_initialized();
+    if (!label || !info) return PARAMETER;
+    ++queries; return NO_ENTITLEMENT;
+}
 uintptr_t runtime_content_resolve(const char *name) {
+    if (!strcmp(name,"m47juOmH0VE#libSceAppContent")) return (uintptr_t)addon_info;
     if (!strcmp(name,"g8cM39EUZ6o#libSceSysmodule")) return (uintptr_t)module_load;
     if (!strcmp(name,"fMP5NHUOaMk#libSceSysmodule")) return (uintptr_t)module_loaded;
     if (!strcmp(name,"eR2bZFAAU0Q#libSceSysmodule")) return (uintptr_t)module_unload;
