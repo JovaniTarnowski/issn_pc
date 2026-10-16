@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -141,7 +143,19 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // issn: inFAMOUS Second Son asks for 30 Hz flips (rate 1) in game; GOW3_FLIP_RATE=0 keeps
+    // 60 Hz so a PC that renders faster than 30 FPS shows it (the game runs on real time).
+    static const char* forced = std::getenv("GOW3_FLIP_RATE");
+    const s32 applied = forced && *forced ? std::atoi(forced) : rate;
+    static s32 last_logged = -1;
+    if (rate != last_logged) {
+        last_logged = rate;
+        std::printf("VideoOut: the game asks for flip rate %d (%s)%s\n", rate,
+                    rate == 0 ? "60 Hz" : rate == 1 ? "30 Hz" : "20 Hz",
+                    applied != rate ? "; GOW3_FLIP_RATE overrides it" : "");
+        std::fflush(stdout);
+    }
+    driver->GetPort(handle)->flip_rate = applied;
     return ORBIS_OK;
 }
 
