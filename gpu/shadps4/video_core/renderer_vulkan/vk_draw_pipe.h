@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdlib>
+#include "gow3_sampler.h"
 #include "gow3_threads.h"
 
 #include <array>
@@ -158,6 +159,7 @@ private:
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("gow3:DrawRec");
+        Gow3Sampler::RegisterThisThread("draw recorder");
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
         u64 at = 0;
