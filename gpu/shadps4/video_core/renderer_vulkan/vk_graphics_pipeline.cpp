@@ -1,3 +1,4 @@
+#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -19,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "common/elf_info.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -102,6 +104,22 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    // gow3: GOW3_PIPELINE_LOG=1 lists every graphics pipeline built: primitive type, targets,
+    // vertex formats and shader hashes (finding which pass draws a broken effect).
+    static const bool pipeline_log = std::getenv("GOW3_PIPELINE_LOG") != nullptr;
+    if (pipeline_log) {
+        std::string formats;
+        for (const auto& attr : sdata.vertex_attributes) {
+            formats += fmt::format(" {}:{}", attr.location, vk::to_string(attr.format));
+        }
+        std::string hashes;
+        for (const auto hash : key.stage_hashes) {
+            hashes += fmt::format(" {:#x}", hash);
+        }
+        std::fprintf(stderr, "tlg-pipe: prim=%u poly=%u colors=%u z=%u hashes=[%s ] attrs=[%s ]\n",
+                     unsigned(key.prim_type), unsigned(key.polygon_mode), key.num_color_attachments,
+                     unsigned(key.z_format), hashes.c_str(), formats.c_str());
+    }
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
@@ -433,8 +451,8 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    const auto binary_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-        Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
+    // gow3: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
+    const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
     if (EmulatorSettings.IsDumpShaders()) {
         // issn: the driver may end the process while compiling: the last one named is the one.
         std::fprintf(stderr, "Pipeline: creating graphics %s\n", debug_str.c_str());

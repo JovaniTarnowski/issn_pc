@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <boost/container/static_vector.hpp>
@@ -8,10 +9,14 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/amdgpu/gow3_amd_1d.h"
+#include "video_core/amdgpu/gow3_bc_tiny.h"
+#include "video_core/amdgpu/gow3_block1d.h"
 #include "video_core/amdgpu/gow3_msaa.h"
 #include "video_core/amdgpu/gow3_msaa_default.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -422,7 +427,40 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    // gow3: BP06 (SotC 8d84cf7). Detected at run time: the extension is listed and the feature
+    // reports true; only then is it enabled. Off by default, so the device is created exactly as
+    // before unless GOW3_BP06=1.
+    maximal_reconvergence = false;
+    if (Common::Backports::On(Common::Backports::Id::MaximalReconvergence) &&
+        std::ranges::find(available_extensions, std::string{VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME}) !=
+            available_extensions.end()) {
+        const auto reconvergence_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
+                .get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+        if (reconvergence_features.shaderMaximalReconvergence) {
+            maximal_reconvergence = add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+        } else {
+            LOG_WARNING(Render_Vulkan, "BP06: shaderMaximalReconvergence feature not supported");
+        }
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // gow3: from shadPS4-Infamous-FixBuild e35e04dc. Lets the driver move device memory out to
+    // system memory instead of failing an allocation when the card is full.
+    const bool memory_priority = add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    const bool pageable_extension =
+        memory_priority && add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    if (pageable_extension) {
+        const auto pageable_chain = physical_device.getFeatures2<
+            vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+            vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+        pageable_device_local_memory =
+            pageable_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+            pageable_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
+                .pageableDeviceLocalMemory;
+        LOG_INFO(Render_Vulkan, "- pageableDeviceLocalMemory: {}", pageable_device_local_memory);
+    }
     // gow3: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     // gow3: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
@@ -562,6 +600,8 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
+            // gow3: compute pipelines met in game ask the driver for a cached one first.
+            .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
@@ -643,8 +683,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImageViewMinLodFeaturesEXT{
             .minLod = true,
         },
+        vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
+            .shaderMaximalReconvergence = true,
+        },
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
+        },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = true,
+        },
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
+            .pageableDeviceLocalMemory = true,
         },
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR{
             .computeDerivativeGroupQuads =
@@ -712,8 +761,15 @@ bool Instance::CreateDevice() {
     if (!image_view_min_lod) {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
     }
+    if (!maximal_reconvergence) {
+        device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+    }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!pageable_device_local_memory) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     }
     if (!compute_shader_derivatives) {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
@@ -814,6 +870,59 @@ void Instance::CollectDeviceParameters() {
     AmdGpu::no_msaa.store(no_msaa, std::memory_order_relaxed);
     std::printf("GPU: guest multisampling %s\n",
                 no_msaa ? "off (single-sampled images; GOW3_NO_MSAA=0 keeps it)" : "on");
+
+    // gow3: see video_core/amdgpu/gow3_block1d.h. The query uses the plainest usage the game's BC
+    // 1D textures need (sampled, filled by copies).
+    const char* block1d_env = std::getenv("GOW3_BLOCK1D");
+    const bool bc1d_refused =
+        physical_device
+            .getImageFormatProperties(vk::Format::eBc1RgbaUnormBlock, vk::ImageType::e1D,
+                                      vk::ImageTiling::eOptimal,
+                                      vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferDst)
+            .result != vk::Result::eSuccess;
+    const bool block1d_as_2d = block1d_env && *block1d_env
+                                   ? *block1d_env == '1'
+                                   : false; // issn: every 1D image is 2D already (upstream #5133)
+    AmdGpu::block1d_as_2d.store(block1d_as_2d, std::memory_order_relaxed);
+    if (bc1d_refused || block1d_as_2d) {
+        std::printf("GPU: block-compressed 1D textures %s\n",
+                    block1d_as_2d ? "as 2D images (the driver refuses BC 1D; GOW3_BLOCK1D=0 keeps 1D)"
+                                  : "kept 1D although the driver refuses them (GOW3_BLOCK1D=1 makes them 2D)");
+    }
+
+    // gow3: BP09 (CTR d26bcb2): every 1D image as 2D of height 1; read once, before any image or
+    // shader exists, so the shaders and the images of a session agree.
+    const bool all_1d_as_2d = Common::Backports::On(Common::Backports::Id::Image1DAs2D);
+    AmdGpu::all_1d_as_2d.store(all_1d_as_2d, std::memory_order_relaxed);
+    if (all_1d_as_2d) {
+        std::printf("GPU: every 1D texture as a 2D image of height 1 (GOW3_BP09=1)\n");
+    }
+
+    // gow3: see video_core/amdgpu/gow3_bc_tiny.h. Set before any image or shader exists.
+    const char* bc_tiny_env = std::getenv("GOW3_BC_TINY");
+    const bool bc_tiny = bc_tiny_env && *bc_tiny_env
+                             ? *bc_tiny_env == '1'
+                             : false; // issn: off as tested (1D images are 2D here)
+    AmdGpu::bc_tiny_decode.store(bc_tiny, std::memory_order_relaxed);
+    std::printf("GPU: tiny block-compressed textures (BC1-BC5 1D, or under 4 texels) %s\n",
+                bc_tiny ? "decoded on the CPU to plain images, 1D kept 1D (GOW3_BC_TINY=0 keeps BC)"
+                        : "kept block-compressed (GOW3_BC_TINY=1 decodes them on the CPU)");
+
+    // gow3: see video_core/amdgpu/gow3_amd_1d.h. Set before any image exists.
+    auto env_flag = [](const char* name, bool fallback) {
+        const char* v = std::getenv(name);
+        return v && *v ? *v == '1' : fallback;
+    };
+    AmdGpu::img_trace.store(env_flag("GOW3_IMG_TRACE", false));
+    AmdGpu::img_1d_no_storage.store(env_flag("GOW3_1D_NO_STORAGE", false));
+    AmdGpu::img_1d_no_mutable.store(env_flag("GOW3_1D_NO_MUTABLE", false));
+    if (AmdGpu::ImgTrace() || AmdGpu::img_1d_no_storage || AmdGpu::img_1d_no_mutable) {
+        std::printf("GPU: 1D image switches: trace %d, no storage %d, no mutable %d "
+                    "(GOW3_IMG_TRACE, GOW3_1D_NO_STORAGE, GOW3_1D_NO_MUTABLE); driver %s\n",
+                    AmdGpu::ImgTrace(), AmdGpu::img_1d_no_storage.load(),
+                    AmdGpu::img_1d_no_mutable.load(), GetDriverVersionName().c_str());
+    }
 
     const std::string model_name{GetModelName()};
     const std::string driver_version = GetDriverVersionName();

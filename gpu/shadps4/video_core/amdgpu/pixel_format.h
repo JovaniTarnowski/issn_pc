@@ -356,7 +356,9 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // Reserved/unknown data formats (The Last Guardian binds descriptors with data_fmt 15,
+            // undefined on GCN) are ignored by the hardware; do the same instead of aborting.
+            return NumberConversion::None;
         }
     }
     default:

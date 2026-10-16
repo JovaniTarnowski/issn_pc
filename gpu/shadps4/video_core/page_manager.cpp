@@ -75,7 +75,7 @@ struct PageManager::Impl {
 
     // gow3: GOW3_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
     // tracked pages cost the most time (which game code waits on the GPU, and for what).
-    struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; bool write = false; };
+    struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; u64 caller = 0; bool write = false; };
     static void ProfileFault(void* context, VAddr addr, bool write, u64 ns) {
 #ifdef __linux__
         static const bool enabled = [] { const char* e = std::getenv("GOW3_FAULT_PROFILE"); return e && *e == '1'; }();
@@ -85,13 +85,17 @@ struct PageManager::Impl {
         static std::mutex mutex;
         static std::unordered_map<u64, FaultSite> sites;
         static auto window = std::chrono::steady_clock::now();
-        const u64 rip = static_cast<u64>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+        const auto* uc = static_cast<ucontext_t*>(context);
+        const u64 rip = static_cast<u64>(uc->uc_mcontext.gregs[REG_RIP]);
+        // The return address at the top of the stack (right for leaf routines such as memcpy).
+        const u64 caller = *reinterpret_cast<const u64*>(uc->uc_mcontext.gregs[REG_RSP]);
         std::scoped_lock lock{mutex};
         auto& site = sites[rip];
         ++site.count;
         site.ns += ns;
         site.last = addr;
         site.write = write;
+        site.caller = caller;
         const auto now = std::chrono::steady_clock::now();
         if (now - window < std::chrono::seconds(5)) {
             return;
@@ -102,8 +106,10 @@ struct PageManager::Impl {
         std::printf("Fault profile (5 s):");
         for (size_t i = 0; i < top.size() && i < 8; ++i) {
             const u64 at = top[i].first;
-            std::printf(" [%s %#llx x%llu %.1f ms @%#llx]", top[i].second.write ? "W" : "R",
+            const u64 from = top[i].second.caller;
+            std::printf(" [%s %#llx<-%#llx x%llu %.1f ms @%#llx]", top[i].second.write ? "W" : "R",
                         static_cast<unsigned long long>(at >= 0x800000000ull && at < 0x810000000ull ? at - 0x800000000ull : at),
+                        static_cast<unsigned long long>(from >= 0x800000000ull && from < 0x810000000ull ? from - 0x800000000ull : from),
                         static_cast<unsigned long long>(top[i].second.count), top[i].second.ns / 1e6,
                         static_cast<unsigned long long>(top[i].second.last));
         }

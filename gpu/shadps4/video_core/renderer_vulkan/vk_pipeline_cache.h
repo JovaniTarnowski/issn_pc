@@ -43,7 +43,6 @@ class Scheduler;
 class ShaderCache;
 struct AsyncShaderCompilation;
 struct AsyncGraphicsCompilation;
-struct AsyncComputeCompilation;
 
 struct Program {
     struct Module {
@@ -86,6 +85,7 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+    bool is_indirect = false; // gow3: BP07 and BP11 (the draw is an indirect one)
 };
 
 } // namespace Vulkan
@@ -107,6 +107,7 @@ struct PipelineSelection {
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
     bool compilation_pending = false;
+    bool sync_compile = false; ///< gow3: BP07, shaders and pipeline of this draw compile now
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };
@@ -188,9 +189,12 @@ private:
                      std::optional<Shader::StageSpecialization> specialization = {});
     void PublishShaders(bool wait = false);
     void PublishGraphics(bool wait = false);
-    void PublishCompute(bool wait = false);
-    bool AsyncComputeEnabled() const;
     void FinishCompilations();
+    /// gow3: BP08, the driver's VkPipelineCache blob kept between sessions (see the .cpp).
+    void StartDriverCacheSaver();
+    void StopDriverCacheSaver();
+    bool SaveDriverCache();
+    bool SaveDriverCacheUnchecked();
     void SeedWorkerCaches();
     bool CheckCacheProfile();
     struct BackgroundWarmup;
@@ -231,6 +235,8 @@ private:
     std::unique_ptr<AsyncCompiler> compiler, capture_compiler;
     std::vector<vk::UniquePipelineCache> worker_pipeline_caches;
     bool worker_caches_seeded = false;
+    struct DriverCacheSaver;
+    DriverCacheSaver* driver_saver = nullptr; ///< gow3: BP08
     /// gow3: GOW3_PARALLEL_WARMUP: WarmUp builds the cached pipelines on these threads.
     struct WarmupPool;
     WarmupPool* warmup_pool = nullptr;
@@ -240,8 +246,6 @@ private:
     /// gow3: StartBackgroundWarmUp state; owned here, deleted by StopWarmUp.
     BackgroundWarmup* background = nullptr;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsCompilation>> pending_graphics;
-    /// issn: GOW3_ASYNC_COMPUTE: compute pipelines built on the compiler threads too.
-    tsl::robin_map<ComputePipelineKey, std::shared_ptr<AsyncComputeCompilation>> pending_compute;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     std::vector<Program*> pending_programs;
     /// gow3: exclusive for program/permutation insertions, shared for worker lookups.

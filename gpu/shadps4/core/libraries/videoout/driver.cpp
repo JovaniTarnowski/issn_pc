@@ -14,11 +14,14 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "common/backports.h"
 #include "common/assert.h"
 #include "gow3_toggles.h"
+#include "gow3_freeze.h"
 #include "gow3_settings.h"
 #include "gow3_graphics.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -302,9 +305,11 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting, then present the frame (gow3: on the swap thread).
+    Gow3Freeze::flips_shown.fetch_add(1, std::memory_order_relaxed);
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
+        Gow3Freeze::presents.fetch_add(1, std::memory_order_relaxed);
     });
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
@@ -516,6 +521,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(Gow3Stats::scene_draws.exchange(0)) / frames : 0.0);
             presenter->GetRasterizer().GetPipelineCache().ReportCompilerStats();
             Vulkan::WaitDiagnostics::Report();
+            Common::Backports::LogHits();
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
@@ -608,6 +614,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
         }
+        Gow3Freeze::flips_submitted.fetch_add(1, std::memory_order_relaxed);
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
@@ -623,6 +630,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    // gow3: frame boundaries of GOW3_FRAME_RECORD_TRIGGER, in stream order on the GPU thread.
+    Vulkan::FrameRecord::OnFlip(index >= 0 ? port->buffer_slots[index].address_left : 0,
+                                std::this_thread::get_id() ==
+                                    liverpool->GetGpuCommandProcessorThread());
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -745,6 +756,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
             // Update vblank status
             vblank_status.count++;
+            Gow3Freeze::vblanks.fetch_add(1, std::memory_order_relaxed);
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();

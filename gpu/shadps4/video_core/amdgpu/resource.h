@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "video_core/amdgpu/pixel_format.h"
+#include "video_core/amdgpu/gow3_bc_tiny.h"
+#include "video_core/amdgpu/gow3_block1d.h"
 #include "video_core/amdgpu/gow3_msaa.h"
 #include "video_core/amdgpu/tiling.h"
 
@@ -314,6 +317,36 @@ struct Image {
             return ImageType::Color2D;
         }
         return base_type;
+    }
+
+    /// gow3: Vulkan has no block-compressed 1D images (inFAMOUS binds BC1/BC4/BC5 1D textures),
+    /// so these are 2D images of height 1 on the host, sampled at the middle row.
+    bool IsBlock1D() const noexcept {
+        // On for drivers that refuse BC 1D, except NVIDIA (gow3_block1d.h); GOW3_BLOCK1D=0/1.
+        // GOW3_BC_TINY decodes BC1-BC5 1D textures to plain 1D images instead (gow3_bc_tiny.h).
+        const auto type = GetType();
+        const auto dfmt = GetDataFmt();
+        const bool is_1d = type == ImageType::Color1D || type == ImageType::Color1DArray;
+        // gow3: BP09, every 1D image (not only block-coded ones) is 2D of height 1 on the host.
+        if (is_1d && All1DAs2D()) {
+            return true;
+        }
+        return Block1DAs2D() && is_1d && IsBlockCoded(dfmt) &&
+               !(BcTinyDecode() && IsBcTinyDecodable(dfmt));
+    }
+
+    /// gow3: BC formats the GOW3_BC_TINY CPU decoder handles (texture_cache/gow3_bc_decode.h).
+    static constexpr bool IsBcTinyDecodable(DataFormat dfmt) noexcept {
+        return dfmt >= DataFormat::FormatBc1 && dfmt <= DataFormat::FormatBc5;
+    }
+
+    /// The view type of the host image: GetViewType, with block-compressed 1D as 2D.
+    ImageType GetHostViewType(const bool is_array) const noexcept {
+        const auto view = GetViewType(is_array);
+        if (IsBlock1D()) {
+            return view == ImageType::Color1DArray ? ImageType::Color2DArray : ImageType::Color2D;
+        }
+        return view;
     }
 
     ImageType GetViewType(const bool is_array) const noexcept {

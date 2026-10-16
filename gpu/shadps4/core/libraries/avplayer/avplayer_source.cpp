@@ -1,3 +1,4 @@
+#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -313,9 +314,25 @@ bool AvPlayerSource::Stop() {
         m_up_data_streamer->Reset();
     }
 
+    // gow3: ask all three to stop, wake every queue they may wait on, then join. Joining one at a
+    // time left Gravity Rush 2 stuck in sceAvPlayerStop after its opening movie: a decoder
+    // waiting on its queue was not woken by the stop request alone.
+    m_video_decoder_thread.RequestStop();
+    m_audio_decoder_thread.RequestStop();
+    m_demuxer_thread.RequestStop();
+    m_video_packets_cv.Notify();
+    m_audio_packets_cv.Notify();
+    m_video_buffers_cv.Notify();
+    m_audio_buffers_cv.Notify();
+    m_video_frames_cv.Notify();
+    m_audio_frames_cv.Notify();
+    std::fprintf(stderr, "tlg-av: %p Stop: joining video\n", (void*)this);
     m_video_decoder_thread.Stop();
+    std::fprintf(stderr, "tlg-av: %p Stop: joining audio\n", (void*)this);
     m_audio_decoder_thread.Stop();
+    std::fprintf(stderr, "tlg-av: %p Stop: joining demuxer\n", (void*)this);
     m_demuxer_thread.Stop();
+    std::fprintf(stderr, "tlg-av: %p Stop: done\n", (void*)this);
 
     m_current_audio_frame.reset();
     m_current_video_frame.reset();
@@ -534,6 +551,8 @@ void AvPlayerSource::ReleaseAVFormatContext(AVFormatContext* context) {
 }
 
 void AvPlayerSource::DemuxerThread(std::stop_token stop) {
+    std::fprintf(stderr, "tlg-av: %p DemuxerThread start\n", (void*)this);
+    struct ExitLog { void* self; ~ExitLog() { std::fprintf(stderr, "tlg-av: %p DemuxerThread exit\n", self); } } exit_log{this};
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvDemuxer");
 
@@ -699,6 +718,8 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
 }
 
 void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
+    std::fprintf(stderr, "tlg-av: %p VideoDecoderThread start\n", (void*)this);
+    struct ExitLog { void* self; ~ExitLog() { std::fprintf(stderr, "tlg-av: %p VideoDecoderThread exit\n", self); } } exit_log{this};
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
 
@@ -822,6 +843,8 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
 }
 
 void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
+    std::fprintf(stderr, "tlg-av: %p AudioDecoderThread start\n", (void*)this);
+    struct ExitLog { void* self; ~ExitLog() { std::fprintf(stderr, "tlg-av: %p AudioDecoderThread exit\n", self); } } exit_log{this};
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvAudioDecoder");
 

@@ -13,6 +13,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -27,6 +28,7 @@
 #include "gow3_gpu_trace.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -270,6 +272,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
+    rasterizer.EagerCopyAtFence();
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // GOW3_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -465,6 +468,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
+            }
+            // gow3: BP01 (shadPS4 #5258) free the finished nested task frame
+            if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                task.handle.destroy();
             }
             break;
         }
@@ -772,6 +780,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                 // They may write guest memory: not before fences deferred earlier.
                 rasterizer->WaitDeferredSignals();
+            }
+            // gow3: GOW3_FRAME_RECORD_TRIGGER (vk_frame_record.h).
+            if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+                Vulkan::FrameRecord::Packet(-1, header, &regs);
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
@@ -1303,6 +1315,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // gow3: BP01 (shadPS4 #5258) free the finished nested task frame
+                if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                    Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                    task.handle.destroy();
+                }
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1465,6 +1482,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             header->type3.NumWords() + 1);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+            Vulkan::FrameRecord::Packet(static_cast<int>(vqid), header, nullptr);
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1479,6 +1499,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
+            }
+            // gow3: BP01 (shadPS4 #5258) free the finished nested task frame
+            if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                task.handle.destroy();
             }
             break;
         }
@@ -1672,6 +1697,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                      static_cast<u32>(release_mem->data_sel.Value()));
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+                rasterizer->EagerCopyAtFence();
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

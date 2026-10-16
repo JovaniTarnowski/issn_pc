@@ -256,6 +256,12 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    /// gow3: true if creating a pipeline can be told to fail instead of compiling it
+    /// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
+    bool IsPipelineCreationCacheControlSupported() const {
+        return vk13_features.pipelineCreationCacheControl;
+    }
+
     /// gow3: VK_KHR_pipeline_executable_properties is on (GOW3_WAVE_STATS=1, vk_wave_stats.h).
     bool IsPipelineExecutableInfoEnabled() const {
         return pipeline_executable_properties &&
@@ -483,6 +489,11 @@ public:
                image_2d_view_of_3d_features.sampler2DViewOf3D;
     }
 
+    /// gow3: BP06. True only when the backport is on and the device enabled the extension + feature.
+    bool IsMaximalReconvergenceSupported() const {
+        return maximal_reconvergence;
+    }
+
     /// Returns whether VK_EXT_image_view_min_lod is supported.
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
@@ -584,12 +595,14 @@ private:
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
+    bool maximal_reconvergence{};
     bool shader_clock{};
     bool pipeline_executable_properties{}; // gow3: GOW3_WAVE_STATS=1 (vk_wave_stats.h)
     bool amd_shader_info{};                // gow3: with it, VK_AMD_shader_info when present
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // gow3: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
+    bool pageable_device_local_memory{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

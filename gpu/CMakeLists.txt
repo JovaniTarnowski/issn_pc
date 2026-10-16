@@ -133,6 +133,24 @@ add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
+
+# gow3: the shader cache key: a hash of every source that shapes the generated SPIR-V. The
+# shader cache directory carries it, so a changed recompiler starts a fresh cache instead of
+# reusing shaders translated by the old code (build.sh configures on every build).
+file(GLOB_RECURSE GOW3_SHADER_KEY_SOURCES shadps4/shader_recompiler/*.cpp shadps4/shader_recompiler/*.h)
+list(APPEND GOW3_SHADER_KEY_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/amdgpu/resource.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp)
+list(SORT GOW3_SHADER_KEY_SOURCES)
+set(GOW3_SHADER_KEY_DATA "")
+foreach(source ${GOW3_SHADER_KEY_SOURCES})
+    file(SHA1 ${source} source_hash)
+    string(APPEND GOW3_SHADER_KEY_DATA ${source_hash})
+endforeach()
+string(SHA1 GOW3_SHADER_KEY "${GOW3_SHADER_KEY_DATA}")
+string(SUBSTRING ${GOW3_SHADER_KEY} 0 12 GOW3_SHADER_KEY)
+add_compile_definitions(GOW3_SHADER_CACHE_KEY="${GOW3_SHADER_KEY}")
+message(STATUS "Shader cache key: ${GOW3_SHADER_KEY}")
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
 set(COMMON
     shadps4/common/decoder.cpp shadps4/common/error.cpp

@@ -24,6 +24,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -711,6 +712,15 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// gow3: while draw packets are in flight the draw recording thread (stage B) owns the
+    /// deferred recording state (record_chunk, full_chunks). A call from any other thread
+    /// first runs `hook(context, caller)`: the rasterizer drains the pipe on stage A and logs
+    /// the caller, so two threads never use record_chunk at once (EmitVertexBuffers crash).
+    void SetOwnerHook(void (*hook)(void*, void*), void* context) {
+        owner_hook = hook;
+        owner_context = context;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -726,6 +736,7 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+        CheckOwner(__builtin_return_address(0));
         if (recording_threaded && !direct_mode) {
             SyncRecording();
             direct_mode = true;
@@ -740,25 +751,9 @@ public:
 
     /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
     /// everything it uses (capture by value): it may run later on the recording thread.
-    /// issn: the recording calls have one producer at a time (the GPU command thread, or the
-    /// draw recording thread after a drain). Two threads inside at once (record_chunk found
-    /// null mid-handoff: inFAMOUS Second Son's spray can) are reported with both names and
-    /// this thread's stack, the first few times.
-    class ProducerGuard {
-    public:
-        explicit ProducerGuard(Scheduler& scheduler) noexcept;
-        ~ProducerGuard();
-        ProducerGuard(const ProducerGuard&) = delete;
-        ProducerGuard& operator=(const ProducerGuard&) = delete;
-
-    private:
-        Scheduler& scheduler;
-        bool owner{};
-    };
-
     template <typename Func>
     void Record(Func&& func) {
-        const ProducerGuard guard{*this};
+        CheckOwner(__builtin_return_address(0));
         if (!recording_threaded || direct_mode) {
             func(current_cmdbuf);
             return;
@@ -777,6 +772,12 @@ public:
         }
     }
 
+    /// gow3: true when commands passed to Record() normally go to the Vulkan recording thread
+    /// (it may still record some directly, after a CommandBuffer() call).
+    [[nodiscard]] bool RecordsOnThread() const noexcept {
+        return recording_threaded && !Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording);
+    }
+
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
         return recording_threaded && !direct_mode &&
@@ -786,14 +787,18 @@ public:
     /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
     /// chunk: data and command must share a chunk, which is recycled once executed.
     void ReserveRecordData(size_t bytes) {
-        const ProducerGuard guard{*this};
+        CheckOwner(__builtin_return_address(0));
         if (!IsRecordingDeferred()) {
             return;
         }
-        // issn: data larger than a chunk goes to its own block (RecordData); only the command
-        // that uses it needs room here.
         if (bytes + 1024 > RecordChunk::Capacity) {
-            bytes = 0;
+            // Too large for a chunk (The Last Guardian issues copies with thousands of regions):
+            // record directly until the next kick. RecordData() then returns the caller's span,
+            // which outlives the command because Record() runs it immediately in direct mode.
+            SyncRecording();
+            direct_mode = true;
+            direct_recordings.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
         if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
             full_chunks.push_back(std::move(record_chunk));
@@ -810,19 +815,10 @@ public:
         }
         // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
-        if (bytes + alignof(T) + 1024 > RecordChunk::Capacity) {
-            // issn: more than a chunk holds (the upload regions of an image with thousands of
-            // mips and layers): a block of its own, freed once the recording thread has run
-            // every command recorded so far (SyncRecording).
-            ReserveRecordData(0);
-            auto block = std::make_unique<std::byte[]>(bytes);
-            auto* dst = reinterpret_cast<T*>(block.get());
-            std::memcpy(dst, data.data(), bytes);
-            std::scoped_lock lk{oversized_mutex};
-            oversized_data.push_back(std::move(block));
-            return {dst, data.size()};
-        }
         ReserveRecordData(bytes + alignof(T));
+        if (!IsRecordingDeferred()) {
+            return data; // ReserveRecordData switched to direct recording (oversized data)
+        }
         auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
@@ -866,6 +862,16 @@ public:
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
+    }
+
+    /// gow3: counts a draw or dispatch recorded since the last submission.
+    void CountWork() noexcept {
+        work_since_submit.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// gow3: draws and dispatches recorded since the last submission.
+    [[nodiscard]] u32 WorkSinceSubmit() const noexcept {
+        return work_since_submit.load(std::memory_order_relaxed);
     }
 
     /// Whether BeginRendering(state) would start a new render pass.
@@ -940,7 +946,8 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
-    u32 pending_polls = 0; // gow3
+    u32 pending_polls = 0; // tlg
+    bool popping_pending_ops = false; ///< gow3: guarded by pending_ops_mutex (recursive)
     std::atomic<u32> num_pending_ops{0}; ///< gow3: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
@@ -950,13 +957,15 @@ private:
     bool is_rendering = false;
     // gow3: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
-    std::atomic<std::thread::id> producer{};       ///< see ProducerGuard
-    std::atomic<u32> producer_tid{};               ///< its native id, for its stack
-    char producer_name[64]{};
-    std::vector<std::unique_ptr<RecordChunk>> full_chunks;
-    std::mutex oversized_mutex;
-    std::vector<std::unique_ptr<std::byte[]>> oversized_data; ///< see RecordData
+    void (*owner_hook)(void*, void*) = nullptr;
+    void* owner_context = nullptr;
 
+    [[gnu::always_inline]] void CheckOwner(void* caller) {
+        if (owner_hook && !DrawPipe::OnStageB()) [[unlikely]] {
+            owner_hook(owner_context, caller);
+        }
+    }
+    std::vector<std::unique_ptr<RecordChunk>> full_chunks;
     std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;
@@ -965,6 +974,7 @@ private:
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
+    std::atomic<u32> work_since_submit{0}; ///< gow3: CountWork(), reset by each submission
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};

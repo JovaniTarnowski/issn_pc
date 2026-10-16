@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cctype>
 #include "gow3_settings.h"
 #include "gow3_orbs.h"
 #include "gow3_graphics.h"
@@ -63,6 +64,20 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             return;
         }
     }
+    if (key.size() == 4 && key[0] == 'b' && key[1] == 'p' && std::isdigit((unsigned char)key[2]) &&
+        std::isdigit((unsigned char)key[3])) {
+        const int n = (key[2] - '0') * 10 + (key[3] - '0');
+        if (n >= 1 && n <= kBackportPrefs && !value.empty()) {
+            v.backport_pref[n - 1] = i != 0;
+        }
+        return;
+    }
+    for (int e = 0; e < kExtraPrefs; ++e) {
+        if (key == kExtraKeys[e]) {
+            v.extra_pref[e] = value.empty() ? -1 : i != 0;
+            return;
+        }
+    }
     if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
@@ -91,6 +106,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "sensor_aim") {
+        v.sensor_aim = std::clamp(i, 25, 200);
+    } else if (key == "graffiti_guide_seen") {
+        v.graffiti_guide_seen = i != 0;
     } else if (key == "display_mode") {
         v.display_mode = Gow3Graphics::ParseDisplayMode(value);
     } else if (key == "vsync") {
@@ -186,6 +205,7 @@ void Load() {
         {"GOW3_ASYNC_SHADERS", "async_shaders"},      {"GOW3_DEFERRED_READBACK", "deferred_readback"},
         {"GOW3_STALE_READBACK", "stale_readback"},     {"GOW3_FSR1", "fsr1"},
         {"GOW3_RCAS", "rcas"},                        {"GOW3_FRAMES_AHEAD", "frames_queued"},
+        {"GOW3_SHOW_FPS", "show_fps"},             {"GOW3_SENSOR_AIM", "sensor_aim"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -269,7 +289,7 @@ void Save() {
         return;
     }
     std::fprintf(file,
-                 "# gow3 settings (in-game menu: Insert / R3+L2)\n"
+                 "# tlg settings (in-game menu: Insert / R3+L2)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
                  "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
@@ -311,6 +331,16 @@ void Save() {
                  Gow3Graphics::Resolutions[std::clamp(v.render_resolution.load(), 0, 5)].data(),
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
+    std::fprintf(file, "sensor_aim=%d\ngraffiti_guide_seen=%d\n", v.sensor_aim.load(),
+                 int(v.graffiti_guide_seen.load()));
+    // Fixes: applied on the next start by the launcher (GOW3_BPnn / GOW3_<NAME>); only the ones
+    // the player or the launcher chose are written.
+    for (int n = 0; n < kBackportPrefs; ++n) {
+        if (const int p = v.backport_pref[n]; p >= 0) std::fprintf(file, "bp%02d=%d\n", n + 1, p);
+    }
+    for (int e = 0; e < kExtraPrefs; ++e) {
+        if (const int p = v.extra_pref[e]; p >= 0) std::fprintf(file, "%s=%d\n", kExtraKeys[e], p);
+    }
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

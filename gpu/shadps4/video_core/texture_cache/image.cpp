@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/amdgpu/gow3_amd_1d.h"
 #include "gow3_toggles.h"
+#include <atomic>
+#include <cstdlib>
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -24,6 +27,10 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
     vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
                                 vk::ImageUsageFlagBits::eTransferDst |
                                 vk::ImageUsageFlagBits::eSampled;
+    if (info.props.is_bc_decoded) {
+        // gow3: GOW3_BC_TINY: a texture only ever filled by uploads and sampled.
+        return usage;
+    }
     if (!info.props.is_block) {
         if (info.props.is_depth) {
             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -87,12 +94,14 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
+        GOW3_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
+        GOW3_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
@@ -116,6 +125,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // gow3: see UniqueBuffer::Create: past the budget, the driver moves memory out instead of
+        // failing (shadPS4-Infamous-FixBuild e656365e).
+        LOG_WARNING(Render_Vulkan, "Allocating an image went over the memory budget, allocating "
+                                   "it past the budget");
+        VmaAllocationCreateInfo over_budget_ci = alloc_ci;
+        over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &over_budget_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -141,11 +160,19 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
             flags |= vk::ImageCreateFlagBits::e2DViewCompatibleEXT;
         }
     }
-    if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
+    if (info.props.is_block && !info.props.is_bc_decoded && instance.IsBlockTexelViewSupported()) {
         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
     }
 
     usage_flags = ImageUsageFlags(instance, info);
+    // gow3: GOW3_1D_NO_STORAGE / GOW3_1D_NO_MUTABLE (video_core/amdgpu/gow3_amd_1d.h).
+    const bool host_1d = !info.props.is_host_2d && ConvertImageType(info.type) == vk::ImageType::e1D;
+    if (host_1d && AmdGpu::img_1d_no_storage.load(std::memory_order_relaxed)) {
+        usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+    }
+    if (host_1d && AmdGpu::img_1d_no_mutable.load(std::memory_order_relaxed)) {
+        flags &= ~(vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage);
+    }
     format_features = FormatFeatureFlags(usage_flags);
     if (info.props.is_depth) {
         aspect_mask = vk::ImageAspectFlagBits::eDepth;
@@ -158,7 +185,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
     vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
-        .type = ConvertImageType(info.type),
+        .type = (info.props.is_host_2d ? vk::ImageType::e2D : ConvertImageType(info.type)),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
@@ -183,6 +210,23 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
                   vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+        // gow3: GOW3_BC1D_LOG=1 (PROPOSTA_BC1D_NVIDIA.diff), diagnostics only: one line per image
+        // created although the driver reports its format/type unsupported (BC 1D on NVIDIA), to
+        // tell streaming churn from one hot image and to match against flicker moments.
+        static const bool bc1d_log = [] {
+            const char* e = std::getenv("GOW3_BC1D_LOG");
+            return e && *e == '1';
+        }();
+        if (bc1d_log) {
+            static std::atomic<u32> created{0};
+            LOG_WARNING(Render_Vulkan,
+                        "gow3: unsupported image #{} {} {} {}x{} layers {} mips {} tile {} at "
+                        "{:#x}+{:#x} tick {}",
+                        created.fetch_add(1) + 1, vk::to_string(supported_format),
+                        vk::to_string(format_info.type), info.size.width, info.size.height,
+                        info.resources.layers, info.resources.levels, AmdGpu::NameOf(info.tile_mode),
+                        info.guest_address, info.guest_size, runtime->GetScheduler().CurrentTick());
+        }
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts
@@ -190,7 +234,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     const vk::ImageCreateInfo image_ci = {
         .flags = flags,
-        .imageType = ConvertImageType(info.type),
+        .imageType = (info.props.is_host_2d ? vk::ImageType::e2D : ConvertImageType(info.type)),
         .format = supported_format,
         .extent{
             .width = info.size.width,
@@ -208,7 +252,17 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+    if (host_1d) {
+        GOW3_IMG_TRACE("create 1D image %ux%u layers %u mips %u %s flags %s usage %s at %#llx\n",
+                      info.size.width, info.size.height, u32(info.resources.layers),
+                      u32(info.resources.levels), vk::to_string(supported_format).c_str(),
+                      vk::to_string(flags).c_str(), vk::to_string(usage_flags).c_str(),
+                      (unsigned long long)info.guest_address);
+    }
     backing->image.Create(image_ci);
+    if (host_1d) {
+        GOW3_IMG_TRACE("created 1D image %p\n", (void*)VkImage(backing->image.image));
+    }
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
@@ -250,6 +304,16 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
 
+    constexpr auto memo_write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                      vk::AccessFlagBits2::eShaderWrite |
+                                      vk::AccessFlagBits2::eMemoryWrite;
+    auto& memo = backing->partial_memo;
+    if (needs_partial_transition && partially_transited && memo.valid &&
+        memo.range == *subres_range && memo.layout == dst_layout && memo.access == dst_mask &&
+        memo.stage == dst_stage) {
+        return;
+    }
+    memo.valid = false;
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
@@ -310,6 +374,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
 
         if (!needs_partial_transition) {
             subresource_states.clear();
+        } else if (!(dst_mask & memo_write_flags)) {
+            memo = {true, *subres_range, dst_layout, dst_mask, dst_stage};
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |

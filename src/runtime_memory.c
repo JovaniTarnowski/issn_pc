@@ -63,18 +63,34 @@ _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
  * under the lock may write guest memory, and a GPU-tracked page then faults into
  * runtime_memory_gpu_protect on the same thread. Readers nest because glibc's
  * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
+/* Windows: winpthreads' rwlock blocks new readers behind a waiting writer, so a nested reader
+ * (a fault on a GPU-tracked page under the read lock) deadlocks with it; rwlock_rp.h has glibc's
+ * reader preference. From HayatoG's iss_pc (73f6701). */
+#include "rwlock_rp.h"
+#ifdef _WIN32
+static RpLock lock=RP_LOCK_INITIALIZER;
+#define table_rdlock() rp_read_lock(&lock)
+#define table_wrlock() rp_write_lock(&lock)
+#define table_rdunlock() rp_read_unlock(&lock)
+#define table_wrunlock() rp_write_unlock(&lock)
+#else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+#define table_rdlock() pthread_rwlock_rdlock(&lock)
+#define table_wrlock() pthread_rwlock_wrlock(&lock)
+#define table_rdunlock() pthread_rwlock_unlock(&lock)
+#define table_wrunlock() pthread_rwlock_unlock(&lock)
+#endif
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
 static uint64_t table_generation;
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) { table_wrlock(); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
 static void write_unlock(void) {
-    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
+    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); table_wrunlock(); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
-static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
+static void read_lock(void) { if (!exclusive_depth) table_rdlock(); }
+static void read_unlock(void) { if (!exclusive_depth) table_rdunlock(); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32
@@ -747,6 +763,23 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+        at+=n;
+    }
+    read_unlock();
+    return ok;
+}
+/* issn: reads through the backing view, bypassing GPU page protection; 0 when part of the range
+ * has no backing (the caller then reads the guest address directly). GPU-internal threads use it
+ * so a read of a page protected for readback (GOW3_READBACKS=2) cannot fault into a readback that
+ * waits for the same thread (the Vulkan recorder). From HayatoG's iss_pc. */
+int runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
+    read_lock();
+    int ok=1;
+    for (uintptr_t at=address, end=address+size; at<end && ok;) {
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        memcpy((unsigned char *)data+(at-address),backing_base+vmas[i].phys+(at-vmas[i].start),n);
         at+=n;
     }
     read_unlock();

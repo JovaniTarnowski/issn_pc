@@ -27,7 +27,8 @@ enum Item : unsigned {
     Vram = 1u << 6,
     AllItems = (1u << 7) - 1,
 };
-inline constexpr unsigned DefaultItems = Fps | FrameTime | Upscaler;
+// gow3: the game renders natively (no upscaler), so the defaults show GPU load and VRAM instead.
+inline constexpr unsigned DefaultItems = Fps | FrameTime | Gpu | Vram;
 
 struct Sample {
     float fps = 0.0f, frame_ms = 0.0f;

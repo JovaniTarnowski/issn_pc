@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "common/backports.h"
 #include "common/serdes.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -27,6 +28,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_amd_paths.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "shader_recompiler/recompiler_toggles.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -34,11 +36,10 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 10u; // gow3: interpolated integer fix (Pascal);
-                                                // issn: legacy multiply-add, upstream fixes;
-                                                // 1D images as 2D, cube math in SPIR-V;
-                                                // cube face index result type (AMD)
-static constexpr u32 ShaderMetaVersion = 7u; // gow3: ImageResource::needs_native
+static constexpr u32 ShaderBinaryVersion = 11u; // issn: legacy multiply-add, upstream fixes;
+                                                // 1D images as 2D, cube math in SPIR-V; HayatoG's
+                                                // LDS barriers, lane divergence, WQM, backports
+static constexpr u32 ShaderMetaVersion = 9u; // gow3: LDS barrier scope per guest wave
 static constexpr u32 PipelineKeyVersion = 5u; // gow3: Info layout (ImageResource::needs_native)
 } // namespace Serialization
 
@@ -46,12 +47,17 @@ namespace Vulkan {
 
 namespace {
 // gow3: the test knobs that change recompiled SPIR-V (GOW3_LIGHTING_TEST=dref,
-// GOW3_AMD_PATHS_OFF=shaderext) get their own shader binary cache version.
+// GOW3_AMD_PATHS_OFF=shaderext) get their own shader binary cache version, and so do the
+// recompiler switches of recompiler_toggles.h (GOW3_LDS_SMALL/MULTI/READLANE, GOW3_WQM,
+// GOW3_LANE_DIVERGENCE, GOW3_RFL_ALL): the
+// base and the lighting salt stay below 64.
 u32 CurrentShaderBinaryVersion() {
     return LightingTest::ShaderBinaryVersion(
-        Serialization::ShaderBinaryVersion,
-        LightingTest::ShaderBinarySalt(LightingTest::Current().dref,
-                                       AmdPathsOff::Current().shaderext));
+               Serialization::ShaderBinaryVersion,
+               LightingTest::ShaderBinarySalt(LightingTest::Current().dref,
+                                              AmdPathsOff::Current().shaderext)) +
+           64u * Shader::Toggles::ShaderBinarySalt() +
+           4096u * Common::Backports::ShaderSalt();
 }
 } // namespace
 
@@ -277,6 +283,15 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     const auto create = [&](vk::PipelineCache used_cache, const auto& used_info, bool restored) {
         const auto started = std::chrono::steady_clock::now();
         auto result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        // gow3: a failure the driver may recover from is tried again (a binary that failed to
+        // restore is compiled instead).
+        for (u32 attempt = 1;
+             !restored && result.result != vk::Result::eSuccess &&
+             RetryPipelineCreation(result.result, attempt, "graphics",
+                                   fmt::format("{:#x}", std::hash<GraphicsPipelineKey>{}(key)));
+             ++attempt) {
+            result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        }
         const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count());
@@ -470,7 +485,7 @@ struct PipelineCache::WarmupPool {
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this, low_priority] {
                 if (low_priority) {
-                    Common::SetCurrentThreadName("GoW3:ShaderWarmup");
+                    Common::SetCurrentThreadName("TLG:ShaderWarmup");
                     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
                 }
                 Run();

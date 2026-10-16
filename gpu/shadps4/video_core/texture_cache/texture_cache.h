@@ -50,6 +50,11 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    /// tlg (shadPS4-Infamous-FixBuild 0c3fada0): cards with a budget up to this keep the
+    /// collector's critical mark at least RESIDENCY_HEADROOM below it, forced budget or not.
+    static constexpr s64 SMALL_CARD_MEMORY = 6_GB;
+    /// Room the collector tries to leave for memory the buffer cache makes resident.
+    static constexpr s64 RESIDENCY_HEADROOM = 1_GB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -213,8 +218,11 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
+    /// gow3: GOW3_BC_TINY: fills an is_bc_decoded image from a CPU decode of guest memory.
+    void UploadDecodedImage(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor.
-    /// extra_lod_bias: gow3, added to the S#'s bias (reduced scene rendering).
+    /// extra_lod_bias: tlg, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth, float extra_lod_bias = 0.0f);
@@ -225,7 +233,7 @@ public:
         auto& image = slot_images[id];
         return !uid || image.image_uid == uid ? &image : nullptr;
     }
-    /// gow3 diagnostics: writes level 0 of a color image to GOW3_DIAG_DIR as raw pixels
+    /// tlg diagnostics: writes level 0 of a color image to GOW3_DIAG_DIR as raw pixels
     /// (<seq>_<tag>_<address>_<w>x<h>_p<pitch>_b<bytes per pixel>_f<vk format>.raw). Waits for
     /// the GPU.
     void DiagDumpImage(ImageId image_id, const char* tag);
@@ -309,6 +317,13 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// gow3: frees the images unused for as long as the collector's gentlest pass waits, without
+    /// its limit on how many go, for an allocation that failed for lack of device memory. Only
+    /// on the thread that owns the caches, with the texture binding helper joined. Returns
+    /// about how many bytes went. The memory is released once the GPU is done with the images
+    /// (Scheduler::PopPendingOperations after a Finish).
+    u64 ReleaseMemoryForAllocation();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -347,6 +362,22 @@ public:
         });
         for (const ImageId image_id : images) {
             slot_images[image_id].flags &= ~ImageFlagBits::Picked;
+        }
+    }
+
+    /// gow3: BP02 (shadPS4 145932bf, #5240) images whose guest address is exactly `cpu_addr`. Every
+    /// image is registered in all of its pages, so they are all in the bucket of the first page.
+    template <typename Func>
+    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+        const auto it = page_table.find(cpu_addr >> Traits::PageBits);
+        if (it == nullptr) {
+            return;
+        }
+        for (const ImageId image_id : *it) {
+            Image& image = slot_images[image_id];
+            if (image.info.guest_address == cpu_addr) {
+                func(image_id, image);
+            }
         }
     }
 
@@ -440,6 +471,9 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// gow3: the most critical_gc_memory may be on small cards (0: no cap), see SMALL_CARD_MEMORY.
+    u64 headroom_gc_memory = 0;
+    void ApplyResidencyHeadroom();
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;

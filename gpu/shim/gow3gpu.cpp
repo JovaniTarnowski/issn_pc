@@ -38,6 +38,7 @@ extern "C" {
 // runtime_memory.c
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
+int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
@@ -118,8 +119,11 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             end = source + size;
         }
         const u64 n = std::min<u64>(size, end - source);
-        if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
-        else std::memset(dest, 0, n);
+        // issn: read through the unprotected backing view so readback protection (precise
+        // readbacks) cannot fault on the recorder/copy threads; direct read as the fallback.
+        if (!mapped) std::memset(dest, 0, n);
+        else if (!runtime_memory_read_backing(source, dest, n))
+            std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         source += n; dest += n; size -= n;
     }
 }

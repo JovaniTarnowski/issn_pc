@@ -13,7 +13,14 @@ INFAMOUS_SECOND_SON = ('CUSA00004', 'CUSA00223')
 
 PROFILES = {
     title: {
+        # Precise GPU readbacks: the game reads GPU particle results back (the smoke to drain,
+        # drones); without them those effects are missing. The deferred and eager copies keep
+        # the waits short (HayatoG's iss_pc defaults for this game).
+        'GOW3_READBACKS': '2',
+        # Buffer-store barriers in uniform loops of workgroups wider than a GCN wave (AYOUB1080p).
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
+        'GOW3_DEFERRED_READBACK': '1',
+        'GOW3_EAGER_READBACK': '1',
         # A full memory barrier around each render pass and dispatch: without it 64x64 tiles of
         # the image go black or stale (the game reads compute output the port's barriers miss).
         # Tested on the tester's RX 9060 XT; the exact missing barrier is still to find.

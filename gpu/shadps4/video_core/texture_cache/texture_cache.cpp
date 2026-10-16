@@ -6,7 +6,9 @@
 #include "video_core/amdgpu/liverpool.h"
 
 #include "gow3_toggles.h"
+#include "gow3_freeze.h"
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/hash.h"
@@ -67,6 +69,29 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    // tlg (shadPS4-Infamous-FixBuild 0c3fada0): buffer memory becomes resident in large ranges
+    // (16 MB granules, gigabytes when a save loads) that the collector, running once per
+    // submission and only freeing old images, can't make room for in time. On small discrete
+    // cards keep a gigabyte free for it. Integrated GPUs follow the driver's current budget
+    // instead (GarbageCollectImages).
+    if (!instance.IsIntegrated() && device_local_memory <= SMALL_CARD_MEMORY) {
+        headroom_gc_memory = static_cast<u64>(
+            std::max<s64>(device_local_memory - RESIDENCY_HEADROOM, device_local_memory / 2));
+        ApplyResidencyHeadroom();
+        LOG_INFO(Render_Vulkan,
+                 "Texture cache: {} MB budget, collector critical at {} MB at most "
+                 "({} MB left for buffers)",
+                 device_local_memory >> 20, headroom_gc_memory >> 20, RESIDENCY_HEADROOM >> 20);
+    }
+}
+
+void TextureCache::ApplyResidencyHeadroom() {
+    if (headroom_gc_memory == 0) {
+        return;
+    }
+    critical_gc_memory = std::min(critical_gc_memory, headroom_gc_memory);
+    pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
 }
 
 TextureCache::~TextureCache() {
@@ -143,6 +168,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
         }
         if (diag) readback_sources.Record(source, waited, wait_ns, size);
     };
+    Gow3Freeze::WaitScope wait{"GPU readback", reinterpret_cast<const void*>(address)}; // tlg
     if (assume_locks) resolve();
     else liverpool->SendCommand<true>(resolve);
     return true;
@@ -260,7 +286,8 @@ void TextureCache::ProcessDownloadImages() {
 
 std::optional<TextureCache::PendingDownload> TextureCache::RecordImageDownload(ImageId image_id) {
     Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    // gow3: decoded texels (GOW3_BC_TINY) must never reach guest memory.
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.props.is_bc_decoded) {
         return std::nullopt;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -291,7 +318,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageDownload);
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.props.is_bc_decoded) {
         return;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -648,6 +675,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
 
+    // gow3: a GOW3_BC_TINY image holds decoded texels, nothing another image can copy from or
+    // into: treat the overlap as a chance one, like an allocation from a pool.
+    if (image_info.props.is_bc_decoded != cache_image.info.props.is_bc_decoded) {
+        if (safe_to_delete) {
+            FreeImage(cache_image_id);
+        }
+        return {merged_image_id, -1, -1};
+    }
+
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         const u32 lhs_block_size = image_info.num_bits * image_info.guest_samples;
@@ -951,6 +987,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cache_image.info.size != info.size) {
             continue;
         }
+        if (cache_image.info.props.is_bc_decoded != info.props.is_bc_decoded) {
+            continue;
+        }
         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
             continue;
@@ -1030,7 +1069,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+    // gow3: BP02 (shadPS4 145932bf, #5240) only the bucket of the first page can hold a match.
+    const bool first_page_only =
+        Common::Backports::On(Common::Backports::Id::ImageFromRangeFirst);
+    const auto collect = [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }
@@ -1038,7 +1080,13 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
             return;
         }
         image_ids.push_back(image_id);
-    });
+    };
+    if (first_page_only) {
+        Common::Backports::Hit(Common::Backports::Id::ImageFromRangeFirst);
+        ForEachImageWithAddress(address, collect);
+    } else {
+        ForEachImageInRegion(address, size, collect);
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
@@ -1194,6 +1242,10 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     Gow3Stats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    if (image.info.props.is_bc_decoded) {
+        UploadDecodedImage(image);
+        return;
+    }
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -1244,6 +1296,86 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+}
+
+void TextureCache::UploadDecodedImage(Image& image) {
+    // gow3: GOW3_BC_TINY (video_core/amdgpu/gow3_bc_tiny.h). The blocks are read from guest memory
+    // with the layout the GPU detiler and the BC upload copies use (mips_layout pitch and height
+    // in texels; micro tiling as host_shaders/tiling.comp), decoded and uploaded as texels.
+    const ImageInfo& info = image.info;
+    const auto kind = BcTinyDecodeKind(info.bc_format);
+    ASSERT_MSG(kind.has_value(), "GOW3_BC_TINY image without a decodable BC format");
+    const u32 block_bytes = BcDecode::BlockBytes(*kind);
+    const u32 texel_bytes = BcDecode::TexelBytes(*kind);
+    const u32 num_layers = info.resources.layers;
+    const u32 micro_mode = u32(AmdGpu::GetMicroTileMode(info.tile_mode));
+    const u32 thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
+
+    std::vector<u8> guest(info.guest_size);
+    Core::Memory::Instance()->CopySparseMemory(info.guest_address, guest.data(), guest.size());
+
+    boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+    u64 total = 0;
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const u32 width = std::max(info.size.width >> m, 1u);
+        const u32 height = std::max(info.size.height >> m, 1u);
+        copies.push_back({
+            .bufferOffset = total,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = m,
+                .baseArrayLayer = 0,
+                .layerCount = num_layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        });
+        total += Common::AlignUp(u64(width) * height * num_layers * texel_bytes, 16);
+    }
+
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
+    u8 texels[16 * 4];
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const auto& mip = info.mips_layout[m];
+        const u32 width = copies[m].imageExtent.width;
+        const u32 height = copies[m].imageExtent.height;
+        const u32 pitch_blocks = std::max((mip.pitch + 3) / 4, 1u);
+        const u32 height_blocks = std::max((mip.height + 3) / 4, 1u);
+        u8* const dst = staging.mapped + copies[m].bufferOffset;
+        for (u32 layer = 0; layer < num_layers; ++layer) {
+            for (u32 by = 0; by < Common::DivCeil(height, 4u); ++by) {
+                for (u32 bx = 0; bx < Common::DivCeil(width, 4u); ++bx) {
+                    const u64 offset =
+                        mip.offset +
+                        (info.props.is_tiled
+                             ? BcDecode::MicroTiledOffset(bx, by, layer, pitch_blocks,
+                                                          height_blocks, micro_mode, thickness,
+                                                          info.num_bits)
+                             : ((u64(layer) * height_blocks + by) * pitch_blocks + bx) *
+                                   block_bytes);
+                    if (offset + block_bytes <= guest.size()) {
+                        BcDecode::DecodeBlock(*kind, guest.data() + offset, texels);
+                    } else {
+                        std::memset(texels, 0, sizeof(texels));
+                    }
+                    for (u32 ty = 0; ty < 4 && by * 4 + ty < height; ++ty) {
+                        const u32 y = by * 4 + ty;
+                        const u32 x = bx * 4;
+                        const u32 count = std::min(4u, width - x);
+                        std::memcpy(dst + ((u64(layer) * height + y) * width + x) * texel_bytes,
+                                    texels + ty * 4 * texel_bytes, count * texel_bytes);
+                    }
+                }
+            }
+        }
+        copies[m].bufferOffset += staging.offset;
+    }
+    staging.Flush();
+
+    scheduler.EndRendering();
+    runtime.UploadImage(&image, staging.buffer, copies);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1453,6 +1585,9 @@ void TextureCache::GarbageCollectImages() {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
                 critical_gc_memory = budget / 100 * 95;
+                // A forced budget too close to a small card's memory still leaves the
+                // residency headroom (ISS_GC_BUDGET_MB=5600 on a 6 GB card ran out).
+                ApplyResidencyHeadroom();
             }
         }
     }
@@ -1584,6 +1719,38 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+}
+
+u64 TextureCache::ReleaseMemoryForAllocation() {
+    std::scoped_lock lock{mutex};
+    // Only images unused for as long as the collector's gentlest pass waits go, so the ones the
+    // guest is still drawing with stay. Same rules as the collector's clean-up otherwise.
+    const u64 ticks_to_destroy = std::min<u64>(16, gc_tick);
+    u64 num_freed = 0;
+    u64 freed_bytes = 0;
+    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, [&](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
+                         ReadbackSource::CacheCleanup);
+        const bool download = image.SafeToDownload();
+        if (image.info.IsTiled() && download) {
+            // Can't handle non-linear image downloads, same as the collector.
+            return false;
+        }
+        if (download) {
+            // Synchronously, while the image still protects its pages (see the collector).
+            DownloadImageMemory(image_id, true);
+            ++gc_downloads;
+        }
+        freed_bytes += image.info.guest_size;
+        ++gc_evictions;
+        ++num_freed;
+        FreeImage(image_id);
+        return false;
+    });
+    LOG_WARNING(Render_Vulkan, "Texture cache: freed {} images (~{} MB) for an allocation",
+                num_freed, freed_bytes >> 20);
+    return freed_bytes;
 }
 
 void TextureCache::TouchImage(const Image& image) {

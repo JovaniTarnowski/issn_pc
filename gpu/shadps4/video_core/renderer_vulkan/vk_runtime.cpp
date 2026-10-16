@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/amdgpu/gow3_amd_1d.h"
 #include <boost/container/small_vector.hpp>
 #include "gow3_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -21,6 +22,7 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
+        // issn: 1D images are 2D of height 1 on the host (upstream #5133).
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DArray:
@@ -35,7 +37,7 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
 
 static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_info,
                                               const VideoCore::ImageInfo& dst_info,
-                                              const u32 depth) {
+                                              const u32 depth, const char* path = "") {
     const auto vk_src_type = ConvertImageType(src_info.type);
     const auto vk_dst_type = ConvertImageType(dst_info.type);
 
@@ -56,8 +58,8 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
             LOG_WARNING(Render_Vulkan,
-                        "Coercing copy source layers {} and destination layers {} to minimum.",
-                        src_layers, dst_layers);
+                        "Coercing copy source layers {} and destination layers {} to minimum ({}).",
+                        src_layers, dst_layers, path);
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
@@ -106,6 +108,14 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 }
+
+
+namespace {
+// gow3: GOW3_IMG_TRACE (video_core/amdgpu/gow3_amd_1d.h): every runtime step touching a 1D image.
+bool TraceIs1D(const VideoCore::Image* image) {
+    return AmdGpu::ImgTrace() && image && !image->info.props.is_host_2d && image->info.size.height == 1;
+}
+} // namespace
 
 void Runtime::TickFrame() {
     staging_pool.TickFrame();
@@ -195,6 +205,9 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
+    if (TraceIs1D(image)) {
+        GOW3_IMG_TRACE("Transit %p\n", (void*)VkImage(image->GetImage()));
+    }
     BeforeImageAccess();
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
@@ -243,10 +256,28 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
         FlushBarriers();
     }
 
+    const bool trace_1d = AmdGpu::ImgTrace() && !dst->info.props.is_host_2d &&
+                          dst->info.size.height == 1;
+    if (trace_1d) {
+        GOW3_IMG_TRACE("upload to 1D image %p: %zu regions, first %ux%u mip %u layers %u+%u\n",
+                      (void*)VkImage(dst->GetImage()), upload_copies.size(),
+                      upload_copies.empty() ? 0u : upload_copies[0].imageExtent.width,
+                      upload_copies.empty() ? 0u : upload_copies[0].imageExtent.height,
+                      upload_copies.empty() ? 0u : upload_copies[0].imageSubresource.mipLevel,
+                      upload_copies.empty() ? 0u : upload_copies[0].imageSubresource.baseArrayLayer,
+                      upload_copies.empty() ? 0u : upload_copies[0].imageSubresource.layerCount);
+    }
     scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
-                      regions = scheduler.RecordData(upload_copies)](vk::CommandBuffer cmdbuf) {
+                      regions = scheduler.RecordData(upload_copies), trace_1d](vk::CommandBuffer cmdbuf) {
+        if (trace_1d) {
+            GOW3_IMG_TRACE("record copyBufferToImage %p (%zu regions)\n", (void*)VkImage(image),
+                          (size_t)regions.size());
+        }
         cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
                                  regions.size(), regions.data());
+        if (trace_1d) {
+            GOW3_IMG_TRACE("recorded copyBufferToImage %p\n", (void*)VkImage(image));
+        }
     });
 
     for (const auto& copy : upload_copies) {
@@ -260,6 +291,9 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 
 void Runtime::CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst,
                              const vk::Extent3D& extent) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("CopyAliasImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     SetBackingSamples(src, src->info.num_samples);
     SetBackingSamples(dst, dst->info.num_samples);
     scheduler.EndRendering();
@@ -287,6 +321,9 @@ void Runtime::CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst,
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
+    if (TraceIs1D(src)) {
+        GOW3_IMG_TRACE("DownloadImage %p\n", (void*)VkImage(src->GetImage()));
+    }
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
@@ -316,6 +353,9 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("CopyImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -355,7 +395,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         const u32 mip_h = std::max(base_height >> mip, 1u);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
 
-        const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
+        const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d, "CopyImage");
 
         vk::ImageCopy region{};
         region.srcSubresource.aspectMask = src_aspect;
@@ -417,6 +457,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("CopyImageWithBuffer %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
@@ -478,6 +521,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("CopyMip %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -488,8 +534,22 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
 
-    const auto [src_layers, dst_layers] =
-        SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
+    // gow3: the source is one subresource (usually a single layer) going into layer `slice` of
+    // a larger image: the copy covers the source's layers, not the destination's whole array.
+    // SanitizeCopyLayers compares whole-image layer counts (1 against 256 in inFAMOUS, logged
+    // hundreds of times per session) and its minimum happened to be the right count; take it
+    // directly and keep the copy inside the destination array.
+    u32 src_layers, dst_layers;
+    if (ConvertImageType(src->info.type) == ConvertImageType(dst->info.type) &&
+        ConvertImageType(dst->info.type) != vk::ImageType::e3D) {
+        const u32 dst_available = dst->info.resources.layers > slice
+                                      ? dst->info.resources.layers - slice
+                                      : 1u;
+        src_layers = dst_layers = std::min(src->info.resources.layers, dst_available);
+    } else {
+        std::tie(src_layers, dst_layers) =
+            SanitizeCopyLayers(src->info, dst->info, src->info.size.depth, "CopyMip");
+    }
 
     const vk::ImageCopy image_copy{
         .srcSubresource{
@@ -532,6 +592,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("CopyColorAndDepth %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     // gow3: with GOW3_NO_MSAA a guest multisampled depth target is single-sampled on the host; a
     // colour image aliasing it still holds the samples as channels, so sample 0 is channel 0.
     const bool guest_ms_depth = dst->info.props.is_depth && dst->info.guest_samples > 1;
@@ -614,6 +677,9 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {
+    if (TraceIs1D(src) || TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("ResolveImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+    }
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
 
@@ -629,7 +695,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
         FlushBarriers();
     }
 
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
+    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1, "ResolveImage");
     if (!needs_resolve) {
         const vk::ImageCopy region = {
             .srcSubresource{
@@ -684,6 +750,9 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
+    if (TraceIs1D(dst)) {
+        GOW3_IMG_TRACE("ClearImage %p\n", (void*)VkImage(dst->GetImage()));
+    }
     scheduler.EndRendering();
 
     const bool needs_flush =
@@ -710,6 +779,9 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
 }
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
+    if (TraceIs1D(image)) {
+        GOW3_IMG_TRACE("SetBackingSamples %p\n", (void*)VkImage(image->GetImage()));
+    }
     BeforeImageAccess();
     auto& backing = image->backing;
     auto& backing_images = image->backing_images;

@@ -4,6 +4,7 @@
 // start. Readers load the atomics every frame; writers are the menu and Load().
 
 #pragma once
+#include "gow3_perf_stats.h"
 
 #include "../../src/cheat_hook.h"
 
@@ -27,6 +28,13 @@ inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
 inline constexpr int OutputCount = 4;
 inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 
+inline constexpr int kBackportPrefs = 32;
+/// A/B switches read once at start (recompiler_toggles.h, device creation); tlg.ini keys.
+inline constexpr const char* kExtraKeys[] = {"wqm", "lds_small", "lds_multi", "lds_readlane",
+                                             "lane_divergence", "rfl_all", "block1d", "bc_tiny",
+                                             "no_msaa"};
+inline constexpr int kExtraPrefs = sizeof(kExtraKeys) / sizeof(kExtraKeys[0]);
+
 struct Values {
     std::atomic<int> upscaler{UpscalerFsr3};
     std::atomic<int> preset{NativeAA};
@@ -40,10 +48,14 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    /// Sensor mode's aiming speed (the graffiti cursor), percent of the default: 25..200.
+    std::atomic<int> sensor_aim{100};
+    /// The graffiti guide was shown once; the menu's Controls tab opens it again.
+    std::atomic<bool> graffiti_guide_seen{false};
     /// Performance overlay (gow3_perf_stats.h): items shown, font size and background opacity
     /// in percent, corner (0 top left, 1 top right, 2 bottom left, 3 bottom right), layout
     /// (0 one line, 1 one item per line). menu_tab: the menu's last tab.
-    std::atomic<unsigned> overlay_items{7};
+    std::atomic<unsigned> overlay_items{Gow3PerfStats::DefaultItems};
     std::atomic<int> overlay_scale{100}, overlay_corner{1}, overlay_opacity{50}, overlay_layout{0};
     std::atomic<int> menu_tab{0};
     std::atomic<float> red_orb_multiplier{1.0f};
@@ -99,6 +111,16 @@ struct Values {
     /// DLSS (gow3_dlss.dll, NVIDIA RTX) is ready, or why not (null before the device exists).
     std::atomic<bool> dlss_supported{false};
     std::atomic<const char*> dlss_problem{nullptr};
+
+    /// Fix switches that apply on the next start (the launcher turns them into GOW3_BPnn /
+    /// GOW3_<NAME> variables): bp01..bp32 and the A/B keys of ExtraKeys(). -1 = not in tlg.ini
+    /// (the built-in default), 0 / 1 = chosen. Kept so Save() does not drop what the launcher wrote.
+    std::atomic<int> backport_pref[kBackportPrefs];
+    std::atomic<int> extra_pref[kExtraPrefs];
+    Values() {
+        for (auto& p : backport_pref) p = -1;
+        for (auto& p : extra_pref) p = -1;
+    }
 
     /// Startup settings for the explicit GOW3_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;

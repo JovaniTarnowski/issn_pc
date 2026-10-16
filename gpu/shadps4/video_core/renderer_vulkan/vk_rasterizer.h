@@ -42,6 +42,11 @@ public:
         return runtime;
     }
 
+    /// gow3: see BufferCache::EagerCopyAtFence (fence packets, before the guest sees them).
+    void EagerCopyAtFence() {
+        buffer_cache.EagerCopyAtFence();
+    }
+
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
         return buffer_cache;
     }
@@ -234,9 +239,27 @@ private:
                   const IndirectDraw* indirect = nullptr);
     /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
     void DispatchRecord(const ComputePipeline* pipeline);
+    /// gow3: binds a compute pipeline in a recorded command: its handle, or, while a compiler
+    /// thread still builds it, the pipeline to wait for where the command is recorded.
+    struct ComputeBinder {
+        vk::Pipeline handle;
+        const ComputePipeline* pending;
+        void operator()(vk::CommandBuffer cmdbuf) const;
+    };
+    static ComputeBinder ComputeBind(const ComputePipeline* pipeline);
+    /// gow3: submits what was recorded so far if a lot was and the next draw starts a render
+    /// pass anyway (GOW3_SUBMIT_DRAWS). On the thread recording draws (stage B or the GPU thread).
+    void SubmitIfWorkPiledUp(const RenderState& next_state);
+    u64 work_submits = 0; ///< submissions made by SubmitIfWorkPiledUp
+    /// gow3: GOW3_FRAME_RECORD_TRIGGER: inputs of the draw or dispatch being recorded
+    /// (vk_frame_record.h). `state`: the draw's render state, null for dispatches.
+    void RecordFrameInputs(const Pipeline* pipeline, const PreparedDraw* prepared,
+                           const RenderState* state, bool is_indexed, u32 index_offset,
+                           const IndirectDraw* indirect);
     /// The compute registers of the dispatch being recorded.
     const AmdGpu::ComputeProgram& CsRegs() const;
     static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
+    static void SchedulerOwnerHook(void* rasterizer, void* caller);
     struct RingBinding;
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                              boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
@@ -346,7 +369,7 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
-    /// gow3 diagnostics (GOW3_DIAG_IMAGES=1, draw pipe off): while a frame capture records, the
+    /// tlg diagnostics (GOW3_DIAG_IMAGES=1, draw pipe off): while a frame capture records, the
     /// color targets of a pass are written to files when the next pass or dispatch begins.
     void DiagPassBoundary(bool force);
     std::array<VAddr, 8> diag_addresses{};
@@ -356,9 +379,10 @@ private:
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
-        bool is_written;
+        vk::AccessFlags2 src_access; // gow3: BP10 (was is_written)
     };
-    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    // gow3: BP10 vertex buffers can exceed Shader::NUM_BUFFERS, so no static_vector.
+    std::vector<BoundBuffer> bound_buffers;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

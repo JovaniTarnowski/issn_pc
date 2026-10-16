@@ -6,13 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
-#include <cstring>
-#include <string>
-#ifdef _WIN32
-#include <windows.h>
-#undef near
-#undef far
-#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -166,6 +159,11 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    // gow3: is_rendering belongs to the draw recording thread (stage B) while draw packets are in
+    // flight: drain first (owner hook), or a stale "not rendering" lets the next command (a
+    // stage A CopyBuffer) be recorded inside the render pass stage B opens meanwhile, which
+    // crashed the NVIDIA driver in the recorder thread (TLG intro; GR2 gameplay).
+    CheckOwner(__builtin_return_address(0));
     if (!is_rendering) {
         return;
     }
@@ -270,123 +268,11 @@ void Scheduler::WaitHostCopies() {
     Gow3Copy::WaitAsync();
 }
 
-namespace {
-void PrintStack() {
-#ifdef _WIN32
-    void* frames[32];
-    const USHORT count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        HMODULE module = nullptr;
-        char name[MAX_PATH] = "?";
-        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               static_cast<LPCSTR>(frames[i]), &module) &&
-            module) {
-            GetModuleFileNameA(module, name, sizeof(name));
-            const char* base = std::strrchr(name, '\\');
-            std::fprintf(stderr, "    #%u %s+0x%llx\n", i, base ? base + 1 : name,
-                         static_cast<unsigned long long>(address -
-                                                         reinterpret_cast<uintptr_t>(module)));
-        } else {
-            std::fprintf(stderr, "    #%u %p\n", i, frames[i]);
-        }
-    }
-#endif
-}
-/// The stack of another thread (the one already recording): suspended just long enough to
-/// unwind it (RtlVirtualUnwind), printed after it resumes (it may hold the stdio lock).
-void PrintOtherThreadStack(u32 tid) {
-#ifdef _WIN32
-    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                   THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!thread) {
-        return;
-    }
-    DWORD64 frames[24]{};
-    int count = 0;
-    if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(thread, &context)) {
-            while (count < 24 && context.Rip) {
-                frames[count++] = context.Rip;
-                DWORD64 image_base = 0;
-                auto* entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-                if (!entry) { // leaf function: the return address is at rsp
-                    context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
-                    context.Rsp += 8;
-                    continue;
-                }
-                void* handler_data = nullptr;
-                DWORD64 establisher = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
-                                 &handler_data, &establisher, nullptr);
-            }
-        }
-        ResumeThread(thread);
-    }
-    CloseHandle(thread);
-    for (int i = 0; i < count; ++i) {
-        HMODULE module = nullptr;
-        char name[MAX_PATH] = "?";
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCSTR>(frames[i]), &module) &&
-            module) {
-            GetModuleFileNameA(module, name, sizeof(name));
-            const char* base = std::strrchr(name, '\\');
-            std::fprintf(stderr, "    #%d %s+0x%llx\n", i, base ? base + 1 : name,
-                         static_cast<unsigned long long>(frames[i] -
-                                                         reinterpret_cast<DWORD64>(module)));
-        } else {
-            std::fprintf(stderr, "    #%d 0x%llx\n", i, static_cast<unsigned long long>(frames[i]));
-        }
-    }
-#else
-    (void)tid;
-#endif
-}
-} // namespace
-
-Scheduler::ProducerGuard::ProducerGuard(Scheduler& scheduler_) noexcept : scheduler{scheduler_} {
-    const auto self = std::this_thread::get_id();
-    std::thread::id expected{};
-    if (scheduler.producer.compare_exchange_strong(expected, self, std::memory_order_acq_rel)) {
-        owner = true;
-        scheduler.producer_tid.store(static_cast<u32>(gettid()), std::memory_order_relaxed);
-        thread_local const std::string name = Common::GetCurrentThreadName();
-        std::snprintf(scheduler.producer_name, sizeof(scheduler.producer_name), "%s",
-                      name.c_str());
-        return;
-    }
-    if (expected == self) {
-        return; // nested on the same thread
-    }
-    static std::atomic<int> reports{0};
-    if (reports.fetch_add(1, std::memory_order_relaxed) >= 5) {
-        return;
-    }
-    std::fprintf(stderr,
-                 "STOP-WARN: Vulkan recording entered by '%s' while '%s' is inside; stack:\n",
-                 Common::GetCurrentThreadName().c_str(), scheduler.producer_name);
-    PrintStack();
-    std::fprintf(stderr, "  and the stack of '%s' (inside):\n", scheduler.producer_name);
-    PrintOtherThreadStack(scheduler.producer_tid.load(std::memory_order_relaxed));
-    std::fflush(stderr);
-}
-
-Scheduler::ProducerGuard::~ProducerGuard() {
-    if (owner) {
-        scheduler.producer.store(std::thread::id{}, std::memory_order_release);
-    }
-}
-
 void Scheduler::KickRecording(bool force) {
-    const ProducerGuard guard{*this};
     if (!recording_threaded) {
         return;
     }
+    CheckOwner(__builtin_return_address(0));
     // Callers kick where nobody holds the raw command buffer: deferral resumes.
     direct_mode = false;
     // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
@@ -426,10 +312,6 @@ void Scheduler::SyncRecording() {
     Gow3Stats::WaitTimer timer{Gow3Stats::sync_recording_ns};
     std::unique_lock lk{recorder_mutex};
     recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
-    lk.unlock();
-    // Every recorded command has run: the oversized data blocks they read are done with.
-    std::scoped_lock oversized_lk{oversized_mutex};
-    oversized_data.clear();
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
@@ -541,11 +423,20 @@ void Scheduler::PopPendingOperations() {
         }
         work_semaphore.Refresh();
     }
+    // gow3: a callback can submit (the fault buffer's ObtainBuffer, which may upload in parts or
+    // wait for the GPU to free memory) and so come back here on this thread while it is still
+    // the front op: running it again, or popping it, would corrupt the queue. The outer loop
+    // carries on once the callback returns.
+    if (popping_pending_ops) {
+        return;
+    }
+    popping_pending_ops = true;
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
         num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
+    popping_pending_ops = false;
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
@@ -572,6 +463,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
+    work_since_submit.store(0, std::memory_order_relaxed);
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
