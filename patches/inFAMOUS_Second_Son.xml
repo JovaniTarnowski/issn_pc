@@ -14,7 +14,7 @@
   <TitleID>
     <ID>CUSA00004</ID>
   </TitleID>
-  <Metadata Title="inFAMOUS Second Son" Name="Dynamic quality thresholds x2 (no quality drops in busy scenes)" Note="The dynamic quality system of the game lowers the quality (sun shadow cascades, resolution) when the per-frame GPU command buffer gets busy; its limits are doubled. FR : limites du systeme de qualite dynamique du jeu doublees : il ne baisse plus la qualite (ombres du soleil, resolution) dans les scenes chargees." Author="AYOUB1080p" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="true">
+  <Metadata Title="inFAMOUS Second Son" Name="Dynamic quality thresholds x2 (no quality drops in busy scenes)" Note="The dynamic quality system of the game lowers the quality (sun shadow cascades, resolution) when the per-frame GPU command buffer gets busy; its limits are doubled. FR : limites du systeme de qualite dynamique du jeu doublees : il ne baisse plus la qualite (ombres du soleil, resolution) dans les scenes chargees." Author="AYOUB1080p" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
     <PatchList>
       <Line Type="bytes" Address="0x005f1736" Value="00000003" OriginalHash="4b72757f9c5c7dc2"/>
       <Line Type="bytes" Address="0x005f1b19" Value="CCCC8C02" OriginalHash="2c21d479393d51d0"/>

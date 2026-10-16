@@ -1147,8 +1147,35 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                        // gow3: occlusion probe (GOW3_OCCLUSION_LOG=1 logs the events; GOW3_OCCLUSION_MODE
+                        // 0 = fake counter as before, 1 = both slots equal (nothing visible), 2 = end far
+                        // above begin (everything visible), 3 = zero counts: the default).
+                        const int occ_mode = Common::Backports::OcclusionMode();
+                        static const bool occ_log = [] {
+                            const char* v = std::getenv("GOW3_OCCLUSION_LOG");
+                            return v && *v && std::atoi(v) != 0;
+                        }();
+                        static std::atomic<u64> occ_events{0};
+                        const u64 occ_n = occ_events.fetch_add(1, std::memory_order_relaxed);
+                        if (occ_log && (occ_n < 48 || occ_n % 2000 == 0)) {
+                            std::printf("Occlusion: event %llu addr %p pairs %d before: %016llx %016llx %016llx %016llx\n",
+                                        static_cast<unsigned long long>(occ_n), static_cast<void*>(results),
+                                        num_counter_pairs, static_cast<unsigned long long>(results[0]),
+                                        static_cast<unsigned long long>(results[1]),
+                                        static_cast<unsigned long long>(results[2]),
+                                        static_cast<unsigned long long>(results[3]));
+                        }
+                        if (occ_mode == 0) {
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                *results = pixel_counter | OcclusionCounterValidMask;
+                            }
+                        } else {
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                const u64 v = pixel_counter | OcclusionCounterValidMask;
+                                results[0] = occ_mode == 3 ? OcclusionCounterValidMask : v;
+                                results[1] = occ_mode == 1 ? v : occ_mode == 2 ? v + (OcclusionCounterStep << 8) :
+                                             OcclusionCounterValidMask;
+                            }
                         }
                         pixel_counter += OcclusionCounterStep;
                     }

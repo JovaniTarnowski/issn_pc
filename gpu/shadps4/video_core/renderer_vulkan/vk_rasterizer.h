@@ -3,8 +3,12 @@
 
 #pragma once
 
+#include <chrono>
+#include <source_location>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
@@ -92,8 +96,19 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
-    void WaitHostCopies() {
+    /// gow3: with GOW3_PERF_DIAG=1 the time waited is attributed to the calling line (the report of
+    /// WaitDiagnostics), to see which guest-visible write holds the GPU thread for the copies.
+    void WaitHostCopies(std::source_location where = std::source_location::current()) {
         DrainDrawPipe();
+        if (WaitDiagnostics::Enabled()) {
+            const auto start = std::chrono::steady_clock::now();
+            scheduler.WaitHostCopies();
+            WaitDiagnostics::Get().Add(
+                where.file_name(), where.line(), 0,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count());
+            return;
+        }
         scheduler.WaitHostCopies();
     }
 

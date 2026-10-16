@@ -9,6 +9,7 @@
 #include "../../src/cheat_hook.h"
 
 #include <atomic>
+#include <string>
 #include <cstdint>
 
 namespace Gow3Settings {
@@ -77,7 +78,7 @@ struct Values {
     std::atomic<bool> async_shaders{true};
     std::atomic<bool> fsr1{false};
     std::atomic<bool> rcas{true};
-    std::atomic<int> rcas_strength{75};
+    std::atomic<int> rcas_strength{60};
     /// Set by the presenter: sharpening ran on the last frame (it needs FSR 1 when the game's
     /// image is smaller than the window).
     std::atomic<bool> rcas_applied{false};
@@ -88,7 +89,7 @@ struct Values {
     std::atomic<int> render_resolution{0};
     std::atomic<int> engine_fps{120};
     std::atomic<bool> deferred_readback{true};
-    std::atomic<bool> stale_readback{true};
+    std::atomic<bool> stale_readback{false};
     /// Set before an "Apply and restart"; cleared once the new launch shows the game. run.py
     /// restores the previous startup options when a launch never cleared it.
     std::atomic<bool> restart_unconfirmed{false};
@@ -96,7 +97,7 @@ struct Values {
     /// The engine rate this launch really runs at (run.py's GOW3_ENGINE_FPS): 60 when the frame
     /// rate patch does not apply to this game build.
     std::atomic<int> applied_engine_fps{120};
-    bool startup_deferred_readback = true, startup_stale_readback = true;
+    bool startup_deferred_readback = true, startup_stale_readback = false;
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
@@ -128,6 +129,22 @@ struct Values {
     bool startup_object_motion = true;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
+
+    // Draw distance (gow3_view.h, src/view_hook.h; inFAMOUS 1.07 only, view_supported). Live:
+    // the LOD values on the next frame, the clip planes for cameras the game creates afterwards.
+    std::atomic<float> lod_scale{1.0f}, region_lod{1.0f}, region_fade{1.0f};
+    std::atomic<float> near_clip{10.0f}, far_clip{1.0e7f};
+    std::atomic<float> lod_bands[6]{400.0f, 750.0f, 1500.0f, 3500.0f, 6000.0f, 15000.0f};
+    std::atomic<bool> view_supported{false};
+    /// Extra texture LOD bias of the game's draws (vk_rasterizer.cpp), any game.
+    std::atomic<float> mip_lod_bias{0.0f};
+
+    // Mouse and keyboard (src/runtime_pad.c through gow3gpu_input_settings, src/mouse_stick.h):
+    // the mouse turns the camera (right stick). Live from the menu.
+    std::atomic<bool> mouse_enabled{true}, mouse_invert_y{false};
+    std::atomic<float> mouse_sensitivity{1.0f}, mouse_smoothing{0.5f}, mouse_accel{0.0f}, mouse_deadzone{0.1f};
+    /// Keyboard and mouse button remap (GOW3_KEY_MAP syntax); written by Load only, read once.
+    std::string key_map;
 };
 
 Values& Get();

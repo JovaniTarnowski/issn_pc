@@ -12,6 +12,7 @@
 #include "cheat_hook.h"
 #include "actor_hook.h"
 #include "damage_hook.h"
+#include "view_hook.h"
 #include "gpu/gow3gpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -617,6 +618,45 @@ static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
     return 1;
 }
 
+extern uintptr_t gow3_view_region_params(void);
+extern uintptr_t gow3_view_fade_inverse(void);
+extern void gow3_view_attach(unsigned char *guest_image);
+
+/* issn: draw distance, LOD and clip planes of inFAMOUS 1.07 (src/view_hook.h, from HayatoG's
+ * iss_pc): the menu's/environment's values reach the game's data through gow3_view_attach; the
+ * regions' LOD_ADJUST and FADE_DISTANCE go through four stubs. Silent for other builds. */
+static void install_view_tuning(Segment *segments, uint64_t count, uint64_t size) {
+    if (!mapped(segments, count, GOW3_VIEW_LOD_TABLE, GOW3_VIEW_LOD_ROWS * GOW3_VIEW_LOD_STRIDE) ||
+        !mapped(segments, count, GOW3_VIEW_BANDS, 4 * GOW3_VIEW_BAND_COUNT) ||
+        !mapped(segments, count, GOW3_VIEW_NEAR_CLIP, 8) ||
+        !mapped(segments, count, gow3_view_region_sites[1], sizeof(gow3_view_region_code)) ||
+        !gow3_view_signature_match(image, size)) {
+        return;
+    }
+    unsigned char *stubs = allocate(page_size);
+    const uint32_t *sites[2] = {gow3_view_region_sites, gow3_view_fade_sites};
+    for (unsigned kind = 0; kind < 2; ++kind) {
+        for (unsigned i = 0; i < 2; ++i) {
+            const uint32_t at = sites[kind][i];
+            unsigned char *stub = stubs + (kind * 2 + i) * 128;
+            const int64_t delta = (int64_t)(uintptr_t)stub - (int64_t)(uintptr_t)(image + at + 5);
+            if (delta < INT32_MIN || delta > INT32_MAX) {
+                printf("Draw distance: unavailable (hook outside relative-jump range)\n");
+                return;
+            }
+            const uintptr_t resume = (uintptr_t)(image + at + GOW3_VIEW_SITE_LENGTH);
+            if (kind == 0) gow3_view_build_region_stub(stub, gow3_view_region_params(), resume);
+            else gow3_view_build_fade_stub(stub, gow3_view_fade_inverse(), resume);
+        }
+    }
+    protect(stubs, page_size, 5);
+    for (unsigned kind = 0; kind < 2; ++kind)
+        for (unsigned i = 0; i < 2; ++i)
+            install_jump(sites[kind][i], GOW3_VIEW_SITE_LENGTH, stubs + (kind * 2 + i) * 128);
+    gow3_view_attach(image);
+    printf("Draw distance: ready (LOD scale, LOD bands, region LOD_ADJUST and FADE_DISTANCE, near/far clip)\n");
+}
+
 /* Damage dealt/taken and green/blue/gold orb multipliers (src/damage_hook.h, src/orb_hook.h):
  * the stubs read the menu's floats directly, so changes apply on the next hit or pickup. */
 static void install_stat_multipliers(Segment *segments, uint64_t count, uint64_t size) {
@@ -1045,6 +1085,7 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_cheats(segments, ns, size);
     if (gpu_enabled) install_actor_watch(segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(segments, ns, size);
+    if (gpu_enabled) install_view_tuning(segments, ns, size);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif

@@ -15,12 +15,17 @@ PROFILES = {
     title: {
         # Precise GPU readbacks: the game reads GPU particle results back (the smoke to drain,
         # drones); without them those effects are missing. The deferred and eager copies keep
-        # the waits short (HayatoG's iss_pc defaults for this game).
+        # the waits short (HayatoG's iss_pc defaults; his eager read-ahead made smoke flicker).
         'GOW3_READBACKS': '2',
         # Buffer-store barriers in uniform loops of workgroups wider than a GCN wave (AYOUB1080p).
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
         'GOW3_DEFERRED_READBACK': '1',
-        'GOW3_EAGER_READBACK': '1',
+        # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
+        # distance means far fewer draws in the open city, the bottleneck here.
+        'GOW3_LOD_SCALE': '0.6',
+        'GOW3_REGION_FADE': '0.8',
+        # AMD: maximal reconvergence is suspected of keeping the game from starting (RX 7600).
+        'GOW3_BP06': '0',
         # GOW3_FULL_BARRIERS=1 is no longer needed: the black 64x64 tiles stay away without it
         # since the vertex/index/indirect buffer barriers (BP10, HayatoG's core); off, the FPS
         # roughly doubles in the city (tester, RX 9060 XT).

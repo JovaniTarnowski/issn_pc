@@ -6,18 +6,23 @@
 #ifndef _WIN32
 #include <array>
 #include <atomic>
+#include <filesystem>
+#include <mutex>
 #include <optional>
 #include <dlfcn.h>
 #endif
+#include <cmath>
 #include <unordered_set>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "gow3_toggles.h"
+#include "gow3_settings.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pass_census.h"
 #include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/backports.h"
+#include "video_core/cache_storage.h"
 #include "common/debug.h"
 #include "common/hash.h"
 #include "core/debug_state.h"
@@ -1272,6 +1277,37 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
+    // tlg (i3-pc 7036810): arguments that no real draw comes near make the GPU hang until the
+    // driver resets the device (an instance count in the billions from unrelated float data). Every
+    // slot of a multi draw is checked, not just the first, when the arguments live in plain guest
+    // memory; slots the GPU wrote (compute) are not in guest memory yet and are left to the GPU.
+    // GOW3_INDIRECT_CHECK=0 turns the check off. The i3-pc also draws from the checked copy even for
+    // GPU-written slots (particle counts a frame old): not ported, it changes what is drawn.
+    static const bool check_args = [] {
+        const char* value = std::getenv("GOW3_INDIRECT_CHECK");
+        return !value || value[0] != '0';
+    }();
+    if (check_args && count_address == 0 && stride >= 16 && max_count != 0 &&
+        !buffer_cache.IsRegionGpuModified(arg_address + offset, u64(stride) * max_count)) {
+        constexpr u32 max_elements = 0x400000;
+        constexpr u32 max_instances = 0x10000;
+        constexpr u32 max_slots = 256;
+        for (u32 slot = 0; slot < std::min(max_count, max_slots); ++slot) {
+            std::array<u32, 2> args{};
+            memory->CopySparseMemory(arg_address + offset + u64(slot) * stride,
+                                     reinterpret_cast<u8*>(args.data()), sizeof(args));
+            if (args[0] > max_elements || args[1] > max_instances) {
+                static std::atomic<u32> dropped{0};
+                if (dropped.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render,
+                                "gow3: dropped indirect draw at {:#x} slot {}: count {:#x}, "
+                                "instances {:#x}",
+                                arg_address + offset, slot, args[0], args[1]);
+                }
+                return;
+            }
+        }
+    }
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
@@ -1827,6 +1863,80 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+// tlg (i3-pc 25f247c): a game that binds a heap whole and read-only (inFAMOUS: 0.5 and 2.5 GB
+// geometry heaps, indexed by a per-instance offset, so no part can be left out) uploaded all of it
+// in the frame of the first bind (a freeze of 2 to 3 seconds). The ranges are remembered per title
+// (heap_binds.txt in the game cache) and, in later sessions, uploaded a slice per submission until
+// the game binds them, so the first bind finds only what was written since. Uploading early is
+// sound: a later write marks the pages again. On; GOW3_HEAP_WARM=0 turns it off.
+namespace {
+constexpr u64 HugeBindSize = 256ull << 20;
+constexpr u64 HugeWarmSlice = 16ull << 20;
+
+struct HugeBind {
+    VAddr base;
+    u64 size;
+    u64 cursor{};
+    bool bound{};
+};
+
+bool HugeWarmEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GOW3_HEAP_WARM");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::filesystem::path HugeBindFile() {
+    return Storage::GameCacheDir() / "heap_binds.txt";
+}
+
+std::mutex huge_binds_mutex;
+
+std::vector<HugeBind>& HugeBinds() {
+    static std::vector<HugeBind> binds = [] {
+        std::vector<HugeBind> loaded;
+        if (FILE* f = std::fopen(HugeBindFile().string().c_str(), "r")) {
+            unsigned long long base, size;
+            while (loaded.size() < 16 && std::fscanf(f, "%llx %llx", &base, &size) == 2) {
+                if (size >= HugeBindSize && size <= (4ull << 30)) {
+                    loaded.push_back({VAddr(base), u64(size)});
+                }
+            }
+            std::fclose(f);
+        }
+        return loaded;
+    }();
+    return binds;
+}
+
+void NoteHugeBind(VAddr base, u64 size) {
+    if (!HugeWarmEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{huge_binds_mutex};
+    auto& binds = HugeBinds();
+    for (auto& bind : binds) {
+        if (bind.base == base && bind.size == size) {
+            bind.bound = true;
+            return;
+        }
+    }
+    if (binds.size() >= 16) {
+        return;
+    }
+    binds.push_back({base, size, 0, true});
+    std::error_code ec;
+    std::filesystem::create_directories(HugeBindFile().parent_path(), ec);
+    if (FILE* f = std::fopen(HugeBindFile().string().c_str(), "a")) {
+        std::fprintf(f, "%llx %llx\n", static_cast<unsigned long long>(base),
+                     static_cast<unsigned long long>(size));
+        std::fclose(f);
+    }
+}
+} // namespace
+
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
     if (fault_process_pending) {
@@ -1835,6 +1945,28 @@ void Rasterizer::OnSubmit() {
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
+    if (HugeWarmEnabled()) {
+        // One slice of each remembered heap this session has not bound yet. The draw pipe was
+        // drained above, so no draw is binding buffers meanwhile.
+        std::scoped_lock lock{huge_binds_mutex};
+        for (auto& bind : HugeBinds()) {
+            if (bind.bound) {
+                continue;
+            }
+            const VAddr start = bind.base + bind.cursor;
+            const u64 length = std::min(HugeWarmSlice, bind.size - bind.cursor);
+            bind.cursor = bind.cursor + length >= bind.size ? 0 : bind.cursor + length;
+            boost::container::small_vector<std::pair<VAddr, u64>, 8> parts;
+            ForEachMappedRangeInRange(start, length, [&](const auto& range) {
+                parts.emplace_back(range.lower(), range.upper() - range.lower());
+            });
+            for (const auto& [addr, part_size] : parts) {
+                if (part_size > 64_KB) {
+                    (void)buffer_cache.ObtainBuffer(addr, u32(part_size), false);
+                }
+            }
+        }
+    }
     runtime.TickFrame();
 }
 
@@ -1964,11 +2096,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // gow3: G-buffer passes sample material textures for a scene rendered below the output
     // size; the temporal upscaler restores the detail of the output's mip level (FSR guide:
     // log2(render / output)). Shadows, post-processing and UI keep the guest's bias.
-    sampler_lod_bias = 0.0f;
+    // The menu's texture LOD bias (mip_lod_bias) adds to every draw: textures without mips
+    // (UI, full-screen passes) are unaffected. Steps of 1/8: dragging the slider creates few samplers.
+    sampler_lod_bias = pipeline->IsCompute() ? 0.0f
+                                             : std::round(Gow3Settings::Get().mip_lod_bias.load() * 8.0f) / 8.0f;
     if (!pipeline->IsCompute() && !Gow3Toggle::Disabled(Gow3Toggle::SceneMipBias) &&
         std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
                       0xff) >= 5) {
-        sampler_lod_bias = upscaler->SceneMipBias();
+        sampler_lod_bias += upscaler->SceneMipBias();
         static float reported = 0.0f;
         if (sampler_lod_bias != reported) {
             reported = sampler_lod_bias;
@@ -2578,6 +2713,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                     vsharp.GetSize(), size, stage.pgm_hash);
                     }
                 }
+                if (!desc.is_written && size >= HugeBindSize) {
+                    NoteHugeBind(vsharp.base_address, size);
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -2617,7 +2755,9 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
                                                                    u64 hash) {
     std::array<u64, 4> key;
     std::memcpy(key.data(), &sharp, sizeof(key));
-    const u32 flags = u32(res.is_written) | u32(res.is_depth) << 1 | u32(res.is_array) << 2;
+    // tlg (gow3_pc #348): needs_native too, since FindImage resolves partial height views only for it.
+    const u32 flags = u32(res.is_written) | u32(res.is_depth) << 1 | u32(res.is_array) << 2 |
+                      u32(res.needs_native) << 3;
     // Two-way set associative: a frame binds a few thousand distinct T#s.
     auto* set = &image_desc_cache[(hash % (image_desc_cache.size() / 2)) * 2];
     const auto matches = [&](const ImageDescCacheEntry& e) {

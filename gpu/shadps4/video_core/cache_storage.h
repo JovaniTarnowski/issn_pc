@@ -8,6 +8,8 @@
 #include "common/types.h"
 
 #include <functional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -53,6 +55,8 @@ public:
     [[nodiscard]] bool ConcurrentReads() const;
     /// gow3: number of blobs ForEachBlob visits (the loading screen's total).
     size_t CountBlobs(BlobType type);
+    /// gow3: the name (no extension) of every blob of a type, without reading it.
+    void ForEachBlobName(BlobType type, const std::function<void(std::string_view name)>& func);
 
 private:
     std::jthread io_worker{};

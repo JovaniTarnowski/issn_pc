@@ -72,6 +72,19 @@ enum : std::uint64_t {
     /// Guest threads wait for their own readback copies (GOW3_DEFERRED_READBACK=1 enables it;
     /// this bit switches it off live for A/B, see BufferCache::ReadMemory).
     DeferredReadback = 1ull << 58,
+    /// ResolveOverlap answers an integer read of the top rows of a cached image with that image
+    /// (gow3_pc #348, off unless GOW3_PARTIAL_HEIGHT_VIEWS=1; this bit switches it off live).
+    PartialHeightViews = 1ull << 59,
+    /// Readbacks that write guest memory through the backing view invalidate the textures over it
+    /// (gow3_pc #331, off unless GOW3_BACKING_INVALIDATE=1; this bit switches it off live).
+    BackingInvalidate = 1ull << 60,
+    /// Image uploads and frees wait only for readback copies that share bytes with the image, not
+    /// just a page (gow3_pc #386; only with stale readbacks; this bit switches it off live).
+    ExactReadbackWaits = 1ull << 61,
+    /// GetProgram takes the variant of the previous lookup without building the specialization
+    /// when its inputs are unchanged (i3-pc 0120115; only with GOW3_VARIANT_REUSE=1 or =check; this
+    /// bit switches it off live).
+    VariantReuse = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

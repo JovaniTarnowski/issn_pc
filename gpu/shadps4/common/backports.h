@@ -53,13 +53,13 @@ inline constexpr std::array<Entry, static_cast<std::size_t>(Id::Count)> kEntries
     {"BP03", "GOW3_BP03", true, true, "keep EXEC after an empty divergent branch", "shadPS4 c34ca21f"},
     {"BP04", "GOW3_BP04", true, true, "V_RCP/RSQ/LOG_CLAMP and V_RSQ_LEGACY really clamp to +-FLT_MAX", "shadPS4 1c2b8f97 #5346"},
     {"BP05", "GOW3_BP05", true, true, "saturate maps NaN to 0 like DX10_CLAMP (NClamp)", "shadPS4 #5257"},
-    {"BP06", "GOW3_BP06", false, true, "VK_KHR_shader_maximal_reconvergence in compute", "SotC 8d84cf7"},
+    {"BP06", "GOW3_BP06", true, true, "VK_KHR_shader_maximal_reconvergence in compute", "SotC 8d84cf7"},
     {"BP07", "GOW3_BP07", false, false, "async compile never skips full-screen/indirect draws", "bbport 10baf9d"},
     {"BP08", "GOW3_BP08", false, false, "persist the driver VkPipelineCache blob", "Mrsuss b972798, 0xCydral bdb9769"},
     {"BP09", "GOW3_BP09", false, true, "every 1D image as 2D with height 1", "CTR d26bcb2"},
     {"BP10", "GOW3_BP10", true, false, "barriers for vertex/index/indirect buffers", "shadPS4 #5262"},
     {"BP11", "GOW3_BP11", true, true, "firstInstance counted once in indirect draws", "shadPS4 #5348"},
-    {"BP12", "GOW3_BP12", true, true, "EarlyFragmentTests when DEPTH_BEFORE_SHADER is set", "shadPS4 7d28d279 #5264"},
+    {"BP12", "GOW3_BP12", false, true, "EarlyFragmentTests when DEPTH_BEFORE_SHADER is set", "shadPS4 7d28d279 #5264"},
 }};
 
 namespace Detail {
@@ -130,6 +130,16 @@ inline std::array<std::atomic<std::int8_t>, kEntries.size()>& States() {
 }
 } // namespace Detail
 
+/// GOW3_OCCLUSION_MODE (ISS_ alias): how the ZPASS_DONE occlusion counter is answered. 0 = the old fake,
+/// ever-growing counter, 1 = both values equal, 2 = end far above begin, 3 = zero counts (default).
+inline int OcclusionMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("GOW3_OCCLUSION_MODE");
+        return v && *v ? std::atoi(v) : 3;
+    }();
+    return mode;
+}
+
 /// State of one backport.
 inline bool On(Id id) {
     return Detail::States()[static_cast<std::size_t>(id)].load(std::memory_order_relaxed) != 0;
@@ -191,6 +201,8 @@ inline std::uint32_t ShaderSalt() {
 
 /// One line per backport, once at start-up (the run log keeps stdout).
 inline void LogStates() {
+    std::printf("Backports: occlusion mode %d (GOW3_OCCLUSION_MODE; 0 = old fake counter, 3 = default)\n",
+                OcclusionMode());
     for (std::size_t i = 0; i < kEntries.size(); ++i) {
         const Entry& e = kEntries[i];
         std::printf("Backports: %s %s=%d (%s; %s)\n", e.id, e.env,

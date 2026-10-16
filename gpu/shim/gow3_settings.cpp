@@ -3,6 +3,7 @@
 #include "gow3_settings.h"
 #include "gow3_orbs.h"
 #include "gow3_graphics.h"
+#include "gow3_view.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -78,6 +79,22 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             return;
         }
     }
+    if (key == "key_map") {
+        v.key_map = value;
+        return;
+    }
+    if (key == "lod_bands") {
+        // Six comma-separated distances; missing or bad entries keep the current value.
+        const char* p = value.c_str();
+        for (auto& band : v.lod_bands) {
+            char* end = nullptr;
+            const float b = std::strtof(p, &end);
+            if (end == p) break;
+            band = Gow3View::ClampBand(b);
+            p = *end == ',' ? end + 1 : end;
+        }
+        return;
+    }
     if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
@@ -106,6 +123,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "mouse_enabled") {
+        v.mouse_enabled = i != 0;
+    } else if (key == "mouse_invert_y") {
+        v.mouse_invert_y = i != 0;
+    } else if (key == "mouse_sensitivity") {
+        v.mouse_sensitivity = Clamp(value.empty() ? 1.0f : f, 0.05f, 10.0f);
+    } else if (key == "mouse_smoothing") {
+        v.mouse_smoothing = Clamp(f, 0.0f, 0.95f);
+    } else if (key == "mouse_accel") {
+        v.mouse_accel = Clamp(f, 0.0f, 2.0f);
+    } else if (key == "mouse_deadzone") {
+        v.mouse_deadzone = Clamp(f, 0.0f, 0.5f);
     } else if (key == "sensor_aim") {
         v.sensor_aim = std::clamp(i, 25, 200);
     } else if (key == "graffiti_guide_seen") {
@@ -152,6 +181,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.blue_orb_multiplier = Gow3Orbs::ClampMultiplier(f);
     } else if (key == "gold_orb_multiplier") {
         v.gold_orb_multiplier = Gow3Orbs::ClampMultiplier(f);
+    } else if (key == "lod_scale") {
+        v.lod_scale = Gow3View::ClampLodScale(f);
+    } else if (key == "region_lod") {
+        v.region_lod = Gow3View::ClampRegionLod(f);
+    } else if (key == "region_fade") {
+        v.region_fade = Gow3View::ClampRegionFade(f);
+    } else if (key == "near_clip") {
+        v.near_clip = Gow3View::ClampNearClip(f);
+    } else if (key == "far_clip") {
+        v.far_clip = Gow3View::ClampFarClip(f);
+    } else if (key == "mip_lod_bias") {
+        v.mip_lod_bias = Gow3View::ClampMipLodBias(f);
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -177,7 +218,7 @@ Values& Get() {
 void Load() {
     auto& v = Get();
     if (FILE* file = std::fopen(Path(), "r")) {
-        char line[256];
+        char line[1024]; // key_map can be long
         while (std::fgets(line, sizeof(line), file)) {
             std::string text{line};
             text.erase(text.find_last_not_of(" \t\r\n") + 1);
@@ -206,6 +247,13 @@ void Load() {
         {"GOW3_STALE_READBACK", "stale_readback"},     {"GOW3_FSR1", "fsr1"},
         {"GOW3_RCAS", "rcas"},                        {"GOW3_FRAMES_AHEAD", "frames_queued"},
         {"GOW3_SHOW_FPS", "show_fps"},             {"GOW3_SENSOR_AIM", "sensor_aim"},
+        {"GOW3_MOUSE", "mouse_enabled"},           {"GOW3_MOUSE_SENS", "mouse_sensitivity"},
+        {"GOW3_MOUSE_INVERT_Y", "mouse_invert_y"}, {"GOW3_MOUSE_SMOOTHING", "mouse_smoothing"},
+        {"GOW3_MOUSE_ACCEL", "mouse_accel"},       {"GOW3_MOUSE_DEADZONE", "mouse_deadzone"},
+        {"GOW3_LOD_SCALE", "lod_scale"},           {"GOW3_LOD_BANDS", "lod_bands"},
+        {"GOW3_REGION_LOD", "region_lod"},         {"GOW3_REGION_FADE", "region_fade"},
+        {"GOW3_NEAR_CLIP", "near_clip"},           {"GOW3_FAR_CLIP", "far_clip"},
+        {"GOW3_MIP_LOD_BIAS", "mip_lod_bias"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -333,6 +381,12 @@ void Save() {
                  int(v.restart_unconfirmed.load()));
     std::fprintf(file, "sensor_aim=%d\ngraffiti_guide_seen=%d\n", v.sensor_aim.load(),
                  int(v.graffiti_guide_seen.load()));
+    std::fprintf(file,
+                 "lod_scale=%.3f\nregion_lod=%.3f\nregion_fade=%.3f\nnear_clip=%.3f\nfar_clip=%.0f\n"
+                 "mip_lod_bias=%.3f\nlod_bands=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n",
+                 v.lod_scale.load(), v.region_lod.load(), v.region_fade.load(), v.near_clip.load(),
+                 v.far_clip.load(), v.mip_lod_bias.load(), v.lod_bands[0].load(), v.lod_bands[1].load(),
+                 v.lod_bands[2].load(), v.lod_bands[3].load(), v.lod_bands[4].load(), v.lod_bands[5].load());
     // Fixes: applied on the next start by the launcher (GOW3_BPnn / GOW3_<NAME>); only the ones
     // the player or the launcher chose are written.
     for (int n = 0; n < kBackportPrefs; ++n) {
@@ -341,6 +395,11 @@ void Save() {
     for (int e = 0; e < kExtraPrefs; ++e) {
         if (const int p = v.extra_pref[e]; p >= 0) std::fprintf(file, "%s=%d\n", kExtraKeys[e], p);
     }
+    std::fprintf(file,
+                 "mouse_enabled=%d\nmouse_sensitivity=%.2f\nmouse_invert_y=%d\nmouse_smoothing=%.2f\n"
+                 "mouse_accel=%.2f\nmouse_deadzone=%.2f\nkey_map=%s\n",
+                 int(v.mouse_enabled.load()), v.mouse_sensitivity.load(), int(v.mouse_invert_y.load()),
+                 v.mouse_smoothing.load(), v.mouse_accel.load(), v.mouse_deadzone.load(), v.key_map.c_str());
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

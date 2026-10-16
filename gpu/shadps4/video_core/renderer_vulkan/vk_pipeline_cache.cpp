@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <string_view>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include <xxhash.h>
 #include "common/backports.h"
 #include "gow3_threads.h"
+#include "gow3_region.h"
 
 #include "common/elf_info.h"
 #include "common/hash.h"
@@ -158,6 +161,19 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
+// Lowered user clip planes ride the same emulation path as guest-exported distances, so the
+// fragment side arms whenever the hardware vertex stage lowers them, keeping its input locations in
+// sync with the shifted vertex outputs.
+static bool NeedsClipDistanceEmulation(const AmdGpu::Regs& regs, const Shader::Profile& profile) {
+    const bool lowers_user_clip_planes =
+        regs.clipper_control.user_clip_plane_enable &&
+        !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry));
+    return ((regs.vs_output_control.clip_distance_enable &&
+             !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
+            lowers_user_clip_planes) &&
+           profile.needs_clip_distance_emulation;
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& sel, HwStage stage,
                                                              SwStage l_stage) {
     auto& info = sel.runtime_infos[u32(l_stage)];
@@ -285,17 +301,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.hw.fs.color_buffers[i] = sel.graphics_key.color_buffers[i];
         }
-        // Lowered user clip planes ride the same emulation path as guest-exported distances, so
-        // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
-        // locations in sync with the shifted vertex outputs.
-        const bool lowers_user_clip_planes =
-            regs.clipper_control.user_clip_plane_enable &&
-            !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry));
-        info.hw.fs.clip_distance_emulation =
-            ((regs.vs_output_control.clip_distance_enable &&
-              !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
-             lowers_user_clip_planes) &&
-            profile.needs_clip_distance_emulation;
+        info.hw.fs.clip_distance_emulation = NeedsClipDistanceEmulation(regs, profile);
         break;
     }
     case HwStage::Compute: {
@@ -497,7 +503,13 @@ void PipelineCache::StartDriverCacheSaver() {
         auto* saver = driver_saver;
         std::unique_lock lock{saver->mutex};
         while (!saver->stop) {
-            if (saver->cv.wait_for(lock, std::chrono::seconds(180), [&] { return saver->stop; })) {
+            // gow3: GOW3_DRIVER_CACHE_SAVE_S (default 60, was 180): a crash loses at most this much of what
+            // the driver learned.
+            static const int save_seconds = [] {
+                const char* v = std::getenv("GOW3_DRIVER_CACHE_SAVE_S");
+                return v && *v ? std::clamp(std::atoi(v), 10, 3600) : 60;
+            }();
+            if (saver->cv.wait_for(lock, std::chrono::seconds(save_seconds), [&] { return saver->stop; })) {
                 break;
             }
             lock.unlock();
@@ -771,7 +783,12 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
             return false;
         }
         runtime_fault_recover = &recover;
-        capture_work();
+        try {
+            capture_work();
+        } catch (...) {
+            runtime_fault_recover = nullptr; // `recover` dies with this frame
+            throw;
+        }
         runtime_fault_recover = nullptr;
         return true;
     })) {
@@ -781,11 +798,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         PhaseTimer waiting{g_gow3_guest_wait_ns};
         capture_job.Wait();
     }
-    if (faulted->load(std::memory_order_acquire)) {
-        PhaseTimer capture{g_gow3_capture_ns};
-        build->ir.reset();
-        capture_work();
-    } else if (!capture_job.Poll()) {
+    const auto mark_failed = [&](const std::string& error) {
         if (initial) {
             program.compilation_failed = true;
         } else {
@@ -793,7 +806,19 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
             program.failed_permutations.push_back(std::move(*specialization));
         }
         LOG_ERROR(Render_Vulkan, "gow3: shader {:#x}/{} capture failed: {}", params.hash,
-                  permutation, capture_job.Error());
+                  permutation, error);
+    };
+    if (faulted->load(std::memory_order_acquire)) {
+        PhaseTimer capture{g_gow3_capture_ns};
+        build->ir.reset();
+        try {
+            capture_work();
+        } catch (const std::exception& e) {
+            mark_failed(e.what());
+            return false;
+        }
+    } else if (!capture_job.Poll()) {
+        mark_failed(capture_job.Error());
         return false;
     }
     const bool queued = build->job.Start(*compiler, [this, build] {
@@ -865,7 +890,7 @@ void PipelineCache::PublishShaders(bool wait) {
             build->spec.info = &program->info;
             RegisterShaderMeta(program->info, build->spec.fetch_shader_data, build->spec,
                                perm_hash, build->permutation);
-            program->AddPermut(build->module, std::move(build->spec));
+            program->InsertPermut(build->module, std::move(build->spec), build->permutation);
             build->module = nullptr;
             program->pending.reset();
         }
@@ -1093,6 +1118,66 @@ void Bp07Tally(bool compiled_now) {
 }
 } // namespace
 
+// gow3: GOW3_ASYNC_WAIT_MS=N (default 0 = off), GOW3_ASYNC_WAIT_FRAME_MS=M (default 8). A draw whose
+// shader or pipeline is still compiling in the background is skipped. With N > 0 it first waits
+// for the compile up to N ms, and the waits of one GPU frame add up to at most M ms: a short
+// compile then costs a few milliseconds instead of a missing ground or effect, a long one is
+// skipped as before, so the frame time stays bounded. The log shows the tally every 5 s.
+// A new shader is the usual reason for a skipped draw (the pipeline is only queued once the
+// shader is translated), so GetProgram waits too, not only GetGraphicsPipeline.
+namespace {
+struct AsyncWaitBudget {
+    std::chrono::microseconds per_draw{0}, per_frame{8000};
+    u64 frame = ~0ull;
+    std::chrono::nanoseconds used{0};
+    u64 waited = 0, ready = 0, timed_out = 0;
+    std::chrono::nanoseconds total{0};
+    std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+
+    AsyncWaitBudget() {
+        if (const char* v = std::getenv("GOW3_ASYNC_WAIT_MS"); v && *v) {
+            per_draw = std::chrono::milliseconds(std::clamp(std::atoi(v), 0, 100));
+        }
+        if (const char* v = std::getenv("GOW3_ASYNC_WAIT_FRAME_MS"); v && *v) {
+            per_frame = std::chrono::milliseconds(std::clamp(std::atoi(v), 0, 100));
+        }
+    }
+    bool Enabled() const { return per_draw.count() > 0 && per_frame.count() > 0; }
+
+    /// How long this draw may wait now (zero: none left in this frame).
+    std::chrono::nanoseconds Allowance() {
+        const u64 now_frame = Gow3Stats::gpu_frames.load(std::memory_order_relaxed);
+        if (now_frame != frame) {
+            frame = now_frame;
+            used = std::chrono::nanoseconds{0};
+        }
+        const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(per_frame) - used;
+        return left.count() <= 0 ? std::chrono::nanoseconds{0}
+                                 : std::min<std::chrono::nanoseconds>(left, per_draw);
+    }
+
+    void Tally(std::chrono::nanoseconds spent, bool finished) {
+        used += spent;
+        total += spent;
+        ++waited;
+        ++(finished ? ready : timed_out);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log < std::chrono::seconds(5)) {
+            return;
+        }
+        last_log = now;
+        // A warning, not info: the log keeps only warnings and above.
+        LOG_WARNING(Render_Vulkan,
+                    "Async wait (total): {} waits for a compiling shader or pipeline, {:.1f} ms in all, "
+                    "{} finished in time, {} gave up at the limit and the draw was skipped "
+                    "({} ms per wait, {} ms per frame)",
+                    waited, double(total.count()) / 1e6, ready, timed_out, per_draw.count() / 1000,
+                    per_frame.count() / 1000);
+    }
+};
+AsyncWaitBudget async_wait; // GPU thread only (pipeline selection)
+} // namespace
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared) {
     SeedWorkerCaches();
@@ -1109,6 +1194,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (prepared) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
             used_prepared = prepared;
+            Gow3Region::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(prepared->key), true);
             return pipeline;
         }
     }
@@ -1122,6 +1208,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         return nullptr;
     }
+    // gow3: region trace (GOW3_REGION_TRACE=1): the first request of each pipeline.
+    Gow3Region::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(sel.graphics_key),
+                            graphics_pipelines.contains(sel.graphics_key));
     if (AsyncCompilation() && !sel.regs->stage_enable.hs_en && !EmulatorSettings.IsShaderCollect()) {
         const auto found = graphics_pipelines.find(sel.graphics_key);
         if (found != graphics_pipelines.end()) {
@@ -1174,6 +1263,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 pending_graphics.emplace(sel.graphics_key, std::move(build));
             }
         }
+        // gow3: GOW3_ASYNC_WAIT_MS: give the background compile a few milliseconds before the draw goes.
+        if (async_wait.Enabled()) {
+            if (const auto building = pending_graphics.find(sel.graphics_key);
+                building != pending_graphics.end()) {
+                if (const auto allowance = async_wait.Allowance(); allowance.count() > 0) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const bool finished = building.value()->job.WaitFor(allowance);
+                    async_wait.Tally(std::chrono::steady_clock::now() - t0, finished);
+                    if (finished) {
+                        PublishGraphics();
+                        if (const auto done = graphics_pipelines.find(sel.graphics_key);
+                            done != graphics_pipelines.end()) {
+                            return done->second.get();
+                        }
+                    }
+                }
+            }
+        }
         ++g_gow3_pending_draws;
         if (bp07) {
             Bp07Tally(false);
@@ -1216,6 +1323,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+    Gow3Region::NotePipeline('c', std::hash<ComputePipelineKey>{}(compute_key),
+                            compute_pipelines.contains(compute_key));
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
@@ -1479,6 +1588,14 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     }
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
+    if (!fs_info) {
+        // gow3: with no pixel shader, GraphicsPipeline adds the discard fragment shader from this
+        // runtime info. It used to keep the previous draw's, so a pipeline got the discard shader
+        // (or lost it) depending on the draw before it (NVIDIA clip distance emulation).
+        auto& fs_runtime = sel.runtime_infos[static_cast<u32>(SwStage::Fragment)];
+        fs_runtime = {};
+        fs_runtime.hw.fs.clip_distance_emulation = NeedsClipDistanceEmulation(regs, profile);
+    }
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
@@ -1673,6 +1790,10 @@ void Program::LogPermutationGrowth() const {
                 DescribeSpecDiff(modules[n - 2].spec, modules[n - 1].spec));
 }
 
+bool Program::PendingInitial() const {
+    return pending && pending->initial;
+}
+
 PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage hw_stage,
                                                 SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
@@ -1718,6 +1839,26 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                HashCombine(params.hash, perm_idx));
     }
 
+    // gow3: GOW3_ASYNC_WAIT_MS: before the draw goes for lack of its shader, give the background
+    // translation a few milliseconds. True when the shader is ready and the lookup should run again.
+    const auto wait_for_shader = [this](const Program& program) {
+        if (!async_wait.Enabled() || !program.pending) {
+            return false;
+        }
+        const auto allowance = async_wait.Allowance();
+        if (allowance.count() <= 0) {
+            return false;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        const bool finished = program.pending->job.WaitFor(allowance);
+        async_wait.Tally(std::chrono::steady_clock::now() - started, finished);
+        if (!finished) {
+            return false;
+        }
+        PublishShaders();
+        return !program.pending; // published; else the lookup would find it pending again
+    };
+
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
     const bool compile_async = AsyncCompilation() && hw_stage != HwStage::Compute &&
                                !sel.regs->stage_enable.hs_en &&
@@ -1738,37 +1879,62 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     }
     if (it_pgm == program_cache.end()) {
         auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
+        const size_t first_idx = NewPermutationIndex(*new_program, params.hash);
         if (compile_async) {
-            QueueShader(*new_program, hw_stage, sw_stage, params, runtime_info, binding, 0, true);
-            std::unique_lock lock{programs_mutex};
-            program_cache.emplace(params.hash, std::move(new_program));
+            QueueShader(*new_program, hw_stage, sw_stage, params, runtime_info, binding, first_idx,
+                        true);
+            const Program* queued = new_program.get();
+            {
+                std::unique_lock lock{programs_mutex};
+                program_cache.emplace(params.hash, std::move(new_program));
+            }
+            if (wait_for_shader(*queued)) {
+                return GetProgram(sel, hw_stage, sw_stage, params, binding);
+            }
             return {};
         }
         auto start = binding;
         auto compile_runtime = runtime_info; // translation adjusts it; the key keeps the original
-        const auto module =
-            CompileModule(new_program->info, compile_runtime, params.code, 0, binding);
+        vk::ShaderModule module;
+        try {
+            module = CompileModule(new_program->info, compile_runtime, params.code, first_idx,
+                                   binding);
+        } catch (const Shader::UnsupportedShaderError& e) {
+            // gow3: kept in the cache as failed, so its draws are skipped without retranslating.
+            LOG_ERROR(Render_Vulkan, "gow3: shader {:#x} refused: {}", params.hash, e.what());
+            new_program->compilation_failed = true;
+            std::unique_lock lk{programs_mutex};
+            program_cache.emplace(params.hash, std::move(new_program));
+            return {};
+        }
         auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, first_idx);
 
-        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        new_program->AddPermut(module, std::move(spec));
+        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, first_idx);
+        new_program->InsertPermut(module, std::move(spec), first_idx);
         new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
         Program* program = new_program.get();
         {
             std::unique_lock lk{programs_mutex};
             program_cache.emplace(params.hash, std::move(new_program));
         }
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        return std::make_tuple(&program->info, module,
+                               program->modules[first_idx].spec.fetch_shader_data, perm_hash);
     }
 
     auto& program = it_pgm.value();
     if (program->compilation_failed || (program->modules.empty() && program->pending)) {
+        if (!program->compilation_failed && wait_for_shader(*program)) {
+            return GetProgram(sel, hw_stage, sw_stage, params, binding);
+        }
         return {};
     }
     if (program->modules.empty() && compile_async) {
-        QueueShader(*program, hw_stage, sw_stage, params, runtime_info, binding, 0, true);
+        QueueShader(*program, hw_stage, sw_stage, params, runtime_info, binding,
+                    NewPermutationIndex(*program, params.hash), true);
+        if (wait_for_shader(*program)) {
+            return GetProgram(sel, hw_stage, sw_stage, params, binding);
+        }
         return {};
     }
     if (!program->info_template) {
@@ -1780,6 +1946,74 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    // tlg (i3-pc 0120115): the specialization depends only on the flattened user data (which holds
+    // every register, so the fetch shader address too), the runtime info, the first bindings and,
+    // for a vertex shader, the vertex buffer descriptors its fetch shader reads from guest memory.
+    // Tessellation stages also read constants from memory: never reused. GOW3_VARIANT_REUSE=1
+    // turns this on; =check also builds the specialization on every hit and logs a mismatch.
+    static const int reuse_mode = [] {
+        const char* value = std::getenv("GOW3_VARIANT_REUSE");
+        return !value ? 0 : (std::string_view{value} == "check" ? 2 : (value[0] == '1' ? 1 : 0));
+    }();
+    static std::atomic<u64> reuse_hits{0}, reuse_misses{0}, reuse_mismatches{0};
+    auto& last = program->last_match;
+    const bool reusable = reuse_mode != 0 && !Gow3Toggle::Disabled(Gow3Toggle::VariantReuse) &&
+                          sw_stage != SwStage::TessellationControl &&
+                          sw_stage != SwStage::TessellationEval;
+    const auto vs_sharps_match = [&](bool store) {
+        const auto& fetch = program->modules[last.perm_idx].spec.fetch_shader_data;
+        if (!fetch) {
+            if (store) {
+                last.vs_sharps.clear();
+            }
+            return store || last.vs_sharps.empty();
+        }
+        if (store) {
+            last.vs_sharps.clear();
+        } else if (last.vs_sharps.size() != fetch->attributes.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < fetch->attributes.size(); ++i) {
+            const auto sharp = fetch->attributes[i].GetSharp(info);
+            std::array<u32, 4> words;
+            static_assert(sizeof(sharp) == sizeof(words));
+            std::memcpy(words.data(), &sharp, sizeof(words));
+            if (store) {
+                last.vs_sharps.push_back(words);
+            } else if (last.vs_sharps[i] != words) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (reusable && last.perm_idx < program->modules.size() && last.start == binding &&
+        last.runtime_info == runtime_info && last.flat_buf == info.flattened_ud_buf &&
+        vs_sharps_match(false)) {
+        auto& hit = program->modules[last.perm_idx];
+        if (reuse_mode == 2) {
+            // The lookup below compares stored == fresh (the operator is not symmetric).
+            const auto check = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            if (!(hit.spec == check)) {
+                if (reuse_mismatches.fetch_add(1) < 16) {
+                    LOG_ERROR(Render_Vulkan,
+                              "gow3: variant reuse of shader {:#x} perm {} differs from a fresh "
+                              "specialization: {}",
+                              params.hash, last.perm_idx, DescribeSpecDiff(check, hit.spec));
+                }
+            }
+        }
+        ++reuse_hits;
+        program->last_used = last.perm_idx;
+        info.AddBindings(binding);
+        return std::make_tuple(&program->info, hit.module, hit.spec.fetch_shader_data,
+                               HashCombine(params.hash, last.perm_idx));
+    }
+    if (reusable && ((++reuse_misses) & 0xffff) == 0) {
+        LOG_INFO(Render_Vulkan, "gow3: variant reuse: {} hits, {} misses, {} mismatches",
+                 reuse_hits.load(), reuse_misses.load(), reuse_mismatches.load());
+    }
+    const auto start_binding = binding;
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -1807,22 +2041,39 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                     program->failed_permutations.end()) {
             return {};
         }
+        perm_idx = NewPermutationIndex(*program, params.hash);
+        perm_hash = HashCombine(params.hash, perm_idx);
         if (compile_async) {
             QueueShader(*program, hw_stage, sw_stage, params, runtime_info, binding, perm_idx, false,
                         std::move(spec));
             return {};
         }
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        try {
+            module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        } catch (const Shader::UnsupportedShaderError& e) {
+            LOG_ERROR(Render_Vulkan, "gow3: shader {:#x}/{} refused: {}", params.hash, perm_idx,
+                      e.what());
+            spec.info = &program->info;
+            program->failed_permutations.push_back(std::move(spec));
+            return {};
+        }
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         std::unique_lock lk{programs_mutex};
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
+    }
+    if (reusable && perm_idx < program->modules.size()) {
+        last.perm_idx = perm_idx;
+        last.flat_buf = info.flattened_ud_buf;
+        last.runtime_info = runtime_info;
+        last.start = start_binding;
+        vs_sharps_match(true);
     }
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
