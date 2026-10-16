@@ -1940,6 +1940,7 @@ void NoteHugeBind(VAddr base, u64 size) {
 
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
+    buffer_cache.SettleOwedPages();
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();

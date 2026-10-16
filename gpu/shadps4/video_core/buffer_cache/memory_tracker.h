@@ -68,6 +68,19 @@ public:
                             });
     }
 
+    /// gow3: calls func(manager, offset, size) for the 4 KiB page at `page` with its region
+    /// lock held; returns what func returns (false when the page has no region).
+    template <typename Func>
+    bool WithPageLocked(VAddr page, Func&& func) {
+        bool result = false;
+        IteratePages<false>(page, TRACKER_BYTES_PER_PAGE,
+                            [&](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                result = func(*manager, offset, size);
+                            });
+        return result;
+    }
+
     /// gow3: see RegionManager::ExtendWriteFault.
     void ExtendWriteFault(VAddr window_addr, u64 size) {
         IteratePages<false>(window_addr, size,

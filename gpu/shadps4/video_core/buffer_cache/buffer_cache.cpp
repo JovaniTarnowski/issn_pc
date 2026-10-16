@@ -175,6 +175,9 @@ struct ReadbackStats {
     std::atomic<u64> deferred{0}, joined{0}, applied{0}, stale{0}, deferred_ns{0}, deferred_bytes{0};
     /// Eager copies: pages copied, used by a fault, gone stale unread, skipped for backoff.
     std::atomic<u64> eager_copied{0}, eager_used{0}, eager_stale{0}, eager_skipped{0};
+    /// Fast writes (GOW3_FAST_WRITE): taken, and their copies found unchanged, merged (the GPU
+    /// had changed the page), with the page GPU modified again by then, or read back since.
+    std::atomic<u64> fast{0}, owed_same{0}, owed_merged{0}, owed_conflict{0}, owed_superseded{0};
     std::atomic<s64> window_start{0};
 };
 ReadbackStats& Readbacks() {
@@ -216,6 +219,15 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.eager_used.exchange(0)),
                 static_cast<unsigned long long>(r.eager_stale.exchange(0)),
                 static_cast<unsigned long long>(r.eager_skipped.exchange(0)));
+    if (const u64 fast = r.fast.exchange(0); fast || r.owed_merged.load()) {
+        std::printf("  fast writes: %llu; verified unchanged %llu, merged %llu (GPU modified "
+                    "again %llu), read back since %llu\n",
+                    static_cast<unsigned long long>(fast),
+                    static_cast<unsigned long long>(r.owed_same.exchange(0)),
+                    static_cast<unsigned long long>(r.owed_merged.exchange(0)),
+                    static_cast<unsigned long long>(r.owed_conflict.exchange(0)),
+                    static_cast<unsigned long long>(r.owed_superseded.exchange(0)));
+    }
     std::fflush(stdout);
 }
 } // namespace
@@ -246,6 +258,9 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     size = ClampToArenas(device_addr, size);
+    if (is_write && !assume_locks && TryFastWrite(device_addr, size)) {
+        return;
+    }
     const s64 queued_at = ReadbackStatsEnabled() ? NowNs() : 0;
     const auto flush_request = [this, device_addr, size, is_write, queued_at] {
         const s64 started_at = queued_at ? NowNs() : 0;
@@ -356,9 +371,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
-        auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        const VAddr dst_addr = arena_base + copy.srcOffset;
+        const u8* src = download.mapped + (copy.dstOffset - download.offset);
+        if (!FastWriteThreshold()) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(dst_addr), src, copy.size);
+            continue;
+        }
+        // gow3: a fast write may have made a page writable since its bytes were collected
+        // (it unmarks the page under its region lock): the guest's bytes win there.
+        for (VAddr at = dst_addr; at < dst_addr + copy.size;) {
+            const VAddr page = Common::AlignDown(at, TRACKER_BYTES_PER_PAGE);
+            const VAddr end = std::min<VAddr>(dst_addr + copy.size, page + TRACKER_BYTES_PER_PAGE);
+            memory_tracker->WithPageLocked(page, [&](RegionManager& manager, u64 offset,
+                                                     size_t page_size) {
+                if (manager.IsRegionModified<Type::GPU>(offset, page_size)) {
+                    NoteGpuBytes(at, src + (at - dst_addr), end - at);
+                    memory->TryWriteBacking(std::bit_cast<u8*>(at), src + (at - dst_addr),
+                                            end - at);
+                }
+                return true;
+            });
+            at = end;
+        }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
 }
@@ -999,6 +1033,8 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
     // (Unmapped memory has no backing to write, as for DownloadMemory.)
     const bool applied = memory_tracker->ApplyGpuCopyIf(
         page_addr, EagerPageSize, [] { return true; }, [&](VAddr start, VAddr end) {
+            NoteGpuBytes(start, eager_buffer->mapped_data.data() + offset + (start - page_addr),
+                         end - start);
             memory->TryWriteBacking(reinterpret_cast<void*>(start),
                                     eager_buffer->mapped_data.data() + offset + (start - page_addr),
                                     end - start);
@@ -1102,6 +1138,7 @@ bool BufferCache::FinishDeferredReadback(DeferredReadback& readback, bool wait) 
                 const VAddr lo = std::max<VAddr>(copy_start, start);
                 const VAddr hi = std::min<VAddr>(copy_start + copy.size, end);
                 if (lo < hi) {
+                    NoteGpuBytes(lo, mapped + copy.dstOffset + (lo - copy_start), hi - lo);
                     memory->TryWriteBacking(reinterpret_cast<void*>(lo),
                                             mapped + copy.dstOffset + (lo - copy_start), hi - lo);
                 }
@@ -1112,6 +1149,248 @@ bool BufferCache::FinishDeferredReadback(DeferredReadback& readback, bool wait) 
     }
     readback.applied.store(true, std::memory_order_release);
     return true;
+}
+
+namespace {
+constexpr u64 OwedSlots = 4096; // 16 MiB of copies at most in flight
+} // namespace
+
+u32 BufferCache::FastWriteThreshold() {
+    static const u32 threshold = [] {
+        const char* e = std::getenv("GOW3_FAST_WRITE");
+        const u32 n = e && *e ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 0;
+        return EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise
+                   ? std::min<u32>(n, 255)
+                   : 0;
+    }();
+    return threshold;
+}
+
+void BufferCache::NoteGpuBytes(VAddr addr, const u8* data, u64 size) {
+    if (!FastWriteThreshold() || size == 0) {
+        return;
+    }
+    thread_local std::vector<u8> old;
+    old.resize(size);
+    memory->CopySparseMemory(addr, old.data(), size);
+    if (owed_count.load(std::memory_order_acquire)) {
+        // Newer GPU data than a fast write's copy: that copy must not be merged over it.
+        std::scoped_lock lock{owed_mutex};
+        for (VAddr page = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE); page < addr + size;
+             page += TRACKER_BYTES_PER_PAGE) {
+            if (const auto it = owed_pages.find(page); it != owed_pages.end()) {
+                it->second->superseded = true;
+            }
+        }
+    }
+    std::scoped_lock lock{streak_mutex};
+    if (unchanged_streak.size() > (1u << 20)) {
+        unchanged_streak.clear();
+    }
+    for (VAddr at = addr; at < addr + size;) {
+        const VAddr page = Common::AlignDown(at, TRACKER_BYTES_PER_PAGE);
+        const VAddr end = std::min<VAddr>(addr + size, page + TRACKER_BYTES_PER_PAGE);
+        const bool same = std::memcmp(old.data() + (at - addr), data + (at - addr), end - at) == 0;
+        u8& streak = unchanged_streak[page];
+        if (!same) {
+            streak = 0;
+        } else if (at == page && end == page + TRACKER_BYTES_PER_PAGE && streak < 255) {
+            ++streak; // only a whole page vouches for the whole page
+        }
+        at = end;
+    }
+}
+
+bool BufferCache::TryFastWrite(VAddr addr, u64 size) {
+    const u32 threshold = FastWriteThreshold();
+    if (!threshold) {
+        return false;
+    }
+    const VAddr page = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    if (addr + size > page + TRACKER_BYTES_PER_PAGE ||
+        owed_count.load(std::memory_order_acquire) >= OwedSlots) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{streak_mutex};
+        const auto it = unchanged_streak.find(page);
+        if (it == unchanged_streak.end() || it->second < threshold) {
+            return false;
+        }
+    }
+    if (merged_count.load(std::memory_order_acquire)) {
+        // Merged CPU bytes are in guest memory but not yet on the GPU: the copy would differ
+        // from the snapshot there and put the old bytes back.
+        std::scoped_lock merge_lock{merge_mutex};
+        const auto m = merged_writes.upper_bound(page + TRACKER_BYTES_PER_PAGE - 1);
+        if (m != merged_writes.begin() && std::prev(m)->second > page) {
+            return false;
+        }
+    }
+    auto owed = std::make_shared<OwedPage>();
+    owed->page = page;
+    const bool taken = memory_tracker->WithPageLocked(
+        page, [&](RegionManager& manager, u64 offset, size_t page_size) {
+            if (!manager.IsRegionModified<Type::GPU>(offset, page_size)) {
+                return false; // read back meanwhile: the usual path just marks it
+            }
+            {
+                std::scoped_lock lock{owed_mutex};
+                if (owed_pages.size() >= OwedSlots || !owed_pages.try_emplace(page, owed).second) {
+                    return false; // a fast write of it not verified yet: take the slow path
+                }
+                owed_count.store(static_cast<u32>(owed_pages.size()), std::memory_order_release);
+            }
+            // The guest cannot write it: it is protected until the state changes below.
+            memory->CopySparseMemory(page, owed->snapshot.data(), TRACKER_BYTES_PER_PAGE);
+            const VAddr base = manager.GetCpuAddr() + offset;
+            manager.ChangeRegionState<Type::GPU, false>(base, page_size);
+            manager.ChangeRegionState<Type::CPU, true>(base, page_size);
+            return true;
+        });
+    if (!taken) {
+        return false;
+    }
+    // Its copy is recorded at the next submission (SettleOwedPages), or before guest bytes
+    // are uploaded over it (SynchronizeMemory), whichever comes first. Not a GPU thread
+    // command: each of those drains the draw pipe.
+    if (ReadbackStatsEnabled()) {
+        Readbacks().fast.fetch_add(1);
+        ReportReadbacks();
+    }
+    return true;
+}
+
+void BufferCache::RecordOwedLocked(OwedPage& owed) {
+    if (owed.recorded) {
+        return;
+    }
+    if (!owed_buffer) {
+        owed_buffer = std::make_unique<Buffer>(instance, 0, OwedSlots * TRACKER_BYTES_PER_PAGE,
+                                               MemoryType::HostCached, "gow3 fast write copies");
+        for (u64 slot = OwedSlots; slot-- > 0;) {
+            owed_free_slots.push_back(slot);
+        }
+    }
+    owed.slot = owed_free_slots.back();
+    owed_free_slots.pop_back();
+    const Buffer* arena = GetArena(owed.page >> block_shift,
+                                   (owed.page + TRACKER_BYTES_PER_PAGE - 1) >> block_shift);
+    const vk::BufferCopy copy{
+        .srcOffset = owed.page - arena->cpu_addr,
+        .dstOffset = owed.slot * TRACKER_BYTES_PER_PAGE,
+        .size = TRACKER_BYTES_PER_PAGE,
+    };
+    runtime.CopyBuffer(arena, owed_buffer.get(), std::span{&copy, 1});
+    owed.tick = scheduler.CurrentTick();
+    owed.recorded = true;
+}
+
+void BufferCache::RecordOwedInRange(VAddr addr, u64 size) {
+    std::scoped_lock lock{owed_mutex};
+    if (owed_pages.empty()) {
+        return;
+    }
+    const VAddr first = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+    if ((addr + size - first) / TRACKER_BYTES_PER_PAGE > owed_pages.size()) {
+        for (auto& [page, owed] : owed_pages) {
+            if (page < addr + size && addr < page + TRACKER_BYTES_PER_PAGE) {
+                RecordOwedLocked(*owed);
+            }
+        }
+        return;
+    }
+    for (VAddr page = first; page < addr + size; page += TRACKER_BYTES_PER_PAGE) {
+        if (const auto it = owed_pages.find(page); it != owed_pages.end()) {
+            RecordOwedLocked(*it->second);
+        }
+    }
+}
+
+void BufferCache::SettleOwedPages() {
+    if (!owed_count.load(std::memory_order_acquire)) {
+        return;
+    }
+    boost::container::small_vector<std::shared_ptr<OwedPage>, 64> done;
+    {
+        std::scoped_lock lock{owed_mutex};
+        for (const auto& [page, owed] : owed_pages) {
+            if (!owed->recorded) {
+                RecordOwedLocked(*owed);
+            } else if (scheduler.IsFree(owed->tick)) {
+                done.push_back(owed);
+            }
+        }
+    }
+    if (done.empty()) {
+        return;
+    }
+    const bool stats = ReadbackStatsEnabled();
+    std::array<u8, TRACKER_BYTES_PER_PAGE> current;
+    for (const auto& owed : done) {
+        const u64 offset = owed->slot * TRACKER_BYTES_PER_PAGE;
+        owed_buffer->Invalidate(offset, TRACKER_BYTES_PER_PAGE);
+        const u8* gpu = owed_buffer->mapped_data.data() + offset;
+        const bool same =
+            std::memcmp(gpu, owed->snapshot.data(), TRACKER_BYTES_PER_PAGE) == 0;
+        bool superseded;
+        {
+            std::scoped_lock lock{owed_mutex};
+            superseded = owed->superseded;
+        }
+        if (same || superseded) {
+            if (stats) {
+                (same ? Readbacks().owed_same : Readbacks().owed_superseded).fetch_add(1);
+            }
+            if (!same) {
+                std::scoped_lock lock{streak_mutex};
+                unchanged_streak[owed->page] = 0;
+            }
+            continue;
+        }
+        // The GPU did change it: its bytes go where the guest has not written since.
+        {
+            std::scoped_lock lock{streak_mutex};
+            unchanged_streak[owed->page] = 0;
+        }
+        bool conflict = false;
+        memory_tracker->WithPageLocked(owed->page, [&](RegionManager& manager, u64 page_offset,
+                                                       size_t page_size) {
+            const VAddr base = manager.GetCpuAddr() + page_offset;
+            const bool gpu_modified = manager.IsRegionModified<Type::GPU>(page_offset, page_size);
+            if (manager.IsRegionModified<Type::CPU>(page_offset, page_size)) {
+                // Write protected while merging: a guest write now waits for the region lock.
+                manager.ChangeRegionState<Type::CPU, false>(base, page_size);
+            }
+            memory->CopySparseMemory(owed->page, current.data(), TRACKER_BYTES_PER_PAGE);
+            for (u64 i = 0; i < TRACKER_BYTES_PER_PAGE; ++i) {
+                if (current[i] == owed->snapshot[i]) {
+                    current[i] = gpu[i];
+                }
+            }
+            memory->TryWriteBacking(std::bit_cast<u8*>(owed->page), current.data(),
+                                    TRACKER_BYTES_PER_PAGE);
+            if (gpu_modified) {
+                conflict = true; // the GPU's newer bytes are read back over it later
+            } else {
+                // Uploaded on its next use: the GPU copy may lack the guest's bytes.
+                manager.ChangeRegionState<Type::CPU, true>(base, page_size);
+            }
+            return true;
+        });
+        if (stats) {
+            Readbacks().owed_merged.fetch_add(1);
+            if (conflict) {
+                Readbacks().owed_conflict.fetch_add(1);
+            }
+        }
+    }
+    std::scoped_lock lock{owed_mutex};
+    for (const auto& owed : done) {
+        owed_free_slots.push_back(owed->slot);
+        owed_pages.erase(owed->page);
+    }
+    owed_count.store(static_cast<u32>(owed_pages.size()), std::memory_order_release);
 }
 
 void BufferCache::RecoverDeferredReadback(DeferredReadback& readback) {
@@ -1305,6 +1584,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 addr, u64 size) {
+            if (owed_count.load(std::memory_order_acquire)) {
+                RecordOwedInRange(addr, size); // its GPU bytes are copied before these
+            }
             copies.emplace_back(total_size_bytes, addr, size);
             total_size_bytes += size;
         },

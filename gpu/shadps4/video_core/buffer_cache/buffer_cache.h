@@ -5,12 +5,14 @@
 
 #include "gow3_copy.h"
 
+#include <array>
 #include <atomic>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <optional>
 #include <utility>
@@ -21,6 +23,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -221,6 +224,45 @@ private:
     std::atomic<u32> eager_count{0};
     std::vector<VAddr> eager_subtracts; ///< pages served on guest threads: leave gpu_modified_ranges
     std::unique_ptr<Buffer> eager_buffer;
+
+    /// gow3: GOW3_FAST_WRITE=N (precise readbacks). A guest write fault on a page marked GPU
+    /// modified whose last N read backs all came back byte for byte what guest memory held
+    /// (a shader binds a whole buffer for writes and writes a few pages of it) does not wait
+    /// for the GPU: the page's bytes are kept (snapshot), it is unmarked and made writable at
+    /// once, and a copy of it is recorded. When that copy is done the GPU bytes are compared
+    /// with the snapshot: the same (the usual case), nothing more to do; different, the GPU
+    /// bytes are merged into guest memory where the guest did not write since, and the page
+    /// goes back to the slow path until it is unchanged N times again.
+    struct OwedPage {
+        VAddr page{};
+        u64 slot{};      ///< in owed_buffer
+        u64 tick{};      ///< submission holding the copy
+        bool recorded{}; ///< owed_mutex
+        bool superseded{}; ///< newer GPU data was read back over it since (owed_mutex)
+        std::array<u8, TRACKER_BYTES_PER_PAGE> snapshot;
+    };
+    static u32 FastWriteThreshold();
+    /// Guest threads, from a write fault. True when the write may go on.
+    bool TryFastWrite(VAddr addr, u64 size);
+    /// The copy of a page, before guest bytes are uploaded over it. GPU-side threads.
+    void RecordOwedLocked(OwedPage& owed);
+    void RecordOwedInRange(VAddr addr, u64 size);
+    /// GPU bytes about to be written to guest memory by a read back: learns which pages come
+    /// back unchanged. Any thread, region locks of the range held.
+    void NoteGpuBytes(VAddr addr, const u8* data, u64 size);
+    std::mutex owed_mutex; ///< after region locks
+    std::unordered_map<VAddr, std::shared_ptr<OwedPage>> owed_pages;
+    std::vector<u64> owed_free_slots;
+    std::atomic<u32> owed_count{0};
+    std::unique_ptr<Buffer> owed_buffer;
+    std::mutex streak_mutex; ///< after region locks and owed_mutex
+    std::unordered_map<VAddr, u8> unchanged_streak;
+
+public:
+    /// Verifies the fast writes whose copies are done. GPU command thread, at submissions.
+    void SettleOwedPages(); ///< also records the copies not recorded yet
+
+private:
 
     /// gow3: GOW3_DEFERRED_READBACK=1 (precise readbacks): the reads the eager copies don't cover.
     /// The GPU command thread only records a copy of the GPU modified memory around the fault
