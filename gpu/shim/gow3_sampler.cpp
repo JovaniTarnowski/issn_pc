@@ -37,7 +37,10 @@ struct Target {
     DWORD id{};
     std::uint64_t samples = 0;
     std::unordered_map<Key, std::uint64_t, KeyHash> self, total;
+    /// Whole stacks (up to StackDepth frames from the top), to see who calls what.
+    std::unordered_map<std::string, std::uint64_t> stacks;
 };
+constexpr int StackDepth = 14;
 
 std::mutex targets_mutex;
 std::vector<Target*> targets;
@@ -124,9 +127,26 @@ void Print(Target& t) {
     for (const auto& e : top(t.total)) {
         line("total", e);
     }
+    std::vector<std::pair<std::string, std::uint64_t>> stacks(t.stacks.begin(), t.stacks.end());
+    std::sort(stacks.begin(), stacks.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (std::size_t i = 0; i < stacks.size() && i < 15; ++i) {
+        // base:rva pairs; the bases are printed once below with their module names.
+        std::printf("  stack %5.1f%% %s\n", 100.0 * stacks[i].second / t.samples,
+                    stacks[i].first.c_str());
+    }
+    std::unordered_set<std::uint64_t> bases;
+    for (const auto& [key, count] : t.total) {
+        bases.insert(key.base);
+    }
+    for (const std::uint64_t base : bases) {
+        std::printf("  module %llx %s\n", static_cast<unsigned long long>(base),
+                    base ? ModuleName(base).c_str() : "(no image)");
+    }
     t.samples = 0;
     t.self.clear();
     t.total.clear();
+    t.stacks.clear();
 }
 
 void Run() {
@@ -162,6 +182,17 @@ void Run() {
             }
             ++t->samples;
             ++t->self[frames[0]];
+            {
+                std::string stack;
+                for (int i = 0; i < count && i < StackDepth; ++i) {
+                    char part[64];
+                    std::snprintf(part, sizeof(part), "%s%llx:%llx", i ? " < " : "",
+                                  static_cast<unsigned long long>(frames[i].base),
+                                  static_cast<unsigned long long>(frames[i].begin));
+                    stack += part;
+                }
+                ++t->stacks[stack];
+            }
             seen.clear();
             for (int i = 0; i < count; ++i) {
                 if (seen.insert(frames[i].base * 31 + frames[i].begin).second) {
