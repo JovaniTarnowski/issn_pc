@@ -3,6 +3,8 @@
 
 #ifdef __linux__
 #include <ucontext.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 #include <vector>
 #include <chrono>
@@ -77,7 +79,7 @@ struct PageManager::Impl {
     // tracked pages cost the most time (which game code waits on the GPU, and for what).
     struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; u64 caller = 0; bool write = false; };
     static void ProfileFault(void* context, VAddr addr, bool write, u64 ns) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
         static const bool enabled = [] { const char* e = std::getenv("GOW3_FAULT_PROFILE"); return e && *e == '1'; }();
         if (!enabled) {
             return;
@@ -85,10 +87,17 @@ struct PageManager::Impl {
         static std::mutex mutex;
         static std::unordered_map<u64, FaultSite> sites;
         static auto window = std::chrono::steady_clock::now();
+#ifdef _WIN32
+        // issn: the same profile on Windows (EXCEPTION_POINTERS from the vectored handler).
+        const auto* ctx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+        const u64 rip = static_cast<u64>(ctx->Rip);
+        const u64 caller = *reinterpret_cast<const u64*>(ctx->Rsp);
+#else
         const auto* uc = static_cast<ucontext_t*>(context);
         const u64 rip = static_cast<u64>(uc->uc_mcontext.gregs[REG_RIP]);
         // The return address at the top of the stack (right for leaf routines such as memcpy).
         const u64 caller = *reinterpret_cast<const u64*>(uc->uc_mcontext.gregs[REG_RSP]);
+#endif
         std::scoped_lock lock{mutex};
         auto& site = sites[rip];
         ++site.count;
