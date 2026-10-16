@@ -152,7 +152,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         }
         auto state = std::make_shared<Build>();
         const auto caches = builder->caches;
-        const bool deferred_bind = scheduler.RecordsOnThread();
+        // issn: GOW3_COMPUTE_FAST_FIRST=1 always builds an unoptimized pipeline here first (the
+        // optimized one replaces it later), even with the recording thread: on AMD's driver an
+        // optimized compute pipeline takes ~90 ms, and the dispatch waits for it.
+        static const bool fast_first = [] {
+            const char* env = std::getenv("GOW3_COMPUTE_FAST_FIRST");
+            return env && env[0] == '1';
+        }();
+        const bool deferred_bind = scheduler.RecordsOnThread() && !fast_first;
         // With the Vulkan recording thread, the dispatch binds the pipeline there (Handle()
         // waits for it), so the GPU thread goes on and the next new pipelines are built
         // alongside: a burst costs about one build instead of their sum. NVIDIA builds one
