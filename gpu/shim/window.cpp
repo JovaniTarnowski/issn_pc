@@ -200,6 +200,12 @@ bool WindowSDL::PollEvents() {
         }
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            // issn: say why the game closes (the log otherwise just ends with the counters).
+            std::printf("Window: %s: closing the game\n",
+                        event.type == SDL_EVENT_QUIT
+                            ? "quit requested (Alt+F4, the console window closed or the system)"
+                            : "window close button");
+            std::fflush(stdout);
             is_open = false;
             break;
         default:
