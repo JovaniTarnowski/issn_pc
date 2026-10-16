@@ -4,6 +4,7 @@
 static int32_t guest_errno;
 int32_t *runtime_errno(void) { return &guest_errno; }
 int32_t runtime_guest_errno(int e) { return e; }
+int gow3gpu_cpu_write(void *dst, const void *src, int fill, uint64_t size) { (void)dst; (void)src; (void)fill; (void)size; return 0; }
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
     for (size_t i=0;i<n;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;

@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/gow3gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -329,7 +330,9 @@ static int64_t bounce_read(int h,void *buffer,uint64_t size,int64_t offset) {
         const uint64_t chunk=size-done<BOUNCE_SIZE ? size-done : BOUNCE_SIZE;
         const ssize_t n=offset<0 ? host_read(h,bounce,chunk) : pread(h,bounce,chunk,offset+(int64_t)done);
         if (n<0) return done ? (int64_t)done : -errno;
-        memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
+        /* issn: into GPU-modified memory without a fault (GOW3_WRITE_MERGE). */
+        if (n<64 || !gow3gpu_cpu_write((unsigned char *)buffer+done,bounce,-1,(uint64_t)n))
+            memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
         done+=(uint64_t)n;
         if ((uint64_t)n<chunk) break; /* end of file */
     }

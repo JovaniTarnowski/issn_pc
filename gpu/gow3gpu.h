@@ -26,6 +26,9 @@ int gow3gpu_handle_fault(void *ucontext, void *address);
 void gow3gpu_dump_guest_writes(void *ucontext);
 /* issn: the GPU emulation's state for the watchdog: queue waits, last fences, counters. */
 void gow3gpu_dump_gpu_state(void);
+/* issn: a guest memcpy/memset into GPU-modified memory written without a fault or GPU wait
+ * (GOW3_WRITE_MERGE=1 with precise readbacks, from HayatoG's iss_pc); 0: write normally. */
+int gow3gpu_cpu_write(void *dst, const void *src, int fill, uint64_t size);
 /* issn: frames the guest has finished (sceGnmSubmitDone calls), for the hang watchdog. */
 uint64_t gow3gpu_frame_count(void);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when

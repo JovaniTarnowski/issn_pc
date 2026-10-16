@@ -395,3 +395,12 @@ extern "C" int gow3gpu_text_input_poll(char* out, uint64_t size) {
     }
     return state;
 }
+
+// issn: GOW3_WRITE_MERGE (BufferCache::CpuWriteMerge), called by the runtime's memcpy/memset.
+extern "C" int gow3gpu_cpu_write(void* dst, const void* src, int fill, uint64_t size) {
+    auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
+    return rasterizer && rasterizer->GetBufferCache().CpuWriteMerge(reinterpret_cast<VAddr>(dst),
+                                                                     src, fill, size)
+               ? 1
+               : 0;
+}

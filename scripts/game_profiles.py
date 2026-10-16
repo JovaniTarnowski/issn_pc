@@ -20,6 +20,8 @@ PROFILES = {
         # Buffer-store barriers in uniform loops of workgroups wider than a GCN wave (AYOUB1080p).
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
         'GOW3_DEFERRED_READBACK': '1',
+        # The game's memcpy/memset into GPU-modified memory without a fault or GPU wait (iss_pc).
+        'GOW3_WRITE_MERGE': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'GOW3_LOD_SCALE': '0.6',
