@@ -22,7 +22,8 @@ class GameProfileTests(unittest.TestCase):
                 found, env = game_profiles.environment(game(tmp, title), {})
                 self.assertEqual(found, title)
                 self.assertEqual(env['GOW3_WAVE_MEMORY_BARRIERS'], '1')
-                self.assertIn('GOW3_WATCHDOG_PEEK', env)
+                # The fence addresses are the EU 01.00 eboot's.
+                self.assertEqual('GOW3_WATCHDOG_PEEK' in env, title == 'CUSA00004')
 
     def test_other_games_get_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
