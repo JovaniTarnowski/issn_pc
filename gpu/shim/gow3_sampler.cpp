@@ -36,6 +36,8 @@ struct Target {
     HANDLE handle{};
     DWORD id{};
     std::uint64_t samples = 0;
+    std::uint64_t busy = 0; ///< not inside ntdll/win32u (waits, sleeps)
+    bool guest = false;
     std::unordered_map<Key, std::uint64_t, KeyHash> self, total;
     /// Whole stacks (up to StackDepth frames from the top), to see who calls what.
     std::unordered_map<std::string, std::uint64_t> stacks;
@@ -79,7 +81,7 @@ int Walk(CONTEXT context, Key* frames) {
         if (!function) {
             // A leaf function without unwind data (or code outside any image: guest code,
             // JIT): the return address is at the stack pointer.
-            frames[count] = {0, context.Rip};
+            frames[count] = {0, context.Rip & ~0x3full}; // guest code: 64-byte buckets
             if (!image_base && count > 0) {
                 ++count;
                 break; // not in an image: stop rather than guess
@@ -110,9 +112,17 @@ void Print(Target& t) {
         }
         return v;
     };
-    std::printf("Sampler thread %s: %llu samples in %u s\n", t.name.c_str(),
-                static_cast<unsigned long long>(t.samples), unsigned(ReportMs / 1000));
-    if (t.samples == 0) {
+    std::printf("Sampler thread %s: %llu samples in %u s, busy %.1f%%\n", t.name.c_str(),
+                static_cast<unsigned long long>(t.samples), unsigned(ReportMs / 1000),
+                t.samples ? 100.0 * t.busy / t.samples : 0.0);
+    const bool quiet = t.guest && t.busy * 100 < t.samples * 3;
+    const std::size_t self_lines = t.guest ? 15 : 30;
+    const std::size_t stack_lines = t.guest ? 8 : 15;
+    if (t.samples == 0 || quiet) {
+        t.samples = t.busy = 0;
+        t.self.clear();
+        t.total.clear();
+        t.stacks.clear();
         return;
     }
     const auto line = [&](const char* kind, const std::pair<Key, std::uint64_t>& entry) {
@@ -121,16 +131,21 @@ void Print(Target& t) {
                     k.base ? ModuleName(k.base).c_str() : "(no image)",
                     static_cast<unsigned long long>(k.begin));
     };
+    std::size_t printed = 0;
     for (const auto& e : top(t.self)) {
-        line("self ", e);
+        if (printed++ < self_lines) {
+            line("self ", e);
+        }
     }
-    for (const auto& e : top(t.total)) {
-        line("total", e);
+    if (!t.guest) {
+        for (const auto& e : top(t.total)) {
+            line("total", e);
+        }
     }
     std::vector<std::pair<std::string, std::uint64_t>> stacks(t.stacks.begin(), t.stacks.end());
     std::sort(stacks.begin(), stacks.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-    for (std::size_t i = 0; i < stacks.size() && i < 15; ++i) {
+    for (std::size_t i = 0; i < stacks.size() && i < stack_lines; ++i) {
         // base:rva pairs; the bases are printed once below with their module names.
         std::printf("  stack %5.1f%% %s\n", 100.0 * stacks[i].second / t.samples,
                     stacks[i].first.c_str());
@@ -143,7 +158,7 @@ void Print(Target& t) {
         std::printf("  module %llx %s\n", static_cast<unsigned long long>(base),
                     base ? ModuleName(base).c_str() : "(no image)");
     }
-    t.samples = 0;
+    t.samples = t.busy = 0;
     t.self.clear();
     t.total.clear();
     t.stacks.clear();
@@ -157,12 +172,13 @@ void Run() {
     Key frames[MaxFrames];
     std::unordered_set<std::uint64_t> seen;
     for (;;) {
-        Sleep(1);
         std::vector<Target*> list;
         {
             std::scoped_lock lock{targets_mutex};
             list = targets;
         }
+        // Each sample suspends the thread: with the guest's threads too, fewer rounds.
+        Sleep(list.size() > 8 ? static_cast<DWORD>(list.size() / 4) : 1);
         for (Target* t : list) {
             if (SuspendThread(t->handle) == static_cast<DWORD>(-1)) {
                 continue;
@@ -181,6 +197,10 @@ void Run() {
                 continue;
             }
             ++t->samples;
+            if (!frames[0].base || (ModuleName(frames[0].base) != "ntdll.dll" &&
+                                    ModuleName(frames[0].base) != "win32u.dll")) {
+                ++t->busy;
+            }
             ++t->self[frames[0]];
             {
                 std::string stack;
@@ -211,7 +231,13 @@ void Run() {
 }
 } // namespace
 
+static void Register(const char* name, bool guest);
+
 void RegisterThisThread(const char* name) {
+    Register(name, false);
+}
+
+static void Register(const char* name, bool guest) {
     if (!Enabled()) {
         return;
     }
@@ -226,11 +252,16 @@ void RegisterThisThread(const char* name) {
         target->name = name;
         target->handle = handle;
         target->id = GetCurrentThreadId();
+        target->guest = guest;
         targets.push_back(target);
     }
     std::call_once(start_once, [] { std::thread(Run).detach(); });
 }
 } // namespace Gow3Sampler
+
+extern "C" void gow3_sampler_register_thread(const char* name) {
+    Gow3Sampler::Register(name, true);
+}
 
 #else
 

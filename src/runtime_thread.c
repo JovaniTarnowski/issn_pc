@@ -140,7 +140,14 @@ void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
 }
+#ifdef _WIN32
+/* gow3: GOW3_SAMPLE=1 also samples the guest's threads (gpu/shim/gow3_sampler.cpp). */
+void gow3_sampler_register_thread(const char *name);
+#endif
 void runtime_thread_attach_main(void) {
+#ifdef _WIN32
+    gow3_sampler_register_thread("guest main");
+#endif
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
 }
@@ -265,6 +272,9 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+#ifdef _WIN32
+    gow3_sampler_register_thread(t->name);
+#endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
