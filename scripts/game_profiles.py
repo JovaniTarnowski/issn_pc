@@ -21,10 +21,9 @@ PROFILES = {
         'GOW3_WAVE_MEMORY_BARRIERS': '1',
         'GOW3_DEFERRED_READBACK': '1',
         'GOW3_EAGER_READBACK': '1',
-        # A full memory barrier around each render pass and dispatch: without it 64x64 tiles of
-        # the image go black or stale (the game reads compute output the port's barriers miss).
-        # Tested on the tester's RX 9060 XT; the exact missing barrier is still to find.
-        'GOW3_FULL_BARRIERS': '1',
+        # GOW3_FULL_BARRIERS=1 is no longer needed: the black 64x64 tiles stay away without it
+        # since the vertex/index/indirect buffer barriers (BP10, HayatoG's core); off, the FPS
+        # roughly doubles in the city (tester, RX 9060 XT).
         # The game reads rdtsc itself and scales it by sceKernelGetTscFrequency: the host's TSC
         # and frequency, or it runs several times too fast (runtime_kernel.c).
         'GOW3_TSC': 'host',
