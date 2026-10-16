@@ -226,13 +226,13 @@ private:
     std::unique_ptr<Buffer> eager_buffer;
 
     /// gow3: GOW3_FAST_WRITE=N (precise readbacks). A guest write fault on a page marked GPU
-    /// modified whose last N read backs all came back byte for byte what guest memory held
-    /// (a shader binds a whole buffer for writes and writes a few pages of it) does not wait
-    /// for the GPU: the page's bytes are kept (snapshot), it is unmarked and made writable at
-    /// once, and a copy of it is recorded. When that copy is done the GPU bytes are compared
-    /// with the snapshot: the same (the usual case), nothing more to do; different, the GPU
-    /// bytes are merged into guest memory where the guest did not write since, and the page
-    /// goes back to the slow path until it is unchanged N times again.
+    /// modified does not wait for the GPU when the page and its 64 KiB block score at least
+    /// N-1: the page's bytes are kept (snapshot), it is unmarked and made writable at once, and
+    /// a copy of it is recorded. When that copy is done the GPU bytes are compared with the
+    /// snapshot: the same (a shader bound the whole buffer for writes and wrote elsewhere), or
+    /// every changed byte overwritten by the guest since (it refills a buffer the GPU used),
+    /// the score rises; otherwise the GPU bytes are merged where the guest did not write, the
+    /// guest may have read stale bytes meanwhile, and the score drops below zero.
     struct OwedPage {
         VAddr page{};
         u64 slot{};      ///< in owed_buffer
@@ -255,8 +255,10 @@ private:
     std::vector<u64> owed_free_slots;
     std::atomic<u32> owed_count{0};
     std::unique_ptr<Buffer> owed_buffer;
+    /// Evidence for (+) or against (-) fast writes, by page and by 64 KiB block.
+    void ScoreFastWrite(VAddr page, s32 page_delta, s32 block_delta);
     std::mutex streak_mutex; ///< after region locks and owed_mutex
-    std::unordered_map<VAddr, u8> unchanged_streak;
+    std::unordered_map<VAddr, s8> fast_write_score;
 
 public:
     /// Verifies the fast writes whose copies are done. GPU command thread, at submissions.
