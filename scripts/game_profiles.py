@@ -22,6 +22,10 @@ PROFILES = {
         'GOW3_DEFERRED_READBACK': '1',
         # The game's memcpy/memset into GPU-modified memory without a fault or GPU wait (iss_pc).
         'GOW3_WRITE_MERGE': '1',
+        # Eager read-ahead: the GPU results the game reads back are copied at each fence. Halved
+        # the guest's readback waits in a four-enemy fight; flicker only on the boot loading
+        # screen on the tester's RX 9060 XT (HayatoG turned it off for smoke flicker).
+        'GOW3_EAGER_READBACK': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'GOW3_LOD_SCALE': '0.6',
