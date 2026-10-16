@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef __linux__
+#include <ucontext.h>
+#endif
+#include <vector>
+#include <chrono>
+#include <algorithm>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include "gow3_toggles.h"
 #include "common/assert.h"
@@ -66,8 +73,59 @@ struct PageManager::Impl {
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
+    // gow3: GOW3_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
+    // tracked pages cost the most time (which game code waits on the GPU, and for what).
+    struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; bool write = false; };
+    static void ProfileFault(void* context, VAddr addr, bool write, u64 ns) {
+#ifdef __linux__
+        static const bool enabled = [] { const char* e = std::getenv("GOW3_FAULT_PROFILE"); return e && *e == '1'; }();
+        if (!enabled) {
+            return;
+        }
+        static std::mutex mutex;
+        static std::unordered_map<u64, FaultSite> sites;
+        static auto window = std::chrono::steady_clock::now();
+        const u64 rip = static_cast<u64>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+        std::scoped_lock lock{mutex};
+        auto& site = sites[rip];
+        ++site.count;
+        site.ns += ns;
+        site.last = addr;
+        site.write = write;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window < std::chrono::seconds(5)) {
+            return;
+        }
+        window = now;
+        std::vector<std::pair<u64, FaultSite>> top(sites.begin(), sites.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        std::printf("Fault profile (5 s):");
+        for (size_t i = 0; i < top.size() && i < 8; ++i) {
+            const u64 at = top[i].first;
+            std::printf(" [%s %#llx x%llu %.1f ms @%#llx]", top[i].second.write ? "W" : "R",
+                        static_cast<unsigned long long>(at >= 0x800000000ull && at < 0x810000000ull ? at - 0x800000000ull : at),
+                        static_cast<unsigned long long>(top[i].second.count), top[i].second.ns / 1e6,
+                        static_cast<unsigned long long>(top[i].second.last));
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+        sites.clear();
+#else
+        (void)context; (void)addr; (void)write; (void)ns;
+#endif
+    }
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        const auto start = std::chrono::steady_clock::now();
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        const bool handled = HandleGuestFault(context, addr);
+        ProfileFault(context, addr, Common::IsWriteError(context),
+                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start).count()));
+        return handled;
+    }
+
+    static bool HandleGuestFault(void* context, VAddr addr) {
         // gow3: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {

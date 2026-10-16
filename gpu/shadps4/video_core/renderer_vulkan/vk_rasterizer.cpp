@@ -3260,7 +3260,13 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     }
     const bool image_readback =
         texture_cache.ResolveReadbacks(addr, size, assume_locks, VideoCore::ReadbackSource::CpuRead);
-    if (!image_readback || buffer_cache.IsRegionGpuModified(addr, size)) {
+    // gow3: without GPU-modified buffer data there is nothing to download: the guest thread no
+    // longer waits for the GPU command thread to reach its request (~3 ms per fault in inFAMOUS,
+    // hundreds per second). GOW3_FAST_READ_FAULT=0 restores the round trip.
+    static const bool fast = [] { const char* e = std::getenv("GOW3_FAST_READ_FAULT"); return !(e && *e == '0'); }();
+    if (fast && !assume_locks && !buffer_cache.IsRegionGpuModified(addr, size)) {
+        buffer_cache.ReleaseReadProtection(addr, size);
+    } else if (!image_readback || buffer_cache.IsRegionGpuModified(addr, size)) {
         buffer_cache.ReadMemory(addr, size, false, assume_locks);
     }
     return true;
