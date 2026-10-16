@@ -28,6 +28,9 @@ PROFILES = {
     for title in INFAMOUS_SECOND_SON
 }
 PROFILES['CUSA00004']['GOW3_WATCHDOG_PEEK'] = '0x11c0380,0x4ec7310'
+# The US release has the Brazilian Portuguese dub and text (lang_brazilian_*): the tester's
+# choice. GOW3_LANGUAGE=1 gives English.
+PROFILES['CUSA00223']['GOW3_LANGUAGE'] = '17'
 
 
 def title_id(game):

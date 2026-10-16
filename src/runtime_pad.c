@@ -217,7 +217,28 @@ static void sample_motion(PadData *d, SDL_Gamepad *g) {
 }
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
-static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+/* issn: GOW3_STICK_DEADZONE (0..0.5, default 0.10): stick values inside it read as centered and
+ * the rest is rescaled, so a stick that rests a little off center (8BitDo and worn sticks) does
+ * not turn the camera on its own. As HayatoG's iss_pc (TLG_STICK_DEADZONE). */
+static float stick_deadzone(void) {
+    static float zone=-1.0f;
+    if (zone<0.0f) {
+        const char *e=getenv("GOW3_STICK_DEADZONE");
+        zone=e && *e ? (float)atof(e) : 0.10f;
+        if (zone<0.0f) zone=0.0f;
+        if (zone>0.5f) zone=0.5f;
+    }
+    return zone;
+}
+static uint8_t axis(int16_t v) {
+    float f=(float)v/32767.0f;
+    const float zone=stick_deadzone();
+    if (f>1.0f) f=1.0f;
+    if (f<-1.0f) f=-1.0f;
+    f=fabsf(f)<=zone ? 0.0f : (f>0.0f ? f-zone : f+zone)/(1.0f-zone);
+    const int x=(int)lroundf(f*127.5f+127.5f);
+    return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x);
+}
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
