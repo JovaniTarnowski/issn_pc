@@ -293,7 +293,10 @@ int main(void) {
         if (data.touch_count==1) { assert(data.touches[0].y<=last_y); last_y=data.touches[0].y; ++swiped; }
         usleep(15000);
     }
-    assert(swiped>=5 && last_y<300 && !swipe.active);
+    assert(swiped>=5 && last_y<300 && swipe.active); /* held: the finger stays up */
+    inject(path,"touchpad_right"); /* stick back: the finger lifts after the tail */
+    for (int i=0;i<10;++i) { data=read_pad(); usleep(15000); }
+    assert(!swipe.active);
     inject(path,"");
     data=read_pad();
     assert(data.touch_count==0 && !(data.buttons & BTN_TOUCHPAD));

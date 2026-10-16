@@ -217,14 +217,14 @@ static void sample_motion(PadData *d, SDL_Gamepad *g) {
 }
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
-/* issn: GOW3_STICK_DEADZONE (0..0.5, default 0.10): stick values inside it read as centered and
+/* issn: GOW3_STICK_DEADZONE (0..0.5, default 0.05; 0.10 felt stiff on the camera): stick values inside it read as centered and
  * the rest is rescaled, so a stick that rests a little off center (8BitDo and worn sticks) does
  * not turn the camera on its own. As HayatoG's iss_pc (TLG_STICK_DEADZONE). */
 static float stick_deadzone(void) {
     static float zone=-1.0f;
     if (zone<0.0f) {
         const char *e=getenv("GOW3_STICK_DEADZONE");
-        zone=e && *e ? (float)atof(e) : 0.10f;
+        zone=e && *e ? (float)atof(e) : 0.05f;
         if (zone<0.0f) zone=0.0f;
         if (zone>0.5f) zone=0.5f;
     }
@@ -283,7 +283,7 @@ static void play_click(PadData *d) {
  * source is held. Stick first, then Select: a swipe with no click at all. R1 with it: two
  * fingers (play_two_fingers). */
 enum { SWIPE_US=250000, SWIPE_TAIL_US=50000 };
-static struct { int active, used; float dx, dy; uint64_t start; uint8_t id; } swipe;
+static struct { int active, used; float dx, dy; uint64_t start, held; uint8_t id; } swipe;
 static float swipe_stick(uint8_t v) { return ((float)v-128.0f)/127.0f; }
 /* issn: two fingers (Second Son: both thumbs on the touchpad to lift a tree). R1 with the right
  * click source held: one finger on each half of the touchpad and, 50 ms after they land, the
@@ -332,8 +332,11 @@ static void play_swipe(PadData *d) {
         swipe.used=0;
     } else {
         const float sx=swipe_stick(d->right_x), sy=swipe_stick(d->right_y);
+        /* issn: "swipe up and hold" (Second Son's mobile command cores): while the stick stays
+         * pushed the same way, the finger stays at the end of the swipe. */
+        if (swipe.active && sx*swipe.dx+sy*swipe.dy>0.5f) swipe.held=d->timestamp;
         if (!swipe.used && sx*sx+sy*sy>0.36f) {
-            swipe.used=1; swipe.active=1; swipe.start=d->timestamp; swipe.id=(uint8_t)(swipe.id+1)&0x7f;
+            swipe.used=1; swipe.active=1; swipe.start=swipe.held=d->timestamp; swipe.id=(uint8_t)(swipe.id+1)&0x7f;
             if (fabsf(sx)>fabsf(sy)) { swipe.dx=sx>0 ? 1.0f : -1.0f; swipe.dy=0.0f; }
             else { swipe.dx=0.0f; swipe.dy=sy>0 ? 1.0f : -1.0f; }
             click.side=-1; /* no click with the swipe */
@@ -344,7 +347,8 @@ static void play_swipe(PadData *d) {
     }
     if (!swipe.active) return;
     const uint64_t t=d->timestamp-swipe.start;
-    if (t>=SWIPE_US+SWIPE_TAIL_US) { swipe.active=0; return; }
+    const uint64_t end=swipe.held>swipe.start+SWIPE_US ? swipe.held : swipe.start+SWIPE_US;
+    if (t>=SWIPE_US && d->timestamp>=end+SWIPE_TAIL_US) { swipe.active=0; return; }
     const float p=t>=SWIPE_US ? 1.0f : (float)t/(float)SWIPE_US;
     const float x=960.0f+swipe.dx*(p-0.5f)*1400.0f, y=471.0f+swipe.dy*(p-0.5f)*700.0f;
     if (d->touch_count<2) {
