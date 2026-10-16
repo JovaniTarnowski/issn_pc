@@ -16,6 +16,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "gow3_toggles.h"
+#include "gow3_readback_diff.h"
 #include "gow3_settings.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
@@ -2732,6 +2733,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                         (desc.is_written ? vk::AccessFlagBits2::eShaderWrite
                                          : vk::AccessFlagBits2::eNone));
                 if (desc.is_written) {
+                    Gow3ReadbackDiff::NoteBinding(vsharp.base_address, size, stage.pgm_hash,
+                                                  vsharp.GetSize());
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }

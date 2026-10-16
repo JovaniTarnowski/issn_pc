@@ -1,4 +1,5 @@
 #include "gow3_write_log.h"
+#include "gow3_readback_diff.h"
 // gow3: glue between the C loader and the vendored shadPS4 video core.
 #include "gow3_overlay.h"
 #include "gow3_png.h"
@@ -140,6 +141,7 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     Gow3WriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, Gow3WriteLog::Backing);
+    Gow3ReadbackDiff::NoteApply(reinterpret_cast<uintptr_t>(address), data, size);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
