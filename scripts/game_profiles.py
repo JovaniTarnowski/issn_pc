@@ -27,9 +27,10 @@ PROFILES = {
         # screen on the tester's RX 9060 XT (HayatoG turned it off for smoke flicker).
         'GOW3_EAGER_READBACK': '1',
         # The compute queues the main thread waits on (~30 fences a frame): register writes and
-        # dispatches no longer drain the draw pipe, and the graphics stream steps aside every 32
+        # dispatches no longer drain the draw pipe, and the graphics stream steps aside every 8
         # packets while compute work is queued (GOW3_LATENCY: 4.7 ms per fence before). Combat
-        # median 29 -> 33 FPS on the tester's RX 9060 XT, no effect lost.
+        # median 29 -> 33 FPS (every 32 packets), 39 (every 8) on the tester's RX 9060 XT, no
+        # effect lost.
         'GOW3_COMPUTE_PIPELINE': '1',
         'GOW3_COMPUTE_PRIORITY': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD

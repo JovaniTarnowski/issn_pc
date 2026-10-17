@@ -774,10 +774,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         const char* env = std::getenv("GOW3_COMPUTE_PRIORITY");
         return env && env[0] == '1';
     }();
-    // GOW3_COMPUTE_PRIORITY_PACKETS: how many graphics packets between steps aside (32).
+    // GOW3_COMPUTE_PRIORITY_PACKETS: how many graphics packets between steps aside. 8: combat
+    // median 33 -> 39 FPS against 32 (tester, RX 9060 XT); 1 was slower and once froze.
     static const u32 yield_packets = [] {
         const char* env = std::getenv("GOW3_COMPUTE_PRIORITY_PACKETS");
-        const u32 n = env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 32u;
+        const u32 n = env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 8u;
         return std::max(n, 1u);
     }();
     u32 packets_since_yield = 0;
