@@ -239,9 +239,11 @@ private:
         u64 tick{};      ///< submission holding the copy
         bool recorded{}; ///< owed_mutex
         bool superseded{}; ///< newer GPU data was read back over it since (owed_mutex)
+        bool read{};       ///< taken by a read fault (GOW3_FAST_READ), not a write
         std::array<u8, TRACKER_BYTES_PER_PAGE> snapshot;
     };
     static u32 FastWriteThreshold();
+    static bool FastReadEnabled();
     /// Guest threads, from a write fault. True when the write may go on.
     bool TryFastWrite(VAddr addr, u64 size);
     /// The copy of a page, before guest bytes are uploaded over it. GPU-side threads.
@@ -261,6 +263,13 @@ private:
     std::unordered_map<VAddr, s8> fast_write_score;
 
 public:
+    /// issn: GOW3_FAST_READ=1 (precise readbacks). A guest read fault on memory marked GPU
+    /// modified does not wait for the GPU: the GPU modified pages of its 64 KiB block are made
+    /// readable at once with the bytes guest memory holds (older than the GPU's), as fast
+    /// writes are, and the GPU's bytes are merged in when their copy is done (the next
+    /// submission's), where the guest did not write since. The guest sees GPU results about a
+    /// frame late: effects may lag or flicker, the frame does not wait. Guest threads.
+    bool TryFastRead(VAddr addr, u64 size);
     /// Verifies the fast writes whose copies are done. GPU command thread, at submissions.
     void SettleOwedPages(); ///< also records the copies not recorded yet
 

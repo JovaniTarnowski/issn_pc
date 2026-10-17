@@ -3803,6 +3803,8 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     static const bool fast = [] { const char* e = std::getenv("GOW3_FAST_READ_FAULT"); return !(e && *e == '0'); }();
     if (fast && !assume_locks && !buffer_cache.IsRegionGpuModified(addr, size)) {
         buffer_cache.ReleaseReadProtection(addr, size);
+    } else if (!assume_locks && !image_readback && buffer_cache.TryFastRead(addr, size)) {
+        // issn: GOW3_FAST_READ: readable at once, the GPU's bytes follow (BufferCache).
     } else if (!assume_locks && !image_readback && buffer_cache.TryEagerRead(addr, size)) {
         // gow3: served from the copy made at the last fence (GOW3_EAGER_READBACK). Not after an
         // image readback: that resolved newer data the buffer copy would overwrite.
