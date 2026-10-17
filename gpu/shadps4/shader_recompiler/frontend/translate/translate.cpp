@@ -112,7 +112,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
 
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
-        // gow3: BP11 (shadPS4 #5348): unbias the ids in every indirect draw, even when the draw
+        // port: BP11 (shadPS4 #5348): unbias the ids in every indirect draw, even when the draw
         // has no user-data register for them (the old code did it only with a register set).
         const bool bp11 = Common::Backports::On(Common::Backports::Id::FirstInstanceDouble);
         if (bp11) {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// gow3: partial-wave and multi-wave LDS barriers and the uniform-ReadLane divergence search are
+// port: partial-wave and multi-wave LDS barriers and the uniform-ReadLane divergence search are
 // ported from the Shadow of the Colossus native port (github.com/AjncSystem/ShadowOfTheColossus-PC,
 // commit 6f0b3e56 and its file at 70bb4385; the ReadLane part comes from Pink-shadPS4 by
 // luizgustavs). There they were SotC-only; here inFAMOUS turns them on (recompiler_toggles.h).
@@ -89,7 +89,7 @@ struct DivergenceContext {
     bool subgroup{};
 };
 
-// A condition is divergent when it depends on LocalInvocationId (or, with GOW3_LANE_DIVERGENCE,
+// A condition is divergent when it depends on LocalInvocationId (or, with ISSN_LANE_DIVERGENCE,
 // another lane-varying source: IsLaneVaryingSource). With uniform_readlane_blocks,
 // the search does not continue through uniform ReadLanes: a wave-wide reduction (a tile min/max
 // depth, for example) is the same in every invocation even though its inputs are not.
@@ -178,13 +178,13 @@ static constexpr u32 GcnSubgroupSize = 64;
 //   values of the other lanes with no s_barrier at all. On the host the compiler may move those
 //   reads before the writes, so they read stale LDS: SotC's particle count prefix sum (16
 //   threads) gave 0 instances to every GPU particle draw. They get workgroup barriers like a
-//   full wave (GOW3_LDS_SMALL).
+//   full wave (ISSN_LDS_SMALL).
 // - Workgroups of several waves synchronize with s_barrier between waves, but the last steps of
 //   a reduction (s[tid] += s[tid + 32] for tid < 32, ...) run inside one wave and rely on its
 //   lanes executing in lockstep. A host subgroup does not guarantee that, and the compiler may
 //   reorder the loads of other lanes' values (SotC's auto-exposure averaged to 0.78 instead of
-//   2.06). Those workgroups get barriers at the same points (GOW3_LDS_MULTI).
-// gow3: the scope comes from how the guest waves land on host subgroups. The workgroup is cut
+//   2.06). Those workgroups get barriers at the same points (ISSN_LDS_MULTI).
+// port: the scope comes from how the guest waves land on host subgroups. The workgroup is cut
 // into 64-lane guest waves, the last one partial when the size is not a multiple of 64 (96 =
 // 64 + 32). If every guest wave fits inside one host subgroup, the hazards stay inside one
 // subgroup and a subgroup barrier is enough (and does not wait on the other waves, which the
@@ -216,7 +216,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup. gow3: every size other than 64 is now covered, 96 or 192 included (they used to
+    // subgroup. port: every size other than 64 is now covered, 96 or 192 included (they used to
     // get no barriers at all).
     const bool multi_wave = threadgroup_size > GcnSubgroupSize && Toggles::MultiWaveLdsBarriers();
     const bool partial_wave = threadgroup_size < GcnSubgroupSize && Toggles::SmallGroupLdsBarriers();

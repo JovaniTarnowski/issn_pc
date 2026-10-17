@@ -794,7 +794,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
                                                  : IR::F32{};
     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
 
-    // gow3: block-compressed 1D textures are 2D images of height 1 on the host (Vulkan has no
+    // port: block-compressed 1D textures are 2D images of height 1 on the host (Vulkan has no
     // BC 1D): sample the middle row, with zero vertical offset and derivatives.
     IR::Value host_coords = coords, host_offset = offset, host_dx = derivatives_dx, host_dy = derivatives_dy;
     if (image.IsBlock1D() && !is_msaa) {
@@ -908,7 +908,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     const auto has_ms = view_type == AmdGpu::ImageType::Color2DMsaa ||
                         view_type == AmdGpu::ImageType::Color2DMsaaArray;
     ASSERT(!inst_info.has_lod || !has_ms);
-    // gow3: block-compressed 1D textures are 2D (height 1) on the host: texel row 0.
+    // port: block-compressed 1D textures are 2D (height 1) on the host: texel row 0.
     IR::Value host_coords = coords;
     if (image.IsBlock1D()) {
         host_coords = view_type == AmdGpu::ImageType::Color1DArray

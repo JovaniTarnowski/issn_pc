@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Builds dist/gow3-x86_64.AppImage from the Linux build (run `bash build.sh` in the repo root first).
+# Builds dist/issn-x86_64.AppImage from the Linux build (run `bash build.sh` in the repo root first).
 # Libraries are bundled with their dependencies, except the ones that must come from the host
 # (glibc, Vulkan loader and drivers, X11/Wayland, GL). The Tk launcher is frozen with PyInstaller, so
 # players need no Python. Needs: ldd, patchelf, curl (appimagetool), python-pyinstaller, tk, pillow, iced-x86.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-[[ -f out/issn-probe && -f out/gpu/libgow3gpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+[[ -f out/issn-probe && -f out/gpu/libissngpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 
 appdir=out/AppDir
 rm -rf "$appdir"
-share=$appdir/usr/share/gow3
+share=$appdir/usr/share/issn
 mkdir -p "$share/bin/gpu" "$appdir/usr/lib"
 
 install -m755 out/issn-probe out/issn-gpu-capabilities "$share/bin/"
-install -m755 out/gpu/libgow3gpu.so "$share/bin/gpu/"
+install -m755 out/gpu/libissngpu.so "$share/bin/gpu/"
 cp run.py "$share/"
 cp -r scripts patches "$share/"
 mkdir -p "$share/launcher"
-# The icon of the AppImage, the launcher and the game window: packaging/linux/gow3.png when it
+# The icon of the AppImage, the launcher and the game window: packaging/linux/issn.png when it
 # exists (a local choice), else the launcher's own.
 icon=launcher/issn.png
-[[ -f packaging/linux/gow3.png ]] && icon=packaging/linux/gow3.png
+[[ -f packaging/linux/issn.png ]] && icon=packaging/linux/issn.png
 install -m644 "$icon" "$share/launcher/issn.png"
 
 # The launcher also runs run.py (--run) and the preparation scripts (--script) itself, as on
@@ -34,12 +34,12 @@ done
 python3 -c 'import iced_x86' || { echo 'Need iced-x86: pip install iced-x86==1.21.0' >&2; exit 1; }
 python3 -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name issn-launcher \
     --distpath out/pyi-dist --workpath out/pyi-work --specpath out/pyi-work \
-    --paths "$PWD/scripts" "${hidden[@]}" "$PWD/launcher/gow3_launcher_win.py"
+    --paths "$PWD/scripts" "${hidden[@]}" "$PWD/launcher/issn_launcher_win.py"
 cp -r out/pyi-dist/issn-launcher/. "$share/"
 find "$share" -name __pycache__ -prune -exec rm -r {} +
 install -m755 packaging/linux/AppRun "$appdir/AppRun"
-install -m644 packaging/linux/gow3.desktop "$appdir/gow3.desktop"
-install -m644 "$icon" "$appdir/gow3.png"
+install -m644 packaging/linux/issn.desktop "$appdir/issn.desktop"
+install -m644 "$icon" "$appdir/issn.png"
 
 # Host-provided libraries: bundling any of these breaks drivers or the display connection.
 excluded='^(ld-linux.*|libc|libm|libdl|librt|libpthread|libresolv|libutil|libnsl|libanl|libvulkan|libGL|libGLX|libGLdispatch|libEGL|libOpenGL|libgbm|libdrm.*|libX11|libX11-xcb|libxcb.*|libXau|libXdmcp|libXext|libXfixes|libXrender|libXi|libXcursor|libXrandr|libwayland-.*|libasound|libudev|libpulse.*|libfontconfig|libfreetype|libOpenCL|libva.*|libvdpau|libvpl|libnvidia-.*|libcuda|libz|libstdc\+\+|libgcc_s)\.so'
@@ -57,12 +57,12 @@ bundle() {
         bundle "$lib"
     done < <(ldd "$elf")
 }
-bundle out/gpu/libgow3gpu.so
+bundle out/gpu/libissngpu.so
 bundle out/issn-probe
 # libstdc++/libgcc/libz come from the build host: the same glibc generation as the one that runs
 # the AppImage is assumed, and a newer libstdc++ than Mesa's is the safe direction.
 for name in libstdc++.so.6 libgcc_s.so.1; do
-    install -m755 "$(ldd out/gpu/libgow3gpu.so | awk -v n="$name" '$1==n{print $3}')" "$appdir/usr/lib/$name"
+    install -m755 "$(ldd out/gpu/libissngpu.so | awk -v n="$name" '$1==n{print $3}')" "$appdir/usr/lib/$name"
 done
 # $ORIGIN/gpu is already the probe's RUNPATH; the libraries it needs sit in usr/lib via AppRun.
 find "$appdir/usr/lib" -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
@@ -77,6 +77,6 @@ if [[ -z $tool ]]; then
 fi
 mkdir -p dist
 # Written aside and moved over: replacing a running AppImage in place fails ("Text file busy").
-ARCH=x86_64 "$tool" --appimage-extract-and-run "$appdir" dist/gow3-x86_64.AppImage.new
-mv -f dist/gow3-x86_64.AppImage.new dist/gow3-x86_64.AppImage
-ls -lh dist/gow3-x86_64.AppImage
+ARCH=x86_64 "$tool" --appimage-extract-and-run "$appdir" dist/issn-x86_64.AppImage.new
+mv -f dist/issn-x86_64.AppImage.new dist/issn-x86_64.AppImage
+ls -lh dist/issn-x86_64.AppImage

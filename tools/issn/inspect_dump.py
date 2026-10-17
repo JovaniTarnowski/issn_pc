@@ -6,7 +6,7 @@ Lê a pasta do jogo (a que tem eboot.bin, sce_module e sce_sys), confere se o du
 completo e descriptografado, e lista todas as funções do sistema do PS4 que o jogo importa,
 dizendo de onde cada uma viria no port:
 
-  runtime   já implementada no runtime em C (src/runtime_*.c), herdado do port do GOW3
+  runtime   já implementada no runtime em C (src/runtime_*.c), herdado do port do ISSN
   gpu       registrada pelo núcleo do shadPS4 (gpu/), por exemplo GnmDriver e VideoOut
   modulo    exportada por um módulo que vem no próprio dump (sce_module/*.prx)
   FALTA     ninguém implementa: é trabalho a fazer
@@ -18,7 +18,7 @@ Uso:
   python tools/issn/inspect_dump.py "D:\\Jogos\\CUSA00004" --probe out\\issn-probe.exe
 
 Com --probe, além da análise estática, prepara a imagem do jogo e roda o carregador real com
---check-imports (a verificação definitiva, a mesma do port do GOW3).
+--check-imports (a verificação definitiva, a mesma do port do ISSN).
 """
 import argparse
 import collections
@@ -223,7 +223,7 @@ def main():
             problems.append(f'`{name}`: {kind}.')
     for module in LINKED_BY_DEFAULT:
         if module not in bundled:
-            notes.append(f'O dump não traz `sce_module/{module}`, que o pipeline do GOW3 junta ao jogo; '
+            notes.append(f'O dump não traz `sce_module/{module}`, que o pipeline do ISSN junta ao jogo; '
                          'o link será feito só com os módulos presentes.')
     data_bytes = sum(p.stat().st_size for p in game.rglob('*') if p.is_file())
     report['dump_bytes'] = data_bytes

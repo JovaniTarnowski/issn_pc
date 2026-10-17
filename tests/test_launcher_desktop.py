@@ -7,7 +7,7 @@ import unittest
 
 from paths import ROOT
 sys.path.insert(0, str(ROOT / 'launcher'))
-import gow3_launcher_win as launcher  # noqa: E402
+import issn_launcher_win as launcher  # noqa: E402
 
 
 class DesktopIntegrationTest(unittest.TestCase):
@@ -17,24 +17,24 @@ class DesktopIntegrationTest(unittest.TestCase):
         self.icon = self.home / 'source.png'
         self.icon.write_bytes(b'png one')
         self.data = self.home / 'data'
-        self.entry = self.home / '.local' / 'share' / 'applications' / 'gow3.desktop'
+        self.entry = self.home / '.local' / 'share' / 'applications' / 'issn.desktop'
 
-    def integrate(self, enabled=True, appimage='/games/gow3.AppImage'):
+    def integrate(self, enabled=True, appimage='/games/issn.AppImage'):
         return launcher.integrate_desktop(enabled, appimage, self.icon, self.data, home=self.home)
 
     def test_entry_names_the_appimage_the_icon_and_the_window_class(self):
         self.assertEqual(self.integrate(), self.entry)
         text = self.entry.read_text()
-        self.assertIn('Exec="/games/gow3.AppImage"', text)
+        self.assertIn('Exec="/games/issn.AppImage"', text)
         self.assertIn(f'Icon={self.data / "issn.png"}', text)
-        self.assertIn('StartupWMClass=gow3', text)
+        self.assertIn('StartupWMClass=issn', text)
         self.assertEqual((self.data / 'issn.png').read_bytes(), b'png one')
 
     def test_a_moved_appimage_or_a_new_icon_updates_the_entry(self):
         self.integrate()
         self.icon.write_bytes(b'png two')
-        self.integrate(appimage='/elsewhere/gow3.AppImage')
-        self.assertIn('Exec="/elsewhere/gow3.AppImage"', self.entry.read_text())
+        self.integrate(appimage='/elsewhere/issn.AppImage')
+        self.assertIn('Exec="/elsewhere/issn.AppImage"', self.entry.read_text())
         self.assertEqual((self.data / 'issn.png').read_bytes(), b'png two')
 
     def test_turning_it_off_removes_only_our_entry(self):

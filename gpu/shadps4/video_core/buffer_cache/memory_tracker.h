@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "gow3_toggles.h"
+#include "issn_toggles.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
@@ -54,7 +54,7 @@ public:
                             });
     }
 
-    /// gow3: as MarkRegionAsCpuModified, for a write fault served by a copy applied on the
+    /// port: as MarkRegionAsCpuModified, for a write fault served by a copy applied on the
     /// faulting thread: pages the GPU marked modified again since are left alone, so the write
     /// faults again and reads them back first instead of the upload taking stale guest bytes.
     void MarkRegionAsCpuModifiedUnlessGpu(VAddr dirty_cpu_addr, u64 query_size) {
@@ -68,7 +68,7 @@ public:
                             });
     }
 
-    /// gow3: calls func(manager, offset, size) for the 4 KiB page at `page` with its region
+    /// port: calls func(manager, offset, size) for the 4 KiB page at `page` with its region
     /// lock held; returns what func returns (false when the page has no region).
     template <typename Func>
     bool WithPageLocked(VAddr page, Func&& func) {
@@ -81,7 +81,7 @@ public:
         return result;
     }
 
-    /// gow3: see RegionManager::ExtendWriteFault.
+    /// port: see RegionManager::ExtendWriteFault.
     void ExtendWriteFault(VAddr window_addr, u64 size) {
         IteratePages<false>(window_addr, size,
                             [](RegionManager* manager, u64 offset, size_t size) {
@@ -100,7 +100,7 @@ public:
                             });
     }
 
-    /// gow3: applies a copy of GPU data made earlier (deferred and eager readbacks, buffer_cache.cpp).
+    /// port: applies a copy of GPU data made earlier (deferred and eager readbacks, buffer_cache.cpp).
     /// With the region locks of the range held (taken in address order, as ForEachUploadRange
     /// does), and only if pred() holds: write(start, end) is called for each run of pages still
     /// marked GPU modified, then the range is unmarked (which lifts the read protection). The GPU
@@ -190,12 +190,12 @@ public:
                             auto&& on_upload) {
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
-                               // gow3: read-only bindings skip the region lock when no page
+                               // port: read-only bindings skip the region lock when no page
                                // in range is CPU-modified. A guest write sets its bit in the
                                // fault handler before the store, and the draw that uses the
                                // data reaches this thread through the submission queue lock.
                                if (!is_written &&
-                                   !Gow3Toggle::Disabled(Gow3Toggle::LockFreeUploadCheck) &&
+                                   !IssnToggle::Disabled(IssnToggle::LockFreeUploadCheck) &&
                                    !manager->template IsRegionModified<Type::CPU>(offset, size)) {
                                    return;
                                }

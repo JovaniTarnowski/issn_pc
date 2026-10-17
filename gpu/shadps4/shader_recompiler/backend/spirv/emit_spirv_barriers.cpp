@@ -35,7 +35,7 @@ void EmitBarrier(EmitContext& ctx) {
 
 // Synchronizes the invocations of one host subgroup (like __syncwarp) and orders their shared
 // memory accesses: what a GCN wave gets for free from executing in lockstep.
-// gow3: from the SotC native port (AjncSystem/ShadowOfTheColossus-PC), LDS barriers for
+// port: from the SotC native port (AjncSystem/ShadowOfTheColossus-PC), LDS barriers for
 // multi-wave workgroups.
 void EmitSubgroupBarrier(EmitContext& ctx) {
     const auto semantics{spv::MemorySemanticsMask::AcquireRelease |

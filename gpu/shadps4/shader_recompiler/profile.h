@@ -34,7 +34,7 @@ struct Profile {
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
-    bool supports_maximal_reconvergence{}; // gow3: BP06
+    bool supports_maximal_reconvergence{}; // port: BP06
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
@@ -48,7 +48,7 @@ struct Profile {
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
-    /// gow3: NVIDIA without fragment shader barycentrics (Pascal and older).
+    /// port: NVIDIA without fragment shader barycentrics (Pascal and older).
     bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
     /// issn: also synchronize LDS accesses of compute workgroups larger than a GCN wave (see
@@ -62,12 +62,12 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
-    /// gow3: GOW3_LIGHTING_TEST=dref (vk_lighting_test.h): depth comparisons return the result
+    /// port: ISSN_LIGHTING_TEST=dref (vk_lighting_test.h): depth comparisons return the result
     /// in all four channels instead of (v, 0, 0, 0).
     bool dref_broadcast{};
-    /// gow3: block-compressed 1D textures are 2D images (video_core/amdgpu/gow3_block1d.h).
+    /// port: block-compressed 1D textures are 2D images (video_core/amdgpu/issn_block1d.h).
     bool block1d_as_2d{};
-    /// gow3: tiny BC textures decoded to plain images (video_core/amdgpu/gow3_bc_tiny.h).
+    /// port: tiny BC textures decoded to plain images (video_core/amdgpu/issn_bc_tiny.h).
     bool bc_tiny_decode{};
 
     bool operator==(const Profile&) const = default;

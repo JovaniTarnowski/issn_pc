@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/amdgpu/gow3_amd_1d.h"
+#include "video_core/amdgpu/issn_amd_1d.h"
 #include <boost/container/small_vector.hpp>
-#include "gow3_toggles.h"
+#include "issn_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -111,7 +111,7 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
 
 
 namespace {
-// gow3: GOW3_IMG_TRACE (video_core/amdgpu/gow3_amd_1d.h): every runtime step touching a 1D image.
+// port: ISSN_IMG_TRACE (video_core/amdgpu/issn_amd_1d.h): every runtime step touching a 1D image.
 bool TraceIs1D(const VideoCore::Image* image) {
     return AmdGpu::ImgTrace() && image && !image->info.props.is_host_2d && image->info.size.height == 1;
 }
@@ -125,7 +125,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
 
-    // gow3: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
+    // port: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
     // conservative for barriers, and two tree lookups instead of two per region.
     const bool bounded = copies.size() > 4;
     u64 src_min = ~0ULL, src_max = 0, dst_min = ~0ULL, dst_max = 0;
@@ -206,7 +206,7 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     if (TraceIs1D(image)) {
-        GOW3_IMG_TRACE("Transit %p\n", (void*)VkImage(image->GetImage()));
+        ISSN_IMG_TRACE("Transit %p\n", (void*)VkImage(image->GetImage()));
     }
     BeforeImageAccess();
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
@@ -259,7 +259,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     const bool trace_1d = AmdGpu::ImgTrace() && !dst->info.props.is_host_2d &&
                           dst->info.size.height == 1;
     if (trace_1d) {
-        GOW3_IMG_TRACE("upload to 1D image %p: %zu regions, first %ux%u mip %u layers %u+%u\n",
+        ISSN_IMG_TRACE("upload to 1D image %p: %zu regions, first %ux%u mip %u layers %u+%u\n",
                       (void*)VkImage(dst->GetImage()), upload_copies.size(),
                       upload_copies.empty() ? 0u : upload_copies[0].imageExtent.width,
                       upload_copies.empty() ? 0u : upload_copies[0].imageExtent.height,
@@ -270,13 +270,13 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     scheduler.Record([src_handle = src->Handle(), image = dst->GetImage(),
                       regions = scheduler.RecordData(upload_copies), trace_1d](vk::CommandBuffer cmdbuf) {
         if (trace_1d) {
-            GOW3_IMG_TRACE("record copyBufferToImage %p (%zu regions)\n", (void*)VkImage(image),
+            ISSN_IMG_TRACE("record copyBufferToImage %p (%zu regions)\n", (void*)VkImage(image),
                           (size_t)regions.size());
         }
         cmdbuf.copyBufferToImage(src_handle, image, vk::ImageLayout::eTransferDstOptimal,
                                  regions.size(), regions.data());
         if (trace_1d) {
-            GOW3_IMG_TRACE("recorded copyBufferToImage %p\n", (void*)VkImage(image));
+            ISSN_IMG_TRACE("recorded copyBufferToImage %p\n", (void*)VkImage(image));
         }
     });
 
@@ -292,7 +292,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
 void Runtime::CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst,
                              const vk::Extent3D& extent) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("CopyAliasImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("CopyAliasImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
     SetBackingSamples(src, src->info.num_samples);
     SetBackingSamples(dst, dst->info.num_samples);
@@ -322,7 +322,7 @@ void Runtime::CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
     if (TraceIs1D(src)) {
-        GOW3_IMG_TRACE("DownloadImage %p\n", (void*)VkImage(src->GetImage()));
+        ISSN_IMG_TRACE("DownloadImage %p\n", (void*)VkImage(src->GetImage()));
     }
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
@@ -354,7 +354,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("CopyImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("CopyImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
@@ -458,7 +458,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("CopyImageWithBuffer %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("CopyImageWithBuffer %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
@@ -522,7 +522,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("CopyMip %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("CopyMip %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
@@ -534,7 +534,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
 
-    // gow3: the source is one subresource (usually a single layer) going into layer `slice` of
+    // port: the source is one subresource (usually a single layer) going into layer `slice` of
     // a larger image: the copy covers the source's layers, not the destination's whole array.
     // SanitizeCopyLayers compares whole-image layer counts (1 against 256 in inFAMOUS, logged
     // hundreds of times per session) and its minimum happened to be the right count; take it
@@ -593,9 +593,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("CopyColorAndDepth %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("CopyColorAndDepth %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
-    // gow3: with GOW3_NO_MSAA a guest multisampled depth target is single-sampled on the host; a
+    // port: with ISSN_NO_MSAA a guest multisampled depth target is single-sampled on the host; a
     // colour image aliasing it still holds the samples as channels, so sample 0 is channel 0.
     const bool guest_ms_depth = dst->info.props.is_depth && dst->info.guest_samples > 1;
     if (src->info.num_samples == 1 && dst->info.num_samples == 1 && !guest_ms_depth) {
@@ -678,7 +678,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {
     if (TraceIs1D(src) || TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("ResolveImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("ResolveImage %p -> %p\n", (void*)VkImage(src->GetImage()), (void*)VkImage(dst->GetImage()));
     }
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
@@ -751,7 +751,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
     if (TraceIs1D(dst)) {
-        GOW3_IMG_TRACE("ClearImage %p\n", (void*)VkImage(dst->GetImage()));
+        ISSN_IMG_TRACE("ClearImage %p\n", (void*)VkImage(dst->GetImage()));
     }
     scheduler.EndRendering();
 
@@ -780,7 +780,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
 
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
     if (TraceIs1D(image)) {
-        GOW3_IMG_TRACE("SetBackingSamples %p\n", (void*)VkImage(image->GetImage()));
+        ISSN_IMG_TRACE("SetBackingSamples %p\n", (void*)VkImage(image->GetImage()));
     }
     BeforeImageAccess();
     auto& backing = image->backing;
@@ -893,16 +893,16 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    // gow3: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
+    // port: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
     // at a new offset every draw; rounded, they land in ranges already present and the
     // insert returns early instead of growing the tree until the next barrier flush.
     // Wider read ranges only add barriers, never drop one.
-    if (!(src_access & WRITE_MASK) && !Gow3Toggle::Disabled(Gow3Toggle::CoarseReadTracking)) {
+    if (!(src_access & WRITE_MASK) && !IssnToggle::Disabled(IssnToggle::CoarseReadTracking)) {
         range.range_start &= ~u64{0xFFF};
         range.range_end |= 0xFFF;
     }
     const auto insert = [&](Access access) {
-        if (Gow3Toggle::Disabled(Gow3Toggle::AccessMemo)) {
+        if (IssnToggle::Disabled(IssnToggle::AccessMemo)) {
             barrier_tracker.InsertRange(range, access);
             return;
         }

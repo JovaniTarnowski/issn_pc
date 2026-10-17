@@ -73,13 +73,13 @@ struct SwVertexRuntimeInfo {
     u32 step_rate_1;
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
-    bool is_indirect{}; // gow3: BP11 (set only when the backport is on)
+    bool is_indirect{}; // port: BP11 (set only when the backport is on)
     bool tess_emulated_primitive{};
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };
 
-/// gow3: object motion vectors for temporal upscaling. G-buffer vertex shaders store their
+/// port: object motion vectors for temporal upscaling. G-buffer vertex shaders store their
 /// clip-space positions per referenced vertex and read the previous frame's; the
 /// fragment shader writes the screen-space difference to an extra color attachment.
 struct MotionVectors {
@@ -112,7 +112,7 @@ struct HwVertexRuntimeInfo {
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
     u32 user_clip_plane_mask{};
-    /// gow3: object motion vectors (G-buffer draws), see MotionVectors below.
+    /// port: object motion vectors (G-buffer draws), see MotionVectors below.
     bool motion_vectors{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
@@ -194,7 +194,7 @@ struct PsColorBuffer {
     // GCN applies blend factors to min/max ops while Vulkan ignores them. For the self-scaled
     // pattern min/max(src*src, dst*dst) the shader squares its color output instead, keeping
     // the attachment in the squared domain end to end.
-    u32 blend_self_scale : 1; ///< gow3: unused, kept so cached shader keys stay valid
+    u32 blend_self_scale : 1; ///< port: unused, kept so cached shader keys stay valid
     AmdGpu::CompMapping swizzle;
 
     bool operator==(const PsColorBuffer& other) const = default;
@@ -228,9 +228,9 @@ struct HwFragmentRuntimeInfo {
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};
-    /// gow3: writes the object motion vector to MotionVectors::Output.
+    /// port: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
-    /// gow3: BP12 (shadPS4 7d28d279, #5264) DEPTH_BEFORE_SHADER asks for early Z tests.
+    /// port: BP12 (shadPS4 7d28d279, #5264) DEPTH_BEFORE_SHADER asks for early Z tests.
     bool depth_before_shader{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {

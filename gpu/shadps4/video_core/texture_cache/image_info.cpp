@@ -130,19 +130,19 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     type = image.GetBaseType();
     props.is_host_2d = image.IsBlock1D();
     if (AmdGpu::All1DAs2D() && props.is_host_2d && type == AmdGpu::ImageType::Color1D) {
-        // gow3: BP09, as a 2D image from here on, so that it matches the 2D render target it is
+        // port: BP09, as a 2D image from here on, so that it matches the 2D render target it is
         // sampled from (the colour-grading LUT) instead of being a separate, stale image.
         type = AmdGpu::ImageType::Color2D;
     }
     if (image.IsBlock1D()) {
-        // gow3: diagnostics for the BC 1D -> 2D promotion (one line per distinct shape).
+        // port: diagnostics for the BC 1D -> 2D promotion (one line per distinct shape).
         static std::mutex seen_mutex;
         static std::set<u64> seen;
         const u64 key = (u64(image.width) << 40) | (u64(image.height) << 24) |
                         (u64(image.GetDataFmt()) << 16) | u64(image.GetType());
         std::scoped_lock lock{seen_mutex};
         if (seen.insert(key).second && seen.size() < 64) {
-            LOG_WARNING(Render_Vulkan, "gow3: BC 1D image {}x{} format {} type {} at {:#x} -> 2D",
+            LOG_WARNING(Render_Vulkan, "port: BC 1D image {}x{} format {} type {} at {:#x} -> 2D",
                         image.width + 1, image.height + 1, u32(image.GetDataFmt()),
                         u32(image.GetType()), image.Address());
         }
@@ -167,7 +167,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
     UpdateSize();
 
-    // gow3: GOW3_BC_TINY (video_core/amdgpu/gow3_bc_tiny.h): BC1-BC5 images that are 1D or smaller
+    // port: ISSN_BC_TINY (video_core/amdgpu/issn_bc_tiny.h): BC1-BC5 images that are 1D or smaller
     // than a block in either dimension become plain images decoded on the CPU.
     const auto guest_type = image.GetType();
     const bool is_1d = guest_type == AmdGpu::ImageType::Color1D ||
@@ -183,8 +183,8 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
         std::scoped_lock lock{seen_mutex};
         if (seen.insert(key).second && seen.size() < 64) {
             LOG_WARNING(Render_Vulkan,
-                        "gow3: BC image {}x{} {} type {} tile {} layers {} mips {} at {:#x} -> {} "
-                        "(CPU decode, GOW3_BC_TINY)",
+                        "port: BC image {}x{} {} type {} tile {} layers {} mips {} at {:#x} -> {} "
+                        "(CPU decode, ISSN_BC_TINY)",
                         size.width, size.height, vk::to_string(pixel_format), u32(guest_type),
                         AmdGpu::NameOf(tile_mode), resources.layers, resources.levels,
                         guest_address, vk::to_string(decoded));

@@ -54,7 +54,7 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
-    size_t last_used = 0; ///< gow3: permutation of the previous lookup, compared first
+    size_t last_used = 0; ///< port: permutation of the previous lookup, compared first
     /// tlg (i3-pc 0120115): the inputs of the last variant match. A draw that brings the same
     /// ones again takes the same variant without building its specialization (GetProgram).
     struct LastMatch {
@@ -64,7 +64,7 @@ struct Program {
         Shader::Backend::Bindings start{};
         boost::container::small_vector<std::array<u32, 4>, 16> vs_sharps;
     } last_match;
-    /// gow3: `info` as translated, for draw-preparation workers (they must not read `info`,
+    /// port: `info` as translated, for draw-preparation workers (they must not read `info`,
     /// whose user data the GPU thread rewrites every draw). Guarded by programs_mutex.
     std::unique_ptr<Shader::Info> info_template;
     std::shared_ptr<AsyncShaderCompilation> pending;
@@ -79,10 +79,10 @@ struct Program {
         modules.emplace_back(module, std::move(spec));
         LogPermutationGrowth();
     }
-    /// gow3: at 16, 32, 64... permutations, logs which key fields differ between the last two
+    /// port: at 16, 32, 64... permutations, logs which key fields differ between the last two
     /// (a field that changes every draw makes the list, and every lookup, grow without end).
     void LogPermutationGrowth() const;
-    /// gow3: the pending compilation is the program's first: `info` is not translated yet.
+    /// port: the pending compilation is the program's first: `info` is not translated yet.
     [[nodiscard]] bool PendingInitial() const;
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
@@ -96,7 +96,7 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
-    bool is_indirect = false; // gow3: BP07 and BP11 (the draw is an indirect one)
+    bool is_indirect = false; // port: BP07 and BP11 (the draw is an indirect one)
 };
 
 } // namespace Vulkan
@@ -107,7 +107,7 @@ union Regs;
 
 namespace Vulkan {
 
-/// gow3: state of one graphics/compute pipeline selection. The GPU thread owns one
+/// port: state of one graphics/compute pipeline selection. The GPU thread owns one
 /// (PipelineCache::sel); draw-preparation workers use their own with their register copies.
 struct PipelineSelection {
     const AmdGpu::Regs* regs{};
@@ -118,12 +118,12 @@ struct PipelineSelection {
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
     bool compilation_pending = false;
-    bool sync_compile = false; ///< gow3: BP07, shaders and pipeline of this draw compile now
+    bool sync_compile = false; ///< port: BP07, shaders and pipeline of this draw compile now
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };
 
-/// gow3: a draw-preparation worker's own program state (see vk_draw_prep.h).
+/// port: a draw-preparation worker's own program state (see vk_draw_prep.h).
 struct PrepWorker {
     struct Stage {
         const Program* program;
@@ -146,10 +146,10 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
-    /// Loads the pipelines of earlier sessions. gow3: called by the presenter once the window
+    /// Loads the pipelines of earlier sessions. port: called by the presenter once the window
     /// can show a loading screen; `progress(done, total)` follows the pipelines read.
     void WarmUp(const std::function<void(u32 done, u32 total)>& progress = {});
-    /// gow3: the same load on low-priority threads while the game runs; the GPU thread takes
+    /// port: the same load on low-priority threads while the game runs; the GPU thread takes
     /// the results a few at a time (PumpWarmUp). False when it cannot (zip archive store).
     bool StartBackgroundWarmUp();
     void StartOnDemand();
@@ -163,15 +163,15 @@ public:
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr);
 
-    /// gow3: worker side of draw preparation: selects the pipeline key for `sel.regs` without
+    /// port: worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.
     bool PrepareGraphicsPipeline(PipelineSelection& sel);
 
-    /// gow3: GPU-thread side: the pipeline for a prepared draw after checking that registers
+    /// port: GPU-thread side: the pipeline for a prepared draw after checking that registers
     /// and flattened user data match; null to take the regular path.
     const GraphicsPipeline* TryPreparedPipeline(const PreparedDraw& prepared);
 
-    /// gow3: the prepared draw the last GetGraphicsPipeline used, or null (regular path).
+    /// port: the prepared draw the last GetGraphicsPipeline used, or null (regular path).
     [[nodiscard]] const PreparedDraw* UsedPrepared() const noexcept {
         return used_prepared;
     }
@@ -201,14 +201,14 @@ private:
     void PublishShaders(bool wait = false);
     void PublishGraphics(bool wait = false);
     void FinishCompilations();
-    /// gow3: BP08, the driver's VkPipelineCache blob kept between sessions (see the .cpp).
+    /// port: BP08, the driver's VkPipelineCache blob kept between sessions (see the .cpp).
     void StartDriverCacheSaver();
     void StopDriverCacheSaver();
     bool SaveDriverCache();
     bool SaveDriverCacheUnchecked();
     void SeedWorkerCaches();
     bool CheckCacheProfile();
-    /// gow3: index for a new permutation of `program`: past every index the cache on disk holds.
+    /// port: index for a new permutation of `program`: past every index the cache on disk holds.
     size_t NewPermutationIndex(const Program& program, u64 hash) const;
     struct BackgroundWarmup;
     struct WarmStage;
@@ -249,25 +249,25 @@ private:
     std::vector<vk::UniquePipelineCache> worker_pipeline_caches;
     bool worker_caches_seeded = false;
     struct DriverCacheSaver;
-    DriverCacheSaver* driver_saver = nullptr; ///< gow3: BP08
-    /// gow3: GOW3_PARALLEL_WARMUP: WarmUp builds the cached pipelines on these threads.
+    DriverCacheSaver* driver_saver = nullptr; ///< port: BP08
+    /// port: ISSN_PARALLEL_WARMUP: WarmUp builds the cached pipelines on these threads.
     struct WarmupPool;
     WarmupPool* warmup_pool = nullptr;
     std::mutex warmup_results_mutex;
     std::vector<std::pair<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>>> warmup_graphics;
     std::vector<std::pair<ComputePipelineKey, std::unique_ptr<ComputePipeline>>> warmup_compute;
-    /// gow3: StartBackgroundWarmUp state; owned here, deleted by StopWarmUp.
+    /// port: StartBackgroundWarmUp state; owned here, deleted by StopWarmUp.
     BackgroundWarmup* background = nullptr;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsCompilation>> pending_graphics;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
-    /// gow3: per program hash, one past the highest permutation index of the .spv files on disk.
+    /// port: per program hash, one past the highest permutation index of the .spv files on disk.
     /// A permutation compiled in game takes an index from here, never one that a cached
     /// permutation not yet loaded (background warm-up) already names: its .meta would be
     /// overwritten with another specialization, and the .key files that name it would build
     /// their pipelines with the wrong shader in the next session. Filled by CheckCacheProfile.
     std::unordered_map<u64, size_t> next_permutation;
     std::vector<Program*> pending_programs;
-    /// gow3: exclusive for program/permutation insertions, shared for worker lookups.
+    /// port: exclusive for program/permutation insertions, shared for worker lookups.
     std::shared_mutex programs_mutex;
     u64 prepared_hits = 0, prepared_misses = 0;
     const PreparedDraw* used_prepared = nullptr;

@@ -15,14 +15,23 @@ MINGW*|MSYS*)
           ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
         git submodule update --init --recursive
     fi
+    # A patch that is neither applied nor applicable: the tree holds an older version of the
+    # patches (the GOW3_ -> ISSN_ rename changed their text). Start again from the pinned commit.
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null &&
+           ! git -C gpu/third_party/fsr-vulkan apply --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan checkout -- .
+            break
+        fi
+    done
     for patch in gpu/patches/fsr-vulkan/*.patch; do
         if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOW3_PGO=off \
-        -DGOW3_LTO="${GOW3_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
-    echo "GPU library and loader: LTO ${GOW3_LTO:-OFF}"
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DISSN_PGO=off \
+        -DISSN_LTO="${ISSN_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    echo "GPU library and loader: LTO ${ISSN_LTO:-OFF}"
     if ! ninja -C out/gpu issn-probe issn-gpu-capabilities issn-play > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
@@ -44,17 +53,17 @@ if [[ -z ${CC:-} ]]; then echo 'Install GCC/Clang or set CC.' >&2; exit 1; fi
 # Dependencies come from pkg-config (Vulkan loader/headers, SDL3). On NixOS the
 # environment is provided by shell.nix; re-enter it automatically if needed.
 if ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3 && command -v cmake >/dev/null && command -v ninja >/dev/null; }; then
-    if [[ -z ${GOW3_IN_NIX_SHELL:-} ]] && command -v nix-shell >/dev/null; then
-        exec env GOW3_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash build.sh $*"
+    if [[ -z ${ISSN_IN_NIX_SHELL:-} ]] && command -v nix-shell >/dev/null; then
+        exec env ISSN_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash build.sh $*"
     fi
     echo 'Need pkg-config with vulkan and sdl3, cmake and ninja (see shell.nix).' >&2; exit 1
 fi
 read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3 libavcodec libavutil libswscale)"
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3 libavcodec libavutil libswscale)"
-# GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libgow3gpu.so.
-# GOW3_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
-# Default: use the profile in pgo/ when there is one. GOW3_LTO=OFF disables link-time optimization.
-pgo=${GOW3_PGO:-}
+# GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libissngpu.so.
+# ISSN_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
+# Default: use the profile in pgo/ when there is one. ISSN_LTO=OFF disables link-time optimization.
+pgo=${ISSN_PGO:-}
 if [[ -z $pgo ]]; then
     if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
 fi
@@ -65,20 +74,27 @@ if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/img
     git submodule update --init --recursive
 fi
 for patch in gpu/patches/fsr-vulkan/*.patch; do
+    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null &&
+       ! git -C gpu/third_party/fsr-vulkan apply --check "$PWD/$patch" 2>/dev/null; then
+        git -C gpu/third_party/fsr-vulkan checkout -- .  # an older version of the patches
+        break
+    fi
+done
+for patch in gpu/patches/fsr-vulkan/*.patch; do
     if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
     fi
 done
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGOW3_PGO="$pgo" \
-    -DGOW3_LTO="${GOW3_LTO:-ON}" -DGOW3_PGO_DIR="$PWD/pgo" >/dev/null
-echo "GPU library: PGO $pgo, LTO ${GOW3_LTO:-ON}"
-# A failed GPU build must stop here: an older libgow3gpu.so would otherwise be used silently.
-if ! ninja -C out/gpu gow3gpu > out/gpu-build.log 2>&1; then
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DISSN_PGO="$pgo" \
+    -DISSN_LTO="${ISSN_LTO:-ON}" -DISSN_PGO_DIR="$PWD/pgo" >/dev/null
+echo "GPU library: PGO $pgo, LTO ${ISSN_LTO:-ON}"
+# A failed GPU build must stop here: an older libissngpu.so would otherwise be used silently.
+if ! ninja -C out/gpu issngpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
-gpu=(-Lout/gpu -lgow3gpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
+gpu=(-Lout/gpu -lissngpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
 runtime=(src/runtime*.c)
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)

@@ -193,7 +193,7 @@ void CFG::SplitDivergenceScopes() {
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
-                    // gow3: BP03 (shadPS4 c34ca21f): an empty scope closed by an instruction that
+                    // port: BP03 (shadPS4 c34ca21f): an empty scope closed by an instruction that
                     // also opens one (e.g. S_ANDN2_B64 exec) must start the next scope.
                     if (Common::Backports::On(Common::Backports::Id::ExecEmptyBranch) &&
                         is_open_scope(inst)) {

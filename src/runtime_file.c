@@ -5,7 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
-#include "gpu/gow3gpu.h"
+#include "gpu/issngpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +24,7 @@ typedef struct _stat64 HostStat;
 #define host_stat(path,s) _stat64(path,s)
 #define host_fstat(fd,s) _fstat64(fd,s)
 #define host_lseek _lseeki64
-#define O_DIRECTORY 0x40000000 /* gow3 marker, removed before _open */
+#define O_DIRECTORY 0x40000000 /* issn marker, removed before _open */
 #else
 typedef struct stat HostStat;
 #define host_stat(path,s) stat(path,s)
@@ -191,8 +191,8 @@ static File *get(int fd) {
     if (fd<3 || fd>=MAX_FILES || !files[fd].used) return NULL;
     return &files[fd];
 }
-/* GOW3_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
-static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("GOW3_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
+/* ISSN_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
+static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("ISSN_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
@@ -201,13 +201,13 @@ static int game_path(const char *p) {
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
-/* issn: GOW3_FILE_ALIAS="a.ext=b.ext;c=d": a host file named a.ext (any directory, case
+/* issn: ISSN_FILE_ALIAS="a.ext=b.ext;c=d": a host file named a.ext (any directory, case
  * ignored) is opened as b.ext from the same directory when that exists. run.py builds it from
- * GOW3_VOICE (inFAMOUS Second Son: English voices with another language's text). */
+ * ISSN_VOICE (inFAMOUS Second Son: English voices with another language's text). */
 static void apply_alias(char *path,size_t size) {
     static char spec[2048];
     static int loaded;
-    if (!loaded) { const char *e=getenv("GOW3_FILE_ALIAS"); snprintf(spec,sizeof(spec),"%s",e ? e : ""); loaded=1; }
+    if (!loaded) { const char *e=getenv("ISSN_FILE_ALIAS"); snprintf(spec,sizeof(spec),"%s",e ? e : ""); loaded=1; }
     if (!spec[0]) return;
     char *base=path+strlen(path);
     while (base>path && base[-1]!='/' && base[-1]!='\\') --base;
@@ -279,7 +279,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     ++opens;
     pthread_mutex_unlock(&lock);
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
-    const char *mod_trace=getenv("GOW3_MOD_TRACE"), *mod_root=getenv("GOW3_MODS_DIR");
+    const char *mod_trace=getenv("ISSN_MOD_TRACE"), *mod_root=getenv("ISSN_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
         char actual[PATH_MAX],root[PATH_MAX];
         static unsigned traced;
@@ -330,8 +330,8 @@ static int64_t bounce_read(int h,void *buffer,uint64_t size,int64_t offset) {
         const uint64_t chunk=size-done<BOUNCE_SIZE ? size-done : BOUNCE_SIZE;
         const ssize_t n=offset<0 ? host_read(h,bounce,chunk) : pread(h,bounce,chunk,offset+(int64_t)done);
         if (n<0) return done ? (int64_t)done : -errno;
-        /* issn: into GPU-modified memory without a fault (GOW3_WRITE_MERGE). */
-        if (n<64 || !gow3gpu_cpu_write((unsigned char *)buffer+done,bounce,-1,(uint64_t)n))
+        /* issn: into GPU-modified memory without a fault (ISSN_WRITE_MERGE). */
+        if (n<64 || !issngpu_cpu_write((unsigned char *)buffer+done,bounce,-1,(uint64_t)n))
             memcpy((unsigned char *)buffer+done,bounce,(size_t)n);
         done+=(uint64_t)n;
         if ((uint64_t)n<chunk) break; /* end of file */

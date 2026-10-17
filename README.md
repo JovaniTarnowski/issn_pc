@@ -23,7 +23,7 @@ python tools\issn\inspect_dump.py "D:\Jogos\CUSA00004"
 ## Base herdada
 
 A documentação original do port do God of War III (build, launcher, testes, créditos) está em
-[README.gow3.md](README.gow3.md). Créditos: deadinside28 (bloodborne_pc), Supermedo (Windows),
+[docs/base](docs/base/README.md). Créditos: deadinside28 (bloodborne_pc), Supermedo (Windows),
 Felipe Prado (gow3_pc), cuesta4 e a equipe do shadPS4.
 
 ## Licença

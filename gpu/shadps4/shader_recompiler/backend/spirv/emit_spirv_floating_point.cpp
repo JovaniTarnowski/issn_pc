@@ -150,7 +150,7 @@ Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
     if (Common::Backports::On(Common::Backports::Id::SaturateNan)) {
-        // gow3: BP05 (shadPS4 #5257): NaN saturates to 0 like HLSL/DX10_CLAMP (FClamp is
+        // port: BP05 (shadPS4 #5257): NaN saturates to 0 like HLSL/DX10_CLAMP (FClamp is
         // undefined for NaN). NClamp(x, lo, hi) == NMin(NMax(x, lo), hi).
         Common::Backports::Hit(Common::Backports::Id::SaturateNan);
         return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);

@@ -21,10 +21,10 @@ class GameProfileTests(unittest.TestCase):
             for title in ('CUSA00004', 'CUSA00223'):
                 found, env = game_profiles.environment(game(tmp, title), {})
                 self.assertEqual(found, title)
-                self.assertEqual(env['GOW3_READBACKS'], '2')
-                self.assertEqual(env['GOW3_COMPUTE_PRIORITY'], '1')
+                self.assertEqual(env['ISSN_READBACKS'], '2')
+                self.assertEqual(env['ISSN_COMPUTE_PRIORITY'], '1')
                 # The fence addresses are the EU 01.00 eboot's.
-                self.assertEqual('GOW3_WATCHDOG_PEEK' in env, title == 'CUSA00004')
+                self.assertEqual('ISSN_WATCHDOG_PEEK' in env, title == 'CUSA00004')
 
     def test_other_games_get_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -33,9 +33,9 @@ class GameProfileTests(unittest.TestCase):
     def test_explicit_values_and_opt_out_win(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = game(tmp, 'CUSA00004')
-            self.assertNotIn('GOW3_READBACKS',
-                             game_profiles.environment(folder, {'GOW3_READBACKS': '0'})[1])
-            self.assertEqual(game_profiles.environment(folder, {'GOW3_GAME_PROFILE': '0'})[1], {})
+            self.assertNotIn('ISSN_READBACKS',
+                             game_profiles.environment(folder, {'ISSN_READBACKS': '0'})[1])
+            self.assertEqual(game_profiles.environment(folder, {'ISSN_GAME_PROFILE': '0'})[1], {})
 
     def test_missing_sfo(self):
         with tempfile.TemporaryDirectory() as tmp:

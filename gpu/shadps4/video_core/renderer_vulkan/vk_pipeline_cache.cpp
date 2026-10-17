@@ -17,8 +17,8 @@
 #include <thread>
 #include <xxhash.h>
 #include "common/backports.h"
-#include "gow3_threads.h"
-#include "gow3_region.h"
+#include "issn_threads.h"
+#include "issn_region.h"
 
 #include "common/elf_info.h"
 #include "common/hash.h"
@@ -32,8 +32,8 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/recompiler_toggles.h"
 #include "shader_recompiler/runtime_info.h"
-#include "gow3_settings.h"
-#include "gow3_toggles.h"
+#include "issn_settings.h"
+#include "issn_toggles.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -234,7 +234,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.gs.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         info.hw.gs.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         info.hw.gs.mode = regs.vgt_gs_mode.mode;
-        // gow3: RefreshGraphicsStages already skipped the draw when the copy shader has no
+        // port: RefreshGraphicsStages already skipped the draw when the copy shader has no
         // binary info yet; this only guards against it changing in between (no fatal stop).
         const auto params_vc = AmdGpu::TryGetParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc ? params_vc->code : std::span<const u32>{};
@@ -260,7 +260,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
-        // gow3: BP12 read once when the pipeline is built (the shader cache key has its salt).
+        // port: BP12 read once when the pipeline is built (the shader cache key has its salt).
         info.hw.fs.depth_before_shader =
             Common::Backports::On(Common::Backports::Id::ShadPS4Pr5264) &&
             regs.depth_shader_control.depth_before_shader;
@@ -328,7 +328,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.sw.vs.vertex_sgpr_offset = sel.draw_indirect_params.vertex_sgpr_offset;
         info.sw.vs.instance_sgpr_offset = sel.draw_indirect_params.instance_sgpr_offset;
-        // gow3: BP11 (shadPS4 #5348)
+        // port: BP11 (shadPS4 #5348)
         info.sw.vs.is_indirect = Common::Backports::On(Common::Backports::Id::FirstInstanceDouble) &&
                                  sel.draw_indirect_params.is_indirect;
         info.sw.vs.tess_emulated_primitive =
@@ -354,7 +354,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     return info;
 }
 
-// gow3: BP08 (Mrsuss b972798, 0xCydral bdb9769). The driver's own pipeline cache (the compiled
+// port: BP08 (Mrsuss b972798, 0xCydral bdb9769). The driver's own pipeline cache (the compiled
 // ISA behind every vkCreateGraphicsPipelines) is kept between sessions in
 // <cache>/driver-<serial>/vk_pipeline_cache_<vendor>_<device>_<pipelineCacheUUID>.vkc. The key
 // is in the file name, so a GPU or driver change finds no file and leaves the others alone:
@@ -440,7 +440,7 @@ bool PipelineCache::SaveDriverCache() {
     try {
         return SaveDriverCacheUnchecked();
     } catch (const std::exception& e) {
-        LOG_WARNING(Render_Vulkan, "gow3: driver pipeline cache save skipped: {}", e.what());
+        LOG_WARNING(Render_Vulkan, "port: driver pipeline cache save skipped: {}", e.what());
         return false;
     }
 }
@@ -485,13 +485,13 @@ bool PipelineCache::SaveDriverCacheUnchecked() {
     }
     if (!written || ec) {
         std::filesystem::remove(temp, ec);
-        LOG_ERROR(Render_Vulkan, "gow3: driver pipeline cache not written to {}", path.string());
+        LOG_ERROR(Render_Vulkan, "port: driver pipeline cache not written to {}", path.string());
         return false;
     }
     if (driver_saver) {
         driver_saver->saved_hash = hash;
     }
-    LOG_INFO(Render_Vulkan, "gow3: driver pipeline cache saved ({} bytes)", blob.size());
+    LOG_INFO(Render_Vulkan, "port: driver pipeline cache saved ({} bytes)", blob.size());
     return true;
 }
 
@@ -499,14 +499,14 @@ void PipelineCache::StartDriverCacheSaver() {
     // The process may end without destructors: the cache is also saved while the game runs.
     driver_saver = new DriverCacheSaver;
     driver_saver->thread = std::thread([this] {
-        Common::SetCurrentThreadName("gow3:DriverCacheSave");
+        Common::SetCurrentThreadName("port:DriverCacheSave");
         auto* saver = driver_saver;
         std::unique_lock lock{saver->mutex};
         while (!saver->stop) {
-            // gow3: GOW3_DRIVER_CACHE_SAVE_S (default 60, was 180): a crash loses at most this much of what
+            // port: ISSN_DRIVER_CACHE_SAVE_S (default 60, was 180): a crash loses at most this much of what
             // the driver learned.
             static const int save_seconds = [] {
-                const char* v = std::getenv("GOW3_DRIVER_CACHE_SAVE_S");
+                const char* v = std::getenv("ISSN_DRIVER_CACHE_SAVE_S");
                 return v && *v ? std::clamp(std::atoi(v), 10, 3600) : 60;
             }();
             if (saver->cv.wait_for(lock, std::chrono::seconds(save_seconds), [&] { return saver->stop; })) {
@@ -587,9 +587,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
-        // gow3: older NVIDIA (Pascal) has no barycentrics; GOW3_INTERP_INT_FIX=0/1 overrides.
+        // port: older NVIDIA (Pascal) has no barycentrics; ISSN_INTERP_INT_FIX=0/1 overrides.
         .needs_integer_interpolation_fix = [&] {
-            if (const char* env = std::getenv("GOW3_INTERP_INT_FIX")) {
+            if (const char* env = std::getenv("ISSN_INTERP_INT_FIX")) {
                 return env[0] == '1';
             }
             return !instance.IsFragmentShaderBarycentricSupported() &&
@@ -598,15 +598,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         // issn: compute synchronization for code that relies on the 64 invocations of a GCN
-        // wave running in lockstep. run.py turns GOW3_WAVE_MEMORY_BARRIERS on for inFAMOUS
+        // wave running in lockstep. run.py turns ISSN_WAVE_MEMORY_BARRIERS on for inFAMOUS
         // Second Son (scripts/game_profiles.py); both are part of the profile, so changing them
         // rebuilds the shader cache.
         .lds_barriers_multi_wave = [] {
-            const char* env = std::getenv("GOW3_LDS_BARRIERS_MULTI_WAVE");
+            const char* env = std::getenv("ISSN_LDS_BARRIERS_MULTI_WAVE");
             return env != nullptr && env[0] == '1';
         }(),
         .wave_memory_barriers = [] {
-            const char* env = std::getenv("GOW3_WAVE_MEMORY_BARRIERS");
+            const char* env = std::getenv("ISSN_WAVE_MEMORY_BARRIERS");
             return env != nullptr && env[0] == '1';
         }(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
@@ -617,7 +617,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .block1d_as_2d = AmdGpu::Block1DAs2D(),
         .bc_tiny_decode = AmdGpu::BcTinyDecode(),
     };
-    // gow3: the recompiler switches (ISS_ names arrive as GOW3_), one line each on stdout (the run
+    // port: the recompiler switches (ISS_ names arrive as ISSN_), one line each on stdout (the run
     // log keeps it; LOG_INFO is filtered out there), for A/B reports.
     Shader::Toggles::LogStates([](const char* name, bool on, const char* what) {
         std::printf("GPU: shader switch %s=%d (%s)\n", name, on ? 1 : 0, what);
@@ -626,7 +626,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     std::printf("GPU: host subgroup size %u, LDS barriers %s\n", profile.subgroup_size,
                 profile.needs_lds_barriers ? "on" : "off");
 
-    // gow3: BP08, start from the driver blob saved by an earlier session (same GPU and driver).
+    // port: BP08, start from the driver blob saved by an earlier session (same GPU and driver).
     std::vector<u8> driver_blob;
     if (Common::Backports::On(Common::Backports::Id::PipelineCacheBlob)) {
         driver_blob = LoadDriverCacheBlob(instance);
@@ -652,25 +652,25 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Common::Backports::Hit(Common::Backports::Id::PipelineCacheBlob);
         }
     }
-    // gow3: the compiler threads always exist; the in-game menu switches async compilation live
-    // (Gow3Settings::async_shaders, GOW3_ASYNC_SHADERS at start).
+    // port: the compiler threads always exist; the in-game menu switches async compilation live
+    // (IssnSettings::async_shaders, ISSN_ASYNC_SHADERS at start).
     {
-        const auto count = std::clamp(Gow3Threads::Available() / 2, 1u, 6u);
-        const auto capture_count = std::min(2u, std::max(1u, Gow3Threads::Available() / 4));
+        const auto count = std::clamp(IssnThreads::Available() / 2, 1u, 6u);
+        const auto capture_count = std::min(2u, std::max(1u, IssnThreads::Available() / 4));
         for (unsigned i = 0; i < count; ++i) {
             auto [result, worker_cache] = instance.GetDevice().createPipelineCacheUnique({});
             ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create compiler pipeline cache");
             worker_pipeline_caches.push_back(std::move(worker_cache));
         }
         capture_compiler = std::make_unique<AsyncCompiler>(capture_count, 8, [](unsigned index) {
-            Common::SetCurrentThreadName(("gow3:ShaderCapture" + std::to_string(index)).c_str());
+            Common::SetCurrentThreadName(("port:ShaderCapture" + std::to_string(index)).c_str());
             Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         });
         compiler = std::make_unique<AsyncCompiler>(count, 64, [](unsigned index) {
-            Common::SetCurrentThreadName(("gow3:ShaderCompile" + std::to_string(index)).c_str());
+            Common::SetCurrentThreadName(("port:ShaderCompile" + std::to_string(index)).c_str());
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         });
-        LOG_INFO(Render_Vulkan, "gow3: async graphics compilation ready ({} capture, {} compile workers)",
+        LOG_INFO(Render_Vulkan, "port: async graphics compilation ready ({} capture, {} compile workers)",
                  capture_count, count);
     }
 }
@@ -686,13 +686,13 @@ PipelineCache::~PipelineCache() {
     }
 }
 
-// gow3: shader/pipeline compile time on the GPU thread, reported by GOW3_FRAME_STATS.
-std::atomic<u64> g_gow3_compile_ns;
-std::atomic<u32> g_gow3_compiles;
-std::atomic<u64> g_gow3_capture_ns, g_gow3_async_ns, g_gow3_compile_wait_ns;
-std::atomic<u64> g_gow3_snapshot_ns, g_gow3_guest_wait_ns;
-std::atomic<u32> g_gow3_pool_reuses;
-std::atomic<u32> g_gow3_pending_draws;
+// port: shader/pipeline compile time on the GPU thread, reported by ISSN_FRAME_STATS.
+std::atomic<u64> g_issn_compile_ns;
+std::atomic<u32> g_issn_compiles;
+std::atomic<u64> g_issn_capture_ns, g_issn_async_ns, g_issn_compile_wait_ns;
+std::atomic<u64> g_issn_snapshot_ns, g_issn_guest_wait_ns;
+std::atomic<u32> g_issn_pool_reuses;
+std::atomic<u32> g_issn_pending_draws;
 namespace {
 struct PhaseTimer {
     std::atomic<u64>& counter;
@@ -711,10 +711,10 @@ struct PhaseTimer {
 struct CompileTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~CompileTimer() {
-        g_gow3_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        g_issn_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count());
-        ++g_gow3_compiles;
+        ++g_issn_compiles;
     }
 };
 } // namespace
@@ -728,7 +728,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
     if (!compiler->HasCapacity()) {
         return false;
     }
-    PhaseTimer snapshot{g_gow3_snapshot_ns};
+    PhaseTimer snapshot{g_issn_snapshot_ns};
     auto build = std::make_shared<AsyncShaderCompilation>();
     build->device = instance.GetDevice();
     build->code.assign(params.code.begin(), params.code.end());
@@ -748,16 +748,16 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
     }
     build->pool_cache = &compiler_pools;
     snapshot.Stop();
-    // gow3: the GPU thread waits until all guest reads and specialization are captured.
+    // port: the GPU thread waits until all guest reads and specialization are captured.
     const auto capture_work = [this, build, binding] {
         if (!build->pools) {
             auto [pools, reused] = compiler_pools.Acquire();
             build->pools = std::move(pools);
             if (reused) {
-                ++g_gow3_pool_reuses;
+                ++g_issn_pool_reuses;
             }
         }
-        // gow3: the GPU thread waits until all guest reads and specialization are captured.
+        // port: the GPU thread waits until all guest reads and specialization are captured.
         // The key keeps the runtime info as the lookup builds it: translation adjusts it
         // (InjectClipDistanceAttributes adds a fragment input), and a key made after that never
         // matches again, so every draw queued a new permutation (inFAMOUS: 32768 of one shader).
@@ -767,7 +767,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         build->spec = Shader::StageSpecialization(build->info, lookup_runtime, profile, binding);
         build->fetch.Capture(build->info);
     };
-    // gow3: the capture worker reads guest memory (fetch shader, resource descriptors). A page
+    // port: the capture worker reads guest memory (fetch shader, resource descriptors). A page
     // the GPU wrote is protected under precise readbacks, and its readback needs this (the GPU
     // command) thread, which is waiting here: the worker gives up on such a fault
     // (runtime_fault_recover) and the capture runs again on this thread, where the readback
@@ -775,7 +775,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
     auto faulted = std::make_shared<std::atomic<bool>>(false);
     AsyncJob<bool> capture_job;
     if (!capture_job.Start(*capture_compiler, [capture_work, faulted] {
-        PhaseTimer capture{g_gow3_capture_ns};
+        PhaseTimer capture{g_issn_capture_ns};
         sigjmp_buf recover;
         if (sigsetjmp(recover, 0)) {
             runtime_fault_recover = nullptr;
@@ -795,7 +795,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         return false;
     }
     {
-        PhaseTimer waiting{g_gow3_guest_wait_ns};
+        PhaseTimer waiting{g_issn_guest_wait_ns};
         capture_job.Wait();
     }
     const auto mark_failed = [&](const std::string& error) {
@@ -805,11 +805,11 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
             specialization->info = &program.info;
             program.failed_permutations.push_back(std::move(*specialization));
         }
-        LOG_ERROR(Render_Vulkan, "gow3: shader {:#x}/{} capture failed: {}", params.hash,
+        LOG_ERROR(Render_Vulkan, "port: shader {:#x}/{} capture failed: {}", params.hash,
                   permutation, error);
     };
     if (faulted->load(std::memory_order_acquire)) {
-        PhaseTimer capture{g_gow3_capture_ns};
+        PhaseTimer capture{g_issn_capture_ns};
         build->ir.reset();
         try {
             capture_work();
@@ -822,7 +822,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         return false;
     }
     const bool queued = build->job.Start(*compiler, [this, build] {
-        PhaseTimer compile{g_gow3_async_ns};
+        PhaseTimer compile{g_issn_async_ns};
         Shader::Gcn::ScopedFetchShaderSnapshot snapshot{build->fetch};
         auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, build->runtime, *build->ir,
                                                     build->binding);
@@ -867,7 +867,7 @@ void PipelineCache::PublishShaders(bool wait) {
                     program->failed_permutations.push_back(std::move(build->spec));
                 }
                 program->pending.reset();
-                LOG_ERROR(Render_Vulkan, "gow3: shader {:#x}/{} compilation failed: {}", hash,
+                LOG_ERROR(Render_Vulkan, "port: shader {:#x}/{} compilation failed: {}", hash,
                           build->permutation, build->job.Error());
                 retire();
             } else {
@@ -907,7 +907,7 @@ void PipelineCache::PublishGraphics(bool wait) {
         auto result = build->job.Poll();
         if (!result) {
             if (build->job.Failed() && !build->failure_logged) {
-                LOG_ERROR(Render_Vulkan, "gow3: pipeline {:#x} compilation failed: {}",
+                LOG_ERROR(Render_Vulkan, "port: pipeline {:#x} compilation failed: {}",
                           std::hash<GraphicsPipelineKey>{}(it.key()), build->job.Error());
                 build->failure_logged = true;
             }
@@ -935,13 +935,13 @@ void PipelineCache::FinishCompilations() {
         }
         const auto result = instance.GetDevice().mergePipelineCaches(*pipeline_cache, sources);
         if (result != vk::Result::eSuccess) {
-            LOG_ERROR(Render_Vulkan, "gow3: compiler cache merge failed: {}", vk::to_string(result));
+            LOG_ERROR(Render_Vulkan, "port: compiler cache merge failed: {}", vk::to_string(result));
         }
     }
 }
 
 bool PipelineCache::AsyncCompilation() const {
-    return compiler && Gow3Settings::Get().async_shaders.load(std::memory_order_relaxed);
+    return compiler && IssnSettings::Get().async_shaders.load(std::memory_order_relaxed);
 }
 
 void PipelineCache::SeedWorkerCaches() {
@@ -961,7 +961,7 @@ void PipelineCache::ReportCompilerStats() {
                     "%.1f ms, compile %.1f ms; pools retained %zu, reused %u\n",
                     capture_compiler->Depth(), compiler->Depth(),
                     capture_compiler->QueueWaitNs() / 1e6, compiler->QueueWaitNs() / 1e6,
-                    compiler_pools.Retained(), g_gow3_pool_reuses.exchange(0));
+                    compiler_pools.Retained(), g_issn_pool_reuses.exchange(0));
     }
 }
 
@@ -1008,8 +1008,8 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
 }
 
 
-// gow3: BP07 (bbport 10baf9d). The async path above skips every draw whose pipeline or shader is
-// still being compiled. With GOW3_BP07=1 only draws of a pass drawn every frame in a busy frame,
+// port: BP07 (bbport 10baf9d). The async path above skips every draw whose pipeline or shader is
+// still being compiled. With ISSN_BP07=1 only draws of a pass drawn every frame in a busy frame,
 // with geometry of a few triangles or more and direct, may go without; the rest (small and
 // full-screen passes, indirect draws, frames with fewer than 300 draws, targets drawn to for
 // fewer than 8 frames in a row) compile now, shaders included, on the GPU thread.
@@ -1049,7 +1049,7 @@ u64 Bp07DrawTarget(const AmdGpu::Regs& regs) {
 /// Counts the draw and classifies it; the result stays in bp07.current.
 Bp07Reason Bp07Classify(const AmdGpu::Regs& regs, bool indirect) {
     auto& st = bp07;
-    const u64 frame = Gow3Stats::gpu_frames.load(std::memory_order_relaxed);
+    const u64 frame = IssnStats::gpu_frames.load(std::memory_order_relaxed);
     if (frame != st.frame_seen) {
         st.last_frame_draws = st.draws_this_frame;
         st.draws_this_frame = 0;
@@ -1118,7 +1118,7 @@ void Bp07Tally(bool compiled_now) {
 }
 } // namespace
 
-// gow3: GOW3_ASYNC_WAIT_MS=N (default 0 = off), GOW3_ASYNC_WAIT_FRAME_MS=M (default 8). A draw whose
+// port: ISSN_ASYNC_WAIT_MS=N (default 0 = off), ISSN_ASYNC_WAIT_FRAME_MS=M (default 8). A draw whose
 // shader or pipeline is still compiling in the background is skipped. With N > 0 it first waits
 // for the compile up to N ms, and the waits of one GPU frame add up to at most M ms: a short
 // compile then costs a few milliseconds instead of a missing ground or effect, a long one is
@@ -1135,10 +1135,10 @@ struct AsyncWaitBudget {
     std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 
     AsyncWaitBudget() {
-        if (const char* v = std::getenv("GOW3_ASYNC_WAIT_MS"); v && *v) {
+        if (const char* v = std::getenv("ISSN_ASYNC_WAIT_MS"); v && *v) {
             per_draw = std::chrono::milliseconds(std::clamp(std::atoi(v), 0, 100));
         }
-        if (const char* v = std::getenv("GOW3_ASYNC_WAIT_FRAME_MS"); v && *v) {
+        if (const char* v = std::getenv("ISSN_ASYNC_WAIT_FRAME_MS"); v && *v) {
             per_frame = std::chrono::milliseconds(std::clamp(std::atoi(v), 0, 100));
         }
     }
@@ -1146,7 +1146,7 @@ struct AsyncWaitBudget {
 
     /// How long this draw may wait now (zero: none left in this frame).
     std::chrono::nanoseconds Allowance() {
-        const u64 now_frame = Gow3Stats::gpu_frames.load(std::memory_order_relaxed);
+        const u64 now_frame = IssnStats::gpu_frames.load(std::memory_order_relaxed);
         if (now_frame != frame) {
             frame = now_frame;
             used = std::chrono::nanoseconds{0};
@@ -1185,7 +1185,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     PublishGraphics();
     PumpWarmUp();
     used_prepared = nullptr;
-    // gow3: BP07, classified per draw (also those a prepared pipeline serves, for the frame's draws).
+    // port: BP07, classified per draw (also those a prepared pipeline serves, for the frame's draws).
     const bool bp07 = Common::Backports::On(Common::Backports::Id::AsyncSkippable);
     sel.sync_compile = false;
     if (bp07) {
@@ -1194,22 +1194,22 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (prepared) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
             used_prepared = prepared;
-            Gow3Region::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(prepared->key), true);
+            IssnRegion::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(prepared->key), true);
             return pipeline;
         }
     }
     sel.draw_indirect_params = params;
     if (!RefreshGraphicsKey(sel)) {
         if (sel.compilation_pending) {
-            ++g_gow3_pending_draws;
+            ++g_issn_pending_draws;
             if (bp07 && !sel.sync_compile) {
                 Bp07Tally(false); // a draw classified skippable
             }
         }
         return nullptr;
     }
-    // gow3: region trace (GOW3_REGION_TRACE=1): the first request of each pipeline.
-    Gow3Region::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(sel.graphics_key),
+    // port: region trace (ISSN_REGION_TRACE=1): the first request of each pipeline.
+    IssnRegion::NotePipeline('g', std::hash<GraphicsPipelineKey>{}(sel.graphics_key),
                             graphics_pipelines.contains(sel.graphics_key));
     if (AsyncCompilation() && !sel.regs->stage_enable.hs_en && !EmulatorSettings.IsShaderCollect()) {
         const auto found = graphics_pipelines.find(sel.graphics_key);
@@ -1217,12 +1217,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return found->second.get();
         }
         if (sel.sync_compile) {
-            // gow3: BP07: this draw does not go without. Wait for the worker building the
+            // port: BP07: this draw does not go without. Wait for the worker building the
             // pipeline, else fall through to the compile below on this thread.
             Bp07Tally(true);
             if (const auto pending = pending_graphics.find(sel.graphics_key);
                 pending != pending_graphics.end()) {
-                PhaseTimer waiting{g_gow3_compile_wait_ns};
+                PhaseTimer waiting{g_issn_compile_wait_ns};
                 pending.value()->job.Wait();
                 waiting.Stop();
                 PublishGraphics();
@@ -1234,7 +1234,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             goto compile_now;
         }
         if (!pending_graphics.contains(sel.graphics_key) && compiler->HasCapacity()) {
-            PhaseTimer capture{g_gow3_snapshot_ns};
+            PhaseTimer capture{g_issn_snapshot_ns};
             auto build = std::make_shared<AsyncGraphicsCompilation>();
             build->selection = sel;
             build->selection.regs = nullptr;
@@ -1251,7 +1251,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             const bool queued = build->job.Start(*compiler, [this, build] {
                 // Only the vertex stage uses fetch-shader guest pointers during pipeline construction.
                 Shader::Gcn::ScopedFetchShaderSnapshot snapshot{build->fetch[u32(SwStage::Vertex)]};
-                PhaseTimer compile{g_gow3_async_ns};
+                PhaseTimer compile{g_issn_async_ns};
                 auto& s = build->selection;
                 build->pipeline = std::make_unique<GraphicsPipeline>(
                     instance, scheduler, desc_heap, profile, s.graphics_key,
@@ -1263,7 +1263,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 pending_graphics.emplace(sel.graphics_key, std::move(build));
             }
         }
-        // gow3: GOW3_ASYNC_WAIT_MS: give the background compile a few milliseconds before the draw goes.
+        // port: ISSN_ASYNC_WAIT_MS: give the background compile a few milliseconds before the draw goes.
         if (async_wait.Enabled()) {
             if (const auto building = pending_graphics.find(sel.graphics_key);
                 building != pending_graphics.end()) {
@@ -1281,7 +1281,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
-        ++g_gow3_pending_draws;
+        ++g_issn_pending_draws;
         if (bp07) {
             Bp07Tally(false);
         }
@@ -1323,7 +1323,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    Gow3Region::NotePipeline('c', std::hash<ComputePipelineKey>{}(compute_key),
+    IssnRegion::NotePipeline('c', std::hash<ComputePipelineKey>{}(compute_key),
                             compute_pipelines.contains(compute_key));
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
@@ -1332,7 +1332,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
-        // gow3: built on the compiler threads when the driver hasn't cached it (the dispatch
+        // port: built on the compiler threads when the driver hasn't cached it (the dispatch
         // binds it once built, vk_compute_pipeline.cpp). Not while collecting shaders: their
         // pipelines are erased on a reload, with a build perhaps still running.
         const ComputeBuilder builder{compiler.get(), worker_pipeline_caches};
@@ -1359,7 +1359,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
 
-    // gow3: a depth/stencil buffer that cannot affect the draw is not attached: on the PC a
+    // port: a depth/stencil buffer that cannot affect the draw is not attached: on the PC a
     // smaller one would crop a full-screen pass (eltutz, vk_depth_stencil_state.h).
     const bool db_enabled = GetEffectiveDepthStencilState(regs).needs_attachment;
 
@@ -1439,10 +1439,10 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
                 }
             }
         }
-        // GOW3_MOTION_SELECT_LOG=1: each G-buffer vertex shader once, with its buffer sizes
+        // ISSN_MOTION_SELECT_LOG=1: each G-buffer vertex shader once, with its buffer sizes
         // and the selection, to find animated models that the size rule leaves out.
         static const bool select_log = [] {
-            const char* value = std::getenv("GOW3_MOTION_SELECT_LOG");
+            const char* value = std::getenv("ISSN_MOTION_SELECT_LOG");
             return value && value[0] == '1';
         }();
         if (select_log && vs) {
@@ -1463,7 +1463,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
         // Keep the old broad path available for visual A/B tests.
         static const bool all_motion = [] {
-            const char* value = std::getenv("GOW3_OBJECT_MOTION_ALL");
+            const char* value = std::getenv("ISSN_OBJECT_MOTION_ALL");
             return value && value[0] == '1';
         }();
         if (all_motion) {
@@ -1555,7 +1555,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         }
 
         const auto found = AmdGpu::TryGetParams(*pgm);
-        // gow3: a geometry stage also needs its VS copy shader (BuildRuntimeInfo reads it).
+        // port: a geometry stage also needs its VS copy shader (BuildRuntimeInfo reads it).
         const bool copy_missing = stage_in == HwStage::Geometry &&
                                   (!regs.vs_program.Address<u32*>() ||
                                    !AmdGpu::TryGetParams(regs.vs_program));
@@ -1589,7 +1589,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 
     const auto* fs_info = sel.infos[static_cast<u32>(SwStage::Fragment)];
     if (!fs_info) {
-        // gow3: with no pixel shader, GraphicsPipeline adds the discard fragment shader from this
+        // port: with no pixel shader, GraphicsPipeline adds the discard fragment shader from this
         // runtime info. It used to keep the previous draw's, so a pipeline got the discard shader
         // (or lost it) depending on the draw before it (NVIDIA clip distance emulation).
         auto& fs_runtime = sel.runtime_infos[static_cast<u32>(SwStage::Fragment)];
@@ -1785,7 +1785,7 @@ void Program::LogPermutationGrowth() const {
     if (n < 16 || (n & (n - 1))) {
         return;
     }
-    LOG_WARNING(Render_Vulkan, "gow3: shader {:#x} (hw stage {}) has {} permutations; last two differ in: {}",
+    LOG_WARNING(Render_Vulkan, "port: shader {:#x} (hw stage {}) has {} permutations; last two differ in: {}",
                 info.pgm_hash, static_cast<int>(info.hw_stage), n,
                 DescribeSpecDiff(modules[n - 2].spec, modules[n - 1].spec));
 }
@@ -1800,7 +1800,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
     if (sel.worker) {
-        // gow3: draw-preparation worker: look up only, with the worker's own Info copy.
+        // port: draw-preparation worker: look up only, with the worker's own Info copy.
         auto& worker = *sel.worker;
         std::shared_lock lk{programs_mutex};
         const auto found_program = program_cache.find(params.hash);
@@ -1839,7 +1839,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                HashCombine(params.hash, perm_idx));
     }
 
-    // gow3: GOW3_ASYNC_WAIT_MS: before the draw goes for lack of its shader, give the background
+    // port: ISSN_ASYNC_WAIT_MS: before the draw goes for lack of its shader, give the background
     // translation a few milliseconds. True when the shader is ready and the lookup should run again.
     const auto wait_for_shader = [this](const Program& program) {
         if (!async_wait.Enabled() || !program.pending) {
@@ -1863,10 +1863,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     const bool compile_async = AsyncCompilation() && hw_stage != HwStage::Compute &&
                                !sel.regs->stage_enable.hs_en &&
                                !EmulatorSettings.IsShaderCollect() &&
-                               !sel.sync_compile; // gow3: BP07 draws compile their shaders now
+                               !sel.sync_compile; // port: BP07 draws compile their shaders now
     if (!compile_async && it_pgm != program_cache.end() && it_pgm->second->pending) {
         {
-            PhaseTimer waiting{g_gow3_compile_wait_ns};
+            PhaseTimer waiting{g_issn_compile_wait_ns};
             it_pgm->second->pending->job.Wait();
         }
         PublishShaders();
@@ -1900,8 +1900,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             module = CompileModule(new_program->info, compile_runtime, params.code, first_idx,
                                    binding);
         } catch (const Shader::UnsupportedShaderError& e) {
-            // gow3: kept in the cache as failed, so its draws are skipped without retranslating.
-            LOG_ERROR(Render_Vulkan, "gow3: shader {:#x} refused: {}", params.hash, e.what());
+            // port: kept in the cache as failed, so its draws are skipped without retranslating.
+            LOG_ERROR(Render_Vulkan, "port: shader {:#x} refused: {}", params.hash, e.what());
             new_program->compilation_failed = true;
             std::unique_lock lk{programs_mutex};
             program_cache.emplace(params.hash, std::move(new_program));
@@ -1950,15 +1950,15 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     // tlg (i3-pc 0120115): the specialization depends only on the flattened user data (which holds
     // every register, so the fetch shader address too), the runtime info, the first bindings and,
     // for a vertex shader, the vertex buffer descriptors its fetch shader reads from guest memory.
-    // Tessellation stages also read constants from memory: never reused. GOW3_VARIANT_REUSE=1
+    // Tessellation stages also read constants from memory: never reused. ISSN_VARIANT_REUSE=1
     // turns this on; =check also builds the specialization on every hit and logs a mismatch.
     static const int reuse_mode = [] {
-        const char* value = std::getenv("GOW3_VARIANT_REUSE");
+        const char* value = std::getenv("ISSN_VARIANT_REUSE");
         return !value ? 0 : (std::string_view{value} == "check" ? 2 : (value[0] == '1' ? 1 : 0));
     }();
     static std::atomic<u64> reuse_hits{0}, reuse_misses{0}, reuse_mismatches{0};
     auto& last = program->last_match;
-    const bool reusable = reuse_mode != 0 && !Gow3Toggle::Disabled(Gow3Toggle::VariantReuse) &&
+    const bool reusable = reuse_mode != 0 && !IssnToggle::Disabled(IssnToggle::VariantReuse) &&
                           sw_stage != SwStage::TessellationControl &&
                           sw_stage != SwStage::TessellationEval;
     const auto vs_sharps_match = [&](bool store) {
@@ -1997,7 +1997,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             if (!(hit.spec == check)) {
                 if (reuse_mismatches.fetch_add(1) < 16) {
                     LOG_ERROR(Render_Vulkan,
-                              "gow3: variant reuse of shader {:#x} perm {} differs from a fresh "
+                              "port: variant reuse of shader {:#x} perm {} differs from a fresh "
                               "specialization: {}",
                               params.hash, last.perm_idx, DescribeSpecDiff(check, hit.spec));
                 }
@@ -2010,7 +2010,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                HashCombine(params.hash, last.perm_idx));
     }
     if (reusable && ((++reuse_misses) & 0xffff) == 0) {
-        LOG_INFO(Render_Vulkan, "gow3: variant reuse: {} hits, {} misses, {} mismatches",
+        LOG_INFO(Render_Vulkan, "port: variant reuse: {} hits, {} misses, {} mismatches",
                  reuse_hits.load(), reuse_misses.load(), reuse_mismatches.load());
     }
     const auto start_binding = binding;
@@ -2021,7 +2021,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
     vk::ShaderModule module{};
 
-    // gow3: consecutive draws of a program almost always use the same permutation.
+    // port: consecutive draws of a program almost always use the same permutation.
     auto it = program->last_used < program->modules.size() &&
                       program->modules[program->last_used].spec == spec
                   ? program->modules.begin() + program->last_used
@@ -2032,7 +2032,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     if (it == program->modules.end() && !program->modules.empty()) {
         const size_t n = program->modules.size();
         if (n >= 16 && !(n & (n - 1)) && !program->pending) {
-            LOG_WARNING(Render_Vulkan, "gow3: shader {:#x} lookup miss with {} permutations; vs last: {}",
+            LOG_WARNING(Render_Vulkan, "port: shader {:#x} lookup miss with {} permutations; vs last: {}",
                         params.hash, n, DescribeSpecDiff(spec, program->modules.back().spec));
         }
     }
@@ -2052,7 +2052,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         try {
             module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
         } catch (const Shader::UnsupportedShaderError& e) {
-            LOG_ERROR(Render_Vulkan, "gow3: shader {:#x}/{} refused: {}", params.hash, perm_idx,
+            LOG_ERROR(Render_Vulkan, "port: shader {:#x}/{} refused: {}", params.hash, perm_idx,
                       e.what());
             spec.info = &program->info;
             program->failed_permutations.push_back(std::move(spec));

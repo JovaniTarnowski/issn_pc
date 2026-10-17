@@ -43,24 +43,24 @@ até a primeira luta com poder de fumaça), com som, vídeo e controle, e salva.
 | 4 | Gráficos: trazer as correções do fork do Ayoub para `gpu/shadps4` | 🟡 correções de renderização feitas; desempenho depois | 3 |
 | 5 | Áudio, vídeos (Bink/AvPlayer), controle e saves | a fazer | 3 |
 | 6 | Prólogo jogável (critérios da Alpha) | a fazer | 4, 5 |
-| 7 | Identidade: renomear `gow3` → `issn`, launcher com a cara do Second Son | a fazer | 6 |
+| 7 | Identidade: renomear `issn` → `issn`, launcher com a cara do Second Son | a fazer | 6 |
 | 8 | Patches (60 FPS, resolução) e menu no jogo (cheats de poder e karma) | depois da Alpha | 6 |
 
 ### Etapa 1: o que o diagnóstico responde
 
 - O dump está completo e descriptografado?
 - Qual versão e região?
-- Quantas funções do sistema o jogo usa e quantas já existem no port (runtime do GOW3 +
+- Quantas funções do sistema o jogo usa e quantas já existem no port (runtime do ISSN +
   núcleo do shadPS4 + módulos que vêm no dump)?
 - **Lista das que faltam, por biblioteca.** É o mapa da etapa 3.
 
-### Etapa 3: método (o mesmo do GOW3)
+### Etapa 3: método (o mesmo do ISSN)
 
 1. Rodar `issn-probe --check-imports` e implementar o que estiver faltando, começando pelas
    bibliotecas que o jogo chama primeiro na inicialização (kernel, sysmodule, userservice).
 2. Rodar o jogo. A cada `STOP:` ou `Fault:` no `user/last_run.log`, implementar ou corrigir.
 3. Funções de serviços online (NP, trophies, PSN) entram como versões "vazias" que respondem
-   "offline" ou "ok", como o GOW3 fez em `runtime_services.c`.
+   "offline" ou "ok", como o ISSN fez em `runtime_services.c`.
 
 ### Etapa 3: o que o primeiro boot ensinou
 
@@ -73,7 +73,7 @@ resolvidas:
 | `libc.prx` antiga: relocação DTPMOD64 de um símbolo TLS que ela mesma exporta | `link_modules.py` aceita (é o bloco TLS do próprio módulo) |
 | `link_libc.py` (linker antigo, saída não usada) rejeitava símbolos de nome comum | `run.py` não o chama mais |
 | O ponteiro de thread (`mov r64, fs:[0]`) lido com 10 registradores, não só `rax` | reescrita das 16 formas (3.392 lugares) no Linux e no Windows |
-| Funções que o runtime implementa pelo nome só eram achadas se o GOW3 as importasse | `src/runtime_export_nids.inc` (gerado): NID#biblioteca de cada nome exportado |
+| Funções que o runtime implementa pelo nome só eram achadas se o ISSN as importasse | `src/runtime_export_nids.inc` (gerado): NID#biblioteca de cada nome exportado |
 | 17 funções sem implementação | event flags do kernel (de verdade, com teste de threads), PlayGo, HTTP/NetCtl offline, NP, DLC, SystemService |
 | Endereços de patch de um executável em 0x400000 | `patches.py` usa base 0 nesse caso; patch fora do executável é pulado, não fatal |
 
@@ -88,7 +88,7 @@ pontos no código dele (assinaturas).
 ### Etapa 4: o que já entrou (gráficos)
 
 O fork do Ayoub é **um commit** sobre o shadPS4 `2338a06` (30/09/2026), com ~14.700 linhas em 92
-arquivos, quase tudo desempenho. O shadPS4 do port está na base `b4e7ae7`, com as mudanças do GOW3.
+arquivos, quase tudo desempenho. O shadPS4 do port está na base `b4e7ae7`, com as mudanças do ISSN.
 Um merge de três vias completo dá 195 conflitos (os dois otimizaram as mesmas peças). Por isso
 entrou primeiro só o que muda a **imagem**:
 
@@ -96,7 +96,7 @@ entrou primeiro só o que muda a **imagem**:
 |---|---|---|
 | Multiplicação "legacy" em `V_MAC/V_MAD_LEGACY_F32` | Ayoub | 0 × ∞ = 0 como no PS4; sem isso, NaN (pixels pretos ou estourados) |
 | Atomics em imagens 1D | Ayoub | shaders de compute que contam em texturas 1D |
-| Barreiras de memória entre "waves" (`GOW3_WAVE_MEMORY_BARRIERS`) | Ayoub | compute shaders que contam com 64 threads em sincronia; ligado só para o Second Son (`scripts/game_profiles.py`) |
+| Barreiras de memória entre "waves" (`ISSN_WAVE_MEMORY_BARRIERS`) | Ayoub | compute shaders que contam com 64 threads em sincronia; ligado só para o Second Son (`scripts/game_profiles.py`) |
 | S# com campos inválidos → sampler padrão | shadPS4 `1a0f5be8` | evita sampler Vulkan inválido |
 | 7 correções de shader do shadPS4 oficial | shadPS4 | ver `gpu/VENDOR.txt` |
 | Patches do Ayoub com `OriginalHash` | Ayoub | qualidade dinâmica ×2, trava anti-congelamento, lista de luzes maior; resolução e FOV opcionais |
@@ -114,12 +114,12 @@ virtual do SDL):
 
 | Recurso | Como fica no PC |
 |---|---|
-| Touchpad (dedos e clique) | já vinha do port do GOW3: dedos reais do DS4/DualSense |
+| Touchpad (dedos e clique) | já vinha do port do ISSN: dedos reais do DS4/DualSense |
 | Sensores de movimento | acelerômetro (em G) e giroscópio (rad/s) do controle; orientação integrada do giroscópio; `scePadSetMotionSensorState` e `scePadResetOrientation` funcionam |
 | Chacoalhar (lata de spray) | tecla **G**, ou Share (Xbox Series) / Mute (DualSense); mapeável em Controles |
-| Light bar | a cor que o jogo pede vai para o controle (karma), só quando muda; `GOW3_LIGHTBAR=0` desliga |
+| Light bar | a cor que o jogo pede vai para o controle (karma), só quando muda; `ISSN_LIGHTBAR=0` desliga |
 
-A confirmar com o jogo: a unidade da aceleração (G, como no SDK; `GOW3_PAD_ACCEL_UNITS=ms2`
+A confirmar com o jogo: a unidade da aceleração (G, como no SDK; `ISSN_PAD_ACCEL_UNITS=ms2`
 passa m/s² como o shadPS4) e o eixo do chacoalhar que o jogo espera. Ainda não: alto-falante do
 controle (áudio no port PAD_SPK) e inclinar com o teclado.
 
@@ -127,8 +127,8 @@ controle (áudio no port PAD_SPK) e inclinar com o teclado.
 
 | Risco | Por que | Plano |
 |---|---|---|
-| Mundo aberto com streaming | O Second Son lê dados do disco o tempo todo; o GOW3 era mais linear. | Atenção a `runtime_file.c` e a I/O assíncrona. |
-| Mais bibliotecas do sistema | O jogo usa recursos do PS4 que o GOW3 não usava (touchpad, light bar, share, câmera). | O diagnóstico mede. Versões vazias primeiro. |
+| Mundo aberto com streaming | O Second Son lê dados do disco o tempo todo; o ISSN era mais linear. | Atenção a `runtime_file.c` e a I/O assíncrona. |
+| Mais bibliotecas do sistema | O jogo usa recursos do PS4 que o ISSN não usava (touchpad, light bar, share, câmera). | O diagnóstico mede. Versões vazias primeiro. |
 | Gráficos | A versão principal do shadPS4 tem glitches e crashes no Second Son. | Portar as correções do fork do Ayoub, que já roda o jogo inteiro. |
 | CPU | O fork do Ayoub é descrito como pesado de CPU. | Medir; o caminho nativo deve ajudar. |
 

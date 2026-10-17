@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// gow3: two-stage draw pipeline (docs/parallel_gpu.md, "Two-stage draw pipeline").
+// port: two-stage draw pipeline (docs/parallel_gpu.md, "Two-stage draw pipeline").
 //
 // The GPU command thread (stage A) decodes PM4, keeps the register file and selects pipelines;
 // for a direct draw it writes a packet (the register blocks changed since the previous packet,
@@ -12,9 +12,9 @@
 #pragma once
 
 #include <cstdlib>
-#include "gow3_futex.h"
-#include "gow3_sampler.h"
-#include "gow3_threads.h"
+#include "issn_futex.h"
+#include "issn_sampler.h"
+#include "issn_threads.h"
 
 #include <array>
 #include <atomic>
@@ -45,7 +45,7 @@ public:
         thread.request_stop();
         published.fetch_add(0, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
-        Gow3Futex::WakeOne(wake);
+        IssnFutex::WakeOne(wake);
     }
 
     /// True on the draw recording thread.
@@ -86,7 +86,7 @@ public:
         ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
             wake.fetch_add(1, std::memory_order_seq_cst);
-            Gow3Futex::WakeOne(wake);
+            IssnFutex::WakeOne(wake);
         }
     }
 
@@ -159,8 +159,8 @@ private:
     }
 
     void Run(std::stop_token stop) {
-        Common::SetCurrentThreadName("gow3:DrawRec");
-        Gow3Sampler::RegisterThisThread("draw recorder");
+        Common::SetCurrentThreadName("port:DrawRec");
+        IssnSampler::RegisterThisThread("draw recorder");
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
         u64 at = 0;
@@ -170,12 +170,12 @@ private:
             u64 available = published.load(std::memory_order_acquire);
             if (available == at) {
                 // With few hardware threads (Steam Deck: 8) a long spin takes time from the
-                // game's own threads. GOW3_PIPE_SPIN_US overrides.
+                // game's own threads. ISSN_PIPE_SPIN_US overrides.
                 static const auto spin_time = std::chrono::microseconds([] {
-                    if (const char* env = std::getenv("GOW3_PIPE_SPIN_US")) {
+                    if (const char* env = std::getenv("ISSN_PIPE_SPIN_US")) {
                         return std::max(0, std::atoi(env));
                     }
-                    return Gow3Threads::Available() >= 12 ? 200 : 50;
+                    return IssnThreads::Available() >= 12 ? 200 : 50;
                 }());
                 const auto spin_until = std::chrono::steady_clock::now() + spin_time;
                 for (u32 spins = 1; available == at; ++spins) {
@@ -188,7 +188,7 @@ private:
                         sleeping.store(true, std::memory_order_seq_cst);
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
-                            Gow3Futex::Wait(wake, seen);
+                            IssnFutex::Wait(wake, seen);
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }

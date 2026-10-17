@@ -45,7 +45,7 @@ bool RetryPipelineCreation(vk::Result result, u32 attempt, std::string_view kind
     if (!may_recover || attempt >= MaxAttempts) {
         return false;
     }
-    LOG_WARNING(Render_Vulkan, "gow3: creating {} pipeline {} failed with {} (attempt {}), trying "
+    LOG_WARNING(Render_Vulkan, "port: creating {} pipeline {} failed with {} (attempt {}), trying "
                 "again", kind, name, vk::to_string(result), attempt);
     std::this_thread::sleep_for(std::chrono::milliseconds{100} * attempt);
     return true;
@@ -60,7 +60,7 @@ vk::Pipeline Pipeline::BuiltHandle() const {
     build->cv.wait(lock, [this] {
         return build->handle.load(std::memory_order_acquire) != VK_NULL_HANDLE;
     });
-    LOG_INFO(Render_Vulkan, "gow3: waited {:.1f} ms for compute pipeline {} being built",
+    LOG_INFO(Render_Vulkan, "port: waited {:.1f} ms for compute pipeline {} being built",
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                  .count(),
              GetDebugString());
@@ -147,7 +147,7 @@ std::string Pipeline::GetDebugString() const {
     return stage_desc;
 }
 
-// gow3: one histogram for every pipeline of the process, reported to last_run.log on news and
+// port: one histogram for every pipeline of the process, reported to last_run.log on news and
 // every 256 pipelines (vk_wave_stats.h). AMD reports width 0 for graphics executables, so on
 // AMD the key also carries the physical VGPR count from VK_AMD_shader_info (it differs between
 // wave32 and wave64), and the ISA of the first executables of each stage goes to

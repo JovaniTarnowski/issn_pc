@@ -12,7 +12,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 
-// libgow3gpu reports the runtime counters when its window closes; no runtime here.
+// libissngpu reports the runtime counters when its window closes; no runtime here.
 extern "C" void runtime_report(void) {}
 
 namespace {

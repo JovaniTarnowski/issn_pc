@@ -87,14 +87,14 @@ static ABI uint64_t process_time_counter(void) {
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
 /* The guest's TSC is the process clock in nanoseconds. The raw rdtsc differs per core on some
  * hosts (3.9 s apart on a Xeon E5-2680 v4, #42), so a thread moving cores made the game jump.
- * issn: GOW3_TSC=host (inFAMOUS Second Son's profile): the host's TSC and its frequency,
+ * issn: ISSN_TSC=host (inFAMOUS Second Son's profile): the host's TSC and its frequency,
  * measured at start. That game reads rdtsc itself (389 sites) and scales it with
  * sceKernelGetTscFrequency: with 1 GHz reported and a 3.6 GHz TSC its time ran 3.6x fast. */
 static int tsc_host;
 static uint64_t host_tsc_hz;
 static pthread_once_t tsc_once=PTHREAD_ONCE_INIT;
 static void tsc_init(void) {
-    const char *mode=getenv("GOW3_TSC");
+    const char *mode=getenv("ISSN_TSC");
     if (!mode || strcmp(mode,"host")) return;
     struct timespec a,b;
     clock_gettime(CLOCK_MONOTONIC,&a);

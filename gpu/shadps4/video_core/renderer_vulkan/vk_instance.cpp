@@ -15,11 +15,11 @@
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
-#include "video_core/amdgpu/gow3_amd_1d.h"
-#include "video_core/amdgpu/gow3_bc_tiny.h"
-#include "video_core/amdgpu/gow3_block1d.h"
-#include "video_core/amdgpu/gow3_msaa.h"
-#include "video_core/amdgpu/gow3_msaa_default.h"
+#include "video_core/amdgpu/issn_amd_1d.h"
+#include "video_core/amdgpu/issn_bc_tiny.h"
+#include "video_core/amdgpu/issn_block1d.h"
+#include "video_core/amdgpu/issn_msaa.h"
+#include "video_core/amdgpu/issn_msaa_default.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_amd_paths.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
@@ -122,13 +122,13 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
-    // gow3: the device list in the game log tells a missing driver apart from a wrong choice.
+    // port: the device list in the game log tells a missing driver apart from a wrong choice.
     for (std::size_t i = 0; i < num_physical_devices; ++i) {
         const auto props = physical_devices[i].getProperties();
         std::printf("GPU %zu: %s (%s)\n", i, props.deviceName.data(),
                     vk::to_string(props.deviceType).c_str());
     }
-    // gow3: a saved choice can outlive its GPU (removed card, new driver order).
+    // port: a saved choice can outlive its GPU (removed card, new driver order).
     if (physical_device_index >= static_cast<s32>(num_physical_devices)) {
         std::printf("GPU: selected GPU %d is not in the device list; choosing automatically\n",
                     physical_device_index);
@@ -230,7 +230,7 @@ std::string Instance::GetDriverVersionName() {
 
 namespace {
 bool PipelineBinaryCacheRequested() {
-    const char* setting = std::getenv("GOW3_PIPELINE_BINARIES");
+    const char* setting = std::getenv("ISSN_PIPELINE_BINARIES");
     return !setting || *setting != '0';
 }
 }
@@ -371,7 +371,7 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
                  list_restart_features.primitiveTopologyPatchListRestart);
     }
-    // gow3: GOW3_AMD_PATHS_OFF=shaderext leaves the AMD shader extensions out (vk_amd_paths.h).
+    // port: ISSN_AMD_PATHS_OFF=shaderext leaves the AMD shader extensions out (vk_amd_paths.h).
     const auto amd_paths_off = AmdPathsOff::Current();
     amd_shader_explicit_vertex_parameter =
         !amd_paths_off.shaderext &&
@@ -391,7 +391,7 @@ bool Instance::CreateDevice() {
     amd_shader_trinary_minmax =
         !amd_paths_off.shaderext && add_extension(VK_AMD_SHADER_TRINARY_MINMAX_EXTENSION_NAME);
     nv_framebuffer_mixed_samples = add_extension(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
-    // gow3: GOW3_AMD_PATHS_OFF=mixed forces equal colour and depth samples, as on Intel.
+    // port: ISSN_AMD_PATHS_OFF=mixed forces equal colour and depth samples, as on Intel.
     amd_mixed_attachment_samples =
         !amd_paths_off.mixed && add_extension(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
@@ -428,9 +428,9 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
-    // gow3: BP06 (SotC 8d84cf7). Detected at run time: the extension is listed and the feature
+    // port: BP06 (SotC 8d84cf7). Detected at run time: the extension is listed and the feature
     // reports true; only then is it enabled. Off by default, so the device is created exactly as
-    // before unless GOW3_BP06=1.
+    // before unless ISSN_BP06=1.
     maximal_reconvergence = false;
     if (Common::Backports::On(Common::Backports::Id::MaximalReconvergence) &&
         std::ranges::find(available_extensions, std::string{VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME}) !=
@@ -447,7 +447,7 @@ bool Instance::CreateDevice() {
         }
     }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    // gow3: from shadPS4-Infamous-FixBuild e35e04dc. Lets the driver move device memory out to
+    // port: from shadPS4-Infamous-FixBuild e35e04dc. Lets the driver move device memory out to
     // system memory instead of failing an allocation when the card is full.
     const bool memory_priority = add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
     const bool pageable_extension =
@@ -462,9 +462,9 @@ bool Instance::CreateDevice() {
                 .pageableDeviceLocalMemory;
         LOG_INFO(Render_Vulkan, "- pageableDeviceLocalMemory: {}", pageable_device_local_memory);
     }
-    // gow3: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
+    // port: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
-    // gow3: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
+    // port: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
     mixed_float_dot_product =
         feature_chain.get<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>()
             .shaderMixedFloatDotProductFloat16AccFloat32 &&
@@ -479,11 +479,11 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
-    // gow3: GOW3_WAVE_STATS=1 logs the subgroup width the driver compiled each pipeline stage
+    // port: ISSN_WAVE_STATS=1 logs the subgroup width the driver compiled each pipeline stage
     // at (vk_wave_stats.h). Off by default: the feature may change how the driver caches
     // pipelines.
     pipeline_executable_properties = [&] {
-        const char* env = std::getenv("GOW3_WAVE_STATS");
+        const char* env = std::getenv("ISSN_WAVE_STATS");
         return env && env[0] == '1' &&
                add_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }();
@@ -526,7 +526,7 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
-    // gow3: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
+    // port: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
     std::vector<const char*> dlss_extensions;
     if (Dlss* dlss = Dlss::Get()) {
         dlss->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
@@ -568,7 +568,7 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
-                // gow3: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
+                // port: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
                 .shaderStorageImageWriteWithoutFormat =
                     features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
@@ -601,7 +601,7 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
-            // gow3: compute pipelines met in game ask the driver for a cached one first.
+            // port: compute pipelines met in game ask the driver for a cached one first.
             .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
@@ -863,18 +863,18 @@ void Instance::CollectDeviceParameters() {
     driver_id = driver.driverID;
     vendor_name = driver.driverName.data();
 
-    // gow3: see video_core/amdgpu/gow3_msaa.h; the default per driver is gow3_msaa_default.h.
-    const char* no_msaa_env = std::getenv("GOW3_NO_MSAA");
+    // port: see video_core/amdgpu/issn_msaa.h; the default per driver is issn_msaa_default.h.
+    const char* no_msaa_env = std::getenv("ISSN_NO_MSAA");
     const bool no_msaa = no_msaa_env && *no_msaa_env
                              ? *no_msaa_env == '1'
-                             : gow3_no_msaa_default(static_cast<VkDriverId>(driver_id)) != 0;
+                             : issn_no_msaa_default(static_cast<VkDriverId>(driver_id)) != 0;
     AmdGpu::no_msaa.store(no_msaa, std::memory_order_relaxed);
     std::printf("GPU: guest multisampling %s\n",
-                no_msaa ? "off (single-sampled images; GOW3_NO_MSAA=0 keeps it)" : "on");
+                no_msaa ? "off (single-sampled images; ISSN_NO_MSAA=0 keeps it)" : "on");
 
-    // gow3: see video_core/amdgpu/gow3_block1d.h. The query uses the plainest usage the game's BC
+    // port: see video_core/amdgpu/issn_block1d.h. The query uses the plainest usage the game's BC
     // 1D textures need (sampled, filled by copies).
-    const char* block1d_env = std::getenv("GOW3_BLOCK1D");
+    const char* block1d_env = std::getenv("ISSN_BLOCK1D");
     const bool bc1d_refused =
         physical_device
             .getImageFormatProperties(vk::Format::eBc1RgbaUnormBlock, vk::ImageType::e1D,
@@ -888,21 +888,21 @@ void Instance::CollectDeviceParameters() {
     AmdGpu::block1d_as_2d.store(block1d_as_2d, std::memory_order_relaxed);
     if (bc1d_refused || block1d_as_2d) {
         std::printf("GPU: block-compressed 1D textures %s\n",
-                    block1d_as_2d ? "as 2D images (the driver refuses BC 1D; GOW3_BLOCK1D=0 keeps 1D)"
-                                  : "kept 1D although the driver refuses them (GOW3_BLOCK1D=1 makes them 2D)");
+                    block1d_as_2d ? "as 2D images (the driver refuses BC 1D; ISSN_BLOCK1D=0 keeps 1D)"
+                                  : "kept 1D although the driver refuses them (ISSN_BLOCK1D=1 makes them 2D)");
     }
 
-    // gow3: BP09 (CTR d26bcb2): every 1D image as 2D of height 1; read once, before any image or
+    // port: BP09 (CTR d26bcb2): every 1D image as 2D of height 1; read once, before any image or
     // shader exists, so the shaders and the images of a session agree.
     const bool all_1d_as_2d = Common::Backports::On(Common::Backports::Id::Image1DAs2D);
     AmdGpu::all_1d_as_2d.store(all_1d_as_2d, std::memory_order_relaxed);
     if (all_1d_as_2d) {
-        std::printf("GPU: every 1D texture as a 2D image of height 1 (GOW3_BP09=1)\n");
+        std::printf("GPU: every 1D texture as a 2D image of height 1 (ISSN_BP09=1)\n");
     }
 
-    // gow3: see video_core/amdgpu/gow3_bc_tiny.h. Set before any image or shader exists.
-    const char* bc_tiny_env = std::getenv("GOW3_BC_TINY");
-    // GOW3_BC_TINY=auto: also decode on any driver that refuses BC 1D and is not given the 2D
+    // port: see video_core/amdgpu/issn_bc_tiny.h. Set before any image or shader exists.
+    const char* bc_tiny_env = std::getenv("ISSN_BC_TINY");
+    // ISSN_BC_TINY=auto: also decode on any driver that refuses BC 1D and is not given the 2D
     // promotion (NVIDIA), so the driver never sees a block-compressed 1D image (test branch).
     const bool bc_tiny_auto = bc_tiny_env && std::string_view{bc_tiny_env} == "auto";
     const bool bc_tiny = bc_tiny_auto ? (bc1d_refused && !block1d_as_2d)
@@ -911,20 +911,20 @@ void Instance::CollectDeviceParameters() {
                              : false; // issn: off as tested (1D images are 2D here)
     AmdGpu::bc_tiny_decode.store(bc_tiny, std::memory_order_relaxed);
     std::printf("GPU: tiny block-compressed textures (BC1-BC5 1D, or under 4 texels) %s\n",
-                bc_tiny ? "decoded on the CPU to plain images, 1D kept 1D (GOW3_BC_TINY=0 keeps BC)"
-                        : "kept block-compressed (GOW3_BC_TINY=1 decodes them on the CPU)");
+                bc_tiny ? "decoded on the CPU to plain images, 1D kept 1D (ISSN_BC_TINY=0 keeps BC)"
+                        : "kept block-compressed (ISSN_BC_TINY=1 decodes them on the CPU)");
 
-    // gow3: see video_core/amdgpu/gow3_amd_1d.h. Set before any image exists.
+    // port: see video_core/amdgpu/issn_amd_1d.h. Set before any image exists.
     auto env_flag = [](const char* name, bool fallback) {
         const char* v = std::getenv(name);
         return v && *v ? *v == '1' : fallback;
     };
-    AmdGpu::img_trace.store(env_flag("GOW3_IMG_TRACE", false));
-    AmdGpu::img_1d_no_storage.store(env_flag("GOW3_1D_NO_STORAGE", false));
-    AmdGpu::img_1d_no_mutable.store(env_flag("GOW3_1D_NO_MUTABLE", false));
+    AmdGpu::img_trace.store(env_flag("ISSN_IMG_TRACE", false));
+    AmdGpu::img_1d_no_storage.store(env_flag("ISSN_1D_NO_STORAGE", false));
+    AmdGpu::img_1d_no_mutable.store(env_flag("ISSN_1D_NO_MUTABLE", false));
     if (AmdGpu::ImgTrace() || AmdGpu::img_1d_no_storage || AmdGpu::img_1d_no_mutable) {
         std::printf("GPU: 1D image switches: trace %d, no storage %d, no mutable %d "
-                    "(GOW3_IMG_TRACE, GOW3_1D_NO_STORAGE, GOW3_1D_NO_MUTABLE); driver %s\n",
+                    "(ISSN_IMG_TRACE, ISSN_1D_NO_STORAGE, ISSN_1D_NO_MUTABLE); driver %s\n",
                     AmdGpu::ImgTrace(), AmdGpu::img_1d_no_storage.load(),
                     AmdGpu::img_1d_no_mutable.load(), GetDriverVersionName().c_str());
     }

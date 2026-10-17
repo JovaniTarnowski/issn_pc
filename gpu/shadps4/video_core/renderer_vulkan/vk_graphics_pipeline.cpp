@@ -28,9 +28,9 @@ namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
 
-// gow3: where pipeline construction time goes (reported when the background warm-up ends).
-std::atomic<u64> g_gow3_pipeline_total_ns, g_gow3_pipeline_driver_ns;
-std::atomic<u32> g_gow3_pipelines_built;
+// port: where pipeline construction time goes (reported when the background warm-up ends).
+std::atomic<u64> g_issn_pipeline_total_ns, g_issn_pipeline_driver_ns;
+std::atomic<u32> g_issn_pipelines_built;
 namespace {
 using Clock = std::chrono::steady_clock;
 u64 NsSince(Clock::time_point start) {
@@ -104,9 +104,9 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
-    // gow3: GOW3_PIPELINE_LOG=1 lists every graphics pipeline built: primitive type, targets,
+    // port: ISSN_PIPELINE_LOG=1 lists every graphics pipeline built: primitive type, targets,
     // vertex formats and shader hashes (finding which pass draws a broken effect).
-    static const bool pipeline_log = std::getenv("GOW3_PIPELINE_LOG") != nullptr;
+    static const bool pipeline_log = std::getenv("ISSN_PIPELINE_LOG") != nullptr;
     if (pipeline_log) {
         std::string formats;
         for (const auto& attr : sdata.vertex_attributes) {
@@ -160,7 +160,7 @@ GraphicsPipeline::GraphicsPipeline(
         sdata.multisampling = {
             .rasterizationSamples = LiverpoolToVK::NumSamples(
                 key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
-            // gow3: GOW3_LIGHTING_TEST=shading keeps sample shading off (vk_lighting_test.h).
+            // port: ISSN_LIGHTING_TEST=shading keeps sample shading off (vk_lighting_test.h).
             .sampleShadingEnable = !LightingTest::Current().shading &&
                                    (fs_info.addr_flags.persp_sample_ena ||
                                     fs_info.addr_flags.linear_sample_ena),
@@ -270,7 +270,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (preloading ? !sdata.fragment.empty()
                           : runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
-        // gow3: a preloaded pipeline has no runtime infos; its .key carries the discard shader.
+        // port: a preloaded pipeline has no runtime infos; its .key carries the discard shader.
         if (!preloading) {
             const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
 
@@ -333,7 +333,7 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
-    // gow3: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
+    // port: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
     // MIN/MAX is drawn twice: native, then this pipeline squares the destination.
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
     bool needs_square_pass = false;
@@ -453,7 +453,7 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    // gow3: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
+    // port: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
     const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
     if (EmulatorSettings.IsDumpShaders()) {
         // issn: the driver may end the process while compiling: the last one named is the one.
@@ -483,8 +483,8 @@ GraphicsPipeline::GraphicsPipeline(
         square_pipeline = std::move(square);
         SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
     }
-    g_gow3_pipeline_total_ns += NsSince(started);
-    ++g_gow3_pipelines_built;
+    g_issn_pipeline_total_ns += NsSince(started);
+    ++g_issn_pipelines_built;
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;

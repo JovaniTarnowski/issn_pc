@@ -24,7 +24,7 @@ class Scheduler;
 class DescriptorHeap;
 class AsyncCompiler;
 
-/// gow3: compiler threads that build compute pipelines met in game (PipelineCache).
+/// port: compiler threads that build compute pipelines met in game (PipelineCache).
 struct ComputeBuilder {
     AsyncCompiler* compiler;
     std::span<const vk::UniquePipelineCache> caches; ///< one per compiler thread
@@ -60,12 +60,12 @@ public:
                     const ComputeBuilder* builder = nullptr);
     ~ComputePipeline();
 
-    /// gow3: on the GPU thread, replaces a pipeline built without optimizations by the optimized
+    /// port: on the GPU thread, replaces a pipeline built without optimizations by the optimized
     /// one once a compiler thread has it. The old one is destroyed once the GPU is past every
     /// command buffer that may bind it.
     void SwapInOptimized();
 
-    /// gow3: program hash and permutation (frame recorder).
+    /// port: program hash and permutation (frame recorder).
     const ComputePipelineKey& GetComputeKey() const {
         return compute_key;
     }

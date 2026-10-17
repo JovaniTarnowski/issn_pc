@@ -11,9 +11,9 @@
 #include <bit>
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
-#include "gow3_copy.h"
-#include "gow3_latency.h"
-#include "gow3_toggles.h"
+#include "issn_copy.h"
+#include "issn_latency.h"
+#include "issn_toggles.h"
 #include "common/alignment.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -68,15 +68,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
-    // gow3: GOW3_MAX_BUFFER_MB lowers the driver's buffer size limit as the arenas see it
+    // port: ISSN_MAX_BUFFER_MB lowers the driver's buffer size limit as the arenas see it
     // (diagnostics: reproduces AMD on Windows 2048, RADV 4095 on any GPU).
     u64 max_buffer = instance.GetMaxBufferSize();
-    if (const char* forced = std::getenv("GOW3_MAX_BUFFER_MB")) {
+    if (const char* forced = std::getenv("ISSN_MAX_BUFFER_MB")) {
         if (const u64 mb = std::strtoull(forced, nullptr, 10)) {
             max_buffer = std::min<u64>(max_buffer, mb << 20);
         }
     }
-    // gow3: with a limit under two full pages (AMD on Windows 2 GiB, RADV ~4 GiB, Intel), pages
+    // port: with a limit under two full pages (AMD on Windows 2 GiB, RADV ~4 GiB, Intel), pages
     // are the smallest size and an arena joins as many as the limit allows: one inFAMOUS request
     // of ~2.4 GiB (the cutscene before the graffiti) crossed three 1 GiB pages and stopped the
     // game ("cannot span more than two VA arena pages", iss_pc #18).
@@ -130,13 +130,13 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
-// gow3: the game fills its per-frame buffers (constants, skinning output) sequentially and
+// port: the game fills its per-frame buffers (constants, skinning output) sequentially and
 // every 4 KiB page cost a protection fault (~110k/s in the test scene, a fifth of each
 // render worker's time in the kernel). A fault unprotects the aligned window around it instead;
 // pages marked CPU-modified without being written only cost an upload when bound.
 // Item: context = BufferCache, source = guest address, destination = host pointer, size,
 // extra = the Buffer whose mapping holds the destination (flushed after the copy).
-void BufferCache::RunGuestCopy(const Gow3Copy::Item& item) {
+void BufferCache::RunGuestCopy(const IssnCopy::Item& item) {
     auto* cache = static_cast<BufferCache*>(item.context);
     auto* dst = reinterpret_cast<u8*>(item.destination);
     cache->memory->CopySparseMemory(item.source, dst, item.size);
@@ -146,27 +146,27 @@ void BufferCache::RunGuestCopy(const Gow3Copy::Item& item) {
 
 // Small guest copies run on the recording thread (it spins for work: no wakeup, and it is
 // idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
-void BufferCache::SmallGuestCopy(const Gow3Copy::Item& item) {
-    if (scheduler.IsRecordingDeferred() && !Gow3Toggle::Disabled(Gow3Toggle::PoolSmallCopies)) {
+void BufferCache::SmallGuestCopy(const IssnCopy::Item& item) {
+    if (scheduler.IsRecordingDeferred() && !IssnToggle::Disabled(IssnToggle::PoolSmallCopies)) {
         scheduler.RecordHostCopy([item] { item.run(item); });
         return;
     }
-    Gow3Copy::QueueCopy(item);
+    IssnCopy::QueueCopy(item);
 }
 
 void BufferCache::ExtendWriteFault(VAddr device_addr) {
     static const u64 window = [] {
-        const char* env = std::getenv("GOW3_FAULT_WINDOW");
+        const char* env = std::getenv("ISSN_FAULT_WINDOW");
         const u64 kib = env ? std::strtoull(env, nullptr, 10) : 256;
         return std::bit_ceil(std::clamp<u64>(kib, 4, 1024)) * 1024;
     }();
-    if (window <= TRACKER_BYTES_PER_PAGE || Gow3Toggle::Disabled(Gow3Toggle::FaultWindow)) {
+    if (window <= TRACKER_BYTES_PER_PAGE || IssnToggle::Disabled(IssnToggle::FaultWindow)) {
         return;
     }
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
-// gow3: GOW3_READBACK_STATS=1: every 5 s, how long CPU read/write faults that need GPU data spend
+// port: ISSN_READBACK_STATS=1: every 5 s, how long CPU read/write faults that need GPU data spend
 // waiting for the GPU command thread to reach them (queue) and inside the download (flush).
 namespace {
 struct ReadbackStats {
@@ -176,11 +176,11 @@ struct ReadbackStats {
     std::atomic<u64> deferred{0}, joined{0}, applied{0}, stale{0}, deferred_ns{0}, deferred_bytes{0};
     /// Eager copies: pages copied, used by a fault, gone stale unread, skipped for backoff.
     std::atomic<u64> eager_copied{0}, eager_used{0}, eager_stale{0}, eager_skipped{0};
-    /// Fast writes (GOW3_FAST_WRITE): taken, and their copies found unchanged, merged (the GPU
+    /// Fast writes (ISSN_FAST_WRITE): taken, and their copies found unchanged, merged (the GPU
     /// had changed the page), with the page GPU modified again by then, or read back since.
     std::atomic<u64> fast{0}, owed_same{0}, owed_merged{0}, owed_conflict{0}, owed_superseded{0},
         owed_dead{0}; ///< the GPU changed it, and the guest overwrote all of that
-    /// Fast reads (GOW3_FAST_READ): faults served, pages made readable, pages whose GPU bytes
+    /// Fast reads (ISSN_FAST_READ): faults served, pages made readable, pages whose GPU bytes
     /// differed when they arrived (the guest read them a little late).
     std::atomic<u64> fast_reads{0}, fast_read_pages{0}, fast_read_late{0};
     /// Write faults on GPU modified memory, and why the fast path passed: across pages, page
@@ -195,7 +195,7 @@ ReadbackStats& Readbacks() {
     return stats;
 }
 bool ReadbackStatsEnabled() {
-    static const bool enabled = [] { const char* e = std::getenv("GOW3_READBACK_STATS"); return e && *e == '1'; }();
+    static const bool enabled = [] { const char* e = std::getenv("ISSN_READBACK_STATS"); return e && *e == '1'; }();
     return enabled;
 }
 s64 NowNs() {
@@ -271,11 +271,11 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 
     // GPU-modified ranges come as many small scattered islands,
     // so the download is widened to a window around the request.
-    // gow3: GOW3_DOWNLOAD_WINDOW_KB sizes it (default 512). Each download waits for the GPU;
+    // port: ISSN_DOWNLOAD_WINDOW_KB sizes it (default 512). Each download waits for the GPU;
     // a game that writes records across megabytes the GPU also updates (inFAMOUS particles)
     // otherwise faults and waits once per window, many times per frame.
     static const u64 WindowSize = [] {
-        const char* e = std::getenv("GOW3_DOWNLOAD_WINDOW_KB");
+        const char* e = std::getenv("ISSN_DOWNLOAD_WINDOW_KB");
         const u64 kb = e && *e ? std::strtoull(e, nullptr, 10) : 512;
         return std::max<u64>(kb, 64) * 1024;
     }();
@@ -311,16 +311,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         // A GPU-side thread touched the memory itself: it has to wait for the GPU.
         flush_request();
-    } else if (DeferredReadbackEnabled() && !Gow3Toggle::Disabled(Gow3Toggle::DeferredReadback)) {
-        // gow3: the GPU command thread only records the copy and goes on with the game's
+    } else if (DeferredReadbackEnabled() && !IssnToggle::Disabled(IssnToggle::DeferredReadback)) {
+        // port: the GPU command thread only records the copy and goes on with the game's
         // commands; this thread waits for the copy, as it would for the GPU on a console.
         std::shared_ptr<DeferredReadback> readback;
-        const bool lat = Gow3Latency::Enabled();
-        const s64 lat_start = lat ? Gow3Latency::Now() : 0;
+        const bool lat = IssnLatency::Enabled();
+        const s64 lat_start = lat ? IssnLatency::Now() : 0;
         s64 lat_picked = 0;
         liverpool->SendCommand<true>([&] {
             if (lat) {
-                lat_picked = Gow3Latency::Now();
+                lat_picked = IssnLatency::Now();
             }
             readback = StartDeferredReadback(device_addr, size);
             if (!readback && is_write) {
@@ -329,14 +329,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             }
         });
         if (lat && readback) {
-            const s64 recorded = Gow3Latency::Now();
-            Gow3Latency::Add(Gow3Latency::ReadbackQueue, lat_picked - lat_start);
-            Gow3Latency::Add(Gow3Latency::ReadbackRecord, recorded - lat_picked);
+            const s64 recorded = IssnLatency::Now();
+            IssnLatency::Add(IssnLatency::ReadbackQueue, lat_picked - lat_start);
+            IssnLatency::Add(IssnLatency::ReadbackRecord, recorded - lat_picked);
             scheduler.GetWorkSemaphore()->Wait(readback->tick);
-            const s64 gpu_done = Gow3Latency::Now();
-            Gow3Latency::Add(Gow3Latency::ReadbackGpu, gpu_done - recorded);
+            const s64 gpu_done = IssnLatency::Now();
+            IssnLatency::Add(IssnLatency::ReadbackGpu, gpu_done - recorded);
             const bool ok = FinishDeferredReadback(*readback, true);
-            Gow3Latency::Add(Gow3Latency::ReadbackApply, Gow3Latency::Now() - gpu_done);
+            IssnLatency::Add(IssnLatency::ReadbackApply, IssnLatency::Now() - gpu_done);
             if (!ok) {
                 liverpool->SendCommand<true>(flush_request);
             } else if (is_write) {
@@ -430,7 +430,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             memory->TryWriteBacking(std::bit_cast<u8*>(dst_addr), src, copy.size);
             continue;
         }
-        // gow3: a fast write may have made a page writable since its bytes were collected
+        // port: a fast write may have made a page writable since its bytes were collected
         // (it unmarks the page under its region lock): the guest's bytes win there.
         for (VAddr at = dst_addr; at < dst_addr + copy.size;) {
             const VAddr page = Common::AlignDown(at, TRACKER_BYTES_PER_PAGE);
@@ -451,7 +451,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 }
 
 namespace {
-// gow3: GOW3_BUFFER_STATS=1 — how buffer bindings reach the GPU, by guest region (256 MiB),
+// port: ISSN_BUFFER_STATS=1 — how buffer bindings reach the GPU, by guest region (256 MiB),
 // printed every 5 s: small read-only copies into the stream buffer, arena bindings, and the
 // bytes those re-upload after CPU writes. Input for engine-level short paths.
 struct BufferStats {
@@ -473,7 +473,7 @@ void NoteHotUse(VAddr address, u32 size) {
         return;
     }
     auto& st = Stats();
-    const u64 frame = Gow3Stats::gpu_frames.load(std::memory_order_relaxed);
+    const u64 frame = IssnStats::gpu_frames.load(std::memory_order_relaxed);
     for (u64 block = address >> 16; block <= (address + size - 1) >> 16; ++block) {
         auto [it, inserted] = st.last_use.try_emplace(block, frame);
         if (!inserted && it->second != frame) {
@@ -488,7 +488,7 @@ u64 RegionKey(VAddr address) {
 }
 bool BufferStatsEnabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("GOW3_BUFFER_STATS");
+        const char* value = std::getenv("ISSN_BUFFER_STATS");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -558,10 +558,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             ++region.stream_count;
             region.stream_bytes += size;
         }
-        // gow3: the guest data is copied on a copy thread, started now; submission and
+        // port: the guest data is copied on a copy thread, started now; submission and
         // guest-visible fences wait for it (Scheduler::WaitHostCopies).
         if (!stream_buffer.mapped_data.empty() &&
-            !Gow3Toggle::Disabled(Gow3Toggle::DeferredStreamCopies)) {
+            !IssnToggle::Disabled(IssnToggle::DeferredStreamCopies)) {
             if (const auto offset = stream_buffer.Reserve(size, instance.UniformMinAlignment())) {
                 SmallGuestCopy({
                     .run = &RunGuestCopy,
@@ -583,14 +583,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    const u64 uploaded_before = Gow3Stats::buffer_upload_bytes.load(std::memory_order_relaxed);
+    const u64 uploaded_before = IssnStats::buffer_upload_bytes.load(std::memory_order_relaxed);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (stats) {
         auto& region = Stats().regions[RegionKey(device_addr)];
         ++region.arena_count;
         region.arena_bytes += size;
         region.upload_bytes +=
-            Gow3Stats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
+            IssnStats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -599,7 +599,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 namespace {
-/// gow3: ObtainBufferForImage calls in progress on this thread. The texture cache calls it with
+/// port: ObtainBufferForImage calls in progress on this thread. The texture cache calls it with
 /// its mutex held (UpdateImage, ExpandImage), so no texture can be freed from there.
 thread_local u32 image_refresh_depth = 0;
 } // namespace
@@ -617,12 +617,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    if (!Gow3Toggle::Disabled(Gow3Toggle::DeferredUploads)) {
-        // gow3: texture data is copied on the copy threads (streaming: 100+ MB per frame);
+    if (!IssnToggle::Disabled(IssnToggle::DeferredUploads)) {
+        // port: texture data is copied on the copy threads (streaming: 100+ MB per frame);
         // the upload reads the staging only after submission, which waits for the copies.
         constexpr u64 Chunk = 1_MB;
         for (u64 offset = 0; offset < staging.size; offset += Chunk) {
-            const Gow3Copy::Item item{
+            const IssnCopy::Item item{
                 .run = &RunGuestCopy,
                 .context = this,
                 .source = device_addr + offset,
@@ -633,7 +633,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
             if (staging.size < Chunk) {
                 SmallGuestCopy(item);
             } else {
-                Gow3Copy::Async([item] { item.run(item); });
+                IssnCopy::Async([item] { item.run(item); });
             }
         }
         return {staging.buffer, staging.offset};
@@ -671,7 +671,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     if (const Buffer* arena = address_space[first_page]; arena && arena == address_space[last_page]) {
         return arena;
     }
-    // gow3: the pages the new arena covers: the request plus every arena it touches (an arena may
+    // port: the pages the new arena covers: the request plus every arena it touches (an arena may
     // join several pages, up to the driver's buffer limit).
     u64 lo = first_page, hi = last_page;
     for (u64 page = first_page; page <= last_page; ++page) {
@@ -719,7 +719,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     return new_arena;
 }
 
-// gow3: from shadPS4-Infamous-FixBuild 4a206865 and 0c3fada0. Memory used to become resident a
+// port: from shadPS4-Infamous-FixBuild 4a206865 and 0c3fada0. Memory used to become resident a
 // block at a time, each range its own driver allocation and sparse bind; granules and chunks
 // make far fewer. When device memory runs out, old textures are freed and it is tried once more.
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
@@ -740,7 +740,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         if (bind_ranges.Empty()) {
             return;
         }
-        Gow3Stats::Timer timer{Gow3Stats::t_resident};
+        IssnStats::Timer timer{IssnStats::t_resident};
 
         // All memory is allocated before anything is recorded or bound: making room for it
         // submits, which sends the pending binds and runs pending operations (and so can make
@@ -894,7 +894,7 @@ namespace {
 constexpr u64 EagerPageSize = 4096;
 constexpr u64 EagerBufferSize = 32ull << 20; // 8192 pages
 constexpr u32 EagerIdleFences = 2400;        // ~40 s at 60 fences/s: forgotten
-// gow3: a page whose copies keep going stale unread (the GPU writes it again before the game
+// port: a page whose copies keep going stale unread (the GPU writes it again before the game
 // reads it) is copied at fewer fences, twice as few each time, up to 1 in 8, until a copy of it
 // is read again. In the fork three quarters of such copies were wasted (9a5224bf).
 constexpr u8 EagerMaxBackoff = 7;
@@ -902,7 +902,7 @@ constexpr u8 EagerMaxBackoff = 7;
 
 bool BufferCache::EagerEnabled() {
     static const bool enabled = [] {
-        const char* e = std::getenv("GOW3_EAGER_READBACK");
+        const char* e = std::getenv("ISSN_EAGER_READBACK");
         return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     }();
     return enabled;
@@ -1073,10 +1073,10 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         offset = it->second.offset;
         tick = it->second.tick;
     }
-    const s64 eager_wait = Gow3Latency::Enabled() ? Gow3Latency::Now() : 0;
+    const s64 eager_wait = IssnLatency::Enabled() ? IssnLatency::Now() : 0;
     scheduler.GetWorkSemaphore()->Wait(tick);
     if (eager_wait) {
-        Gow3Latency::Add(Gow3Latency::EagerWait, Gow3Latency::Now() - eager_wait);
+        IssnLatency::Add(IssnLatency::EagerWait, IssnLatency::Now() - eager_wait);
     }
     std::scoped_lock lock{eager_mutex};
     const auto it = eager_pages.find(page_addr);
@@ -1084,7 +1084,7 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         return false; // the GPU wrote it again meanwhile
     }
     eager_buffer->Invalidate(offset, EagerPageSize);
-    // gow3: only while the page is still GPU modified, checked under the region lock: a deferred
+    // port: only while the page is still GPU modified, checked under the region lock: a deferred
     // readback or a download may have brought it back meanwhile, and the guest may have
     // written it since without a fault.
     // (Unmapped memory has no backing to write, as for DownloadMemory.)
@@ -1111,7 +1111,7 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
 
 bool BufferCache::DeferredReadbackEnabled() {
     static const bool enabled = [] {
-        const char* e = std::getenv("GOW3_DEFERRED_READBACK");
+        const char* e = std::getenv("ISSN_DEFERRED_READBACK");
         return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     }();
     return enabled;
@@ -1215,7 +1215,7 @@ constexpr u64 FastWriteBlock = 64_KB;
 
 u32 BufferCache::FastWriteThreshold() {
     static const u32 threshold = [] {
-        const char* e = std::getenv("GOW3_FAST_WRITE");
+        const char* e = std::getenv("ISSN_FAST_WRITE");
         const u32 n = e && *e ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 0;
         return EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise
                    ? std::min<u32>(n, 255)
@@ -1257,7 +1257,7 @@ void BufferCache::ScoreFastWrite(VAddr page, s32 page_delta, s32 block_delta) {
     if (fast_write_score.size() > (1u << 20)) {
         fast_write_score.clear();
     }
-    // gow3: the game writes its per-frame buffers at advancing offsets, so a page seldom has a
+    // port: the game writes its per-frame buffers at advancing offsets, so a page seldom has a
     // history of its own; its 64 KiB block (key with the low bit set) learns too.
     const auto add = [](s8& score, s32 delta) {
         score = static_cast<s8>(std::clamp<s32>(score + delta, -100, 100));
@@ -1353,7 +1353,7 @@ bool BufferCache::TryFastWrite(VAddr addr, u64 size) {
 
 bool BufferCache::FastReadEnabled() {
     static const bool enabled = [] {
-        const char* e = std::getenv("GOW3_FAST_READ");
+        const char* e = std::getenv("ISSN_FAST_READ");
         return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     }();
     return enabled;
@@ -1426,7 +1426,7 @@ void BufferCache::RecordOwedLocked(OwedPage& owed) {
     }
     if (!owed_buffer) {
         owed_buffer = std::make_unique<Buffer>(instance, 0, OwedSlots * TRACKER_BYTES_PER_PAGE,
-                                               MemoryType::HostCached, "gow3 fast write copies");
+                                               MemoryType::HostCached, "issn fast write copies");
         for (u64 slot = OwedSlots; slot-- > 0;) {
             owed_free_slots.push_back(slot);
         }
@@ -1652,7 +1652,7 @@ void BufferCache::MarkDeferredStale(VAddr addr, u64 size, bool cpu) {
 
 bool BufferCache::CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size) {
     static const bool enabled = [] {
-        const char* e = std::getenv("GOW3_WRITE_MERGE");
+        const char* e = std::getenv("ISSN_WRITE_MERGE");
         return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     }();
     if (!enabled || size < 16 || !memory_tracker->IsRegionGpuModified(dst, size)) {
@@ -1782,17 +1782,17 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     for (const auto& copy : copies) {
         texture_cache.ResolveReadbacks(copy.dstOffset, copy.size, true, ReadbackSource::BufferUpload);
     }
-    Gow3Stats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+    IssnStats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     if (total_size_bytes > MAX_UPLOAD_PART_BYTES) {
         // Recorded here, part by part: nothing left for the caller to copy.
         UploadInParts(arena, copies);
         return nullptr;
     }
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-    // gow3: the guest memory is copied into staging on the copy threads, started now in
+    // port: the guest memory is copied into staging on the copy threads, started now in
     // groups of about 1 MiB; submission and guest-visible fences wait for them
     // (Scheduler::WaitHostCopies).
-    if (!Gow3Toggle::Disabled(Gow3Toggle::DeferredUploads) && total_size_bytes < 1_MB) {
+    if (!IssnToggle::Disabled(IssnToggle::DeferredUploads) && total_size_bytes < 1_MB) {
         // Small uploads join the calling thread's batch.
         for (auto& copy : copies) {
             SmallGuestCopy({
@@ -1808,7 +1808,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
         }
         return staging.buffer;
     }
-    if (!Gow3Toggle::Disabled(Gow3Toggle::DeferredUploads)) {
+    if (!IssnToggle::Disabled(IssnToggle::DeferredUploads)) {
         struct HostCopy {
             VAddr source;
             u8* destination;
@@ -1818,7 +1818,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
         auto group = std::make_shared<Group>();
         u64 group_bytes = 0;
         const auto launch = [&] {
-            Gow3Copy::Async([group, memory = memory, staging] {
+            IssnCopy::Async([group, memory = memory, staging] {
                 for (const auto& copy : *group) {
                     memory->CopySparseMemory(copy.source, copy.destination, copy.size);
                 }
@@ -1846,7 +1846,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
                                  copies[i].size);
     };
     if (total_size_bytes >= 2_MB && copies.size() > 1) {
-        Gow3Copy::ParallelFor(copies.size(), copy);
+        IssnCopy::ParallelFor(copies.size(), copy);
     } else {
         for (std::size_t i = 0; i < copies.size(); ++i) {
             copy(i);
@@ -1880,7 +1880,7 @@ void BufferCache::UploadInParts(const Buffer* arena, std::span<const vk::BufferC
     u64 part_bytes = 0;
     u32 parts = 0;
     const auto upload_part = [&] {
-        Gow3Copy::ParallelFor(host_copies.size(), [&](std::size_t i) {
+        IssnCopy::ParallelFor(host_copies.size(), [&](std::size_t i) {
             memory->CopySparseMemory(host_copies[i].source, host_copies[i].destination,
                                      host_copies[i].size);
         });
@@ -1934,11 +1934,11 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
         }
     }
-    // gow3: most texel buffers alias no image; remember misses until images change.
+    // port: most texel buffers alias no image; remember misses until images change.
     const u64 generation = texture_cache.RegistryGeneration();
     auto& miss = image_miss_cache[((device_addr >> 6) ^ size * 0x9E3779B1u) % image_miss_cache.size()];
     if (miss.address == device_addr && miss.size == size && miss.generation == generation &&
-        !Gow3Toggle::Disabled(Gow3Toggle::TextureBindingMemo)) {
+        !IssnToggle::Disabled(IssnToggle::TextureBindingMemo)) {
         return false;
     }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
@@ -1946,12 +1946,12 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         miss = {device_addr, size, generation};
         return false;
     }
-    // gow3: the lookups above only read what the texture binding helper leaves alone; the
+    // port: the lookups above only read what the texture binding helper leaves alone; the
     // copy below changes image state, so the helper finishes first.
     runtime.BeforeImageAccess();
     Image& image = texture_cache.GetImage(image_id);
     if (image.info.props.is_bc_decoded) {
-        return false; // gow3: GOW3_BC_TINY: decoded texels, not the guest's blocks
+        return false; // port: ISSN_BC_TINY: decoded texels, not the guest's blocks
     }
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,

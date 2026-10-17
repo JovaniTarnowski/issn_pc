@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "gnm_error.h"
-#include "gow3_gpu_trace.h"
+#include "issn_gpu_trace.h"
 #include "gnmdriver.h"
 
 #include "common/assert.h"
@@ -24,7 +24,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
-#include "gow3_freeze.h"
+#include "issn_freeze.h"
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -88,7 +88,7 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 
 static void WaitGpuIdle() {
     HLE_TRACE;
-    Gow3Freeze::WaitScope wait{"GPU idle (submit done)"}; // gow3: freeze report
+    IssnFreeze::WaitScope wait{"GPU idle (submit done)"}; // port: freeze report
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }
@@ -296,7 +296,7 @@ int PS4_SYSV_ABI sceGnmDestroyWorkloadStream() {
 void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "vqid {}, offset_dw {}", gnm_vqid, next_offs_dw);
-    Gow3GpuTrace::Event("sceGnmDingDong vqid %u offset %u", gnm_vqid, next_offs_dw);
+    IssnGpuTrace::Event("sceGnmDingDong vqid %u offset %u", gnm_vqid, next_offs_dw);
 
     if (gnm_vqid == 0) {
         return;
@@ -1230,8 +1230,8 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
         liverpool->asc_queues.insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
     // We need to offset index as `dingDong` assumes it to be from the range [1..64]
     const auto gnm_vqid = vqid.index + 1;
-    Gow3GpuTrace::Count(Gow3GpuTrace::CountMapComputeQueue);
-    Gow3GpuTrace::Event("sceGnmMapComputeQueue pipe %u queue %u ring %#llx (%u dwords) -> vqid %u",
+    IssnGpuTrace::Count(IssnGpuTrace::CountMapComputeQueue);
+    IssnGpuTrace::Event("sceGnmMapComputeQueue pipe %u queue %u ring %#llx (%u dwords) -> vqid %u",
                         pipe_id, queue_id, static_cast<unsigned long long>(ring_base_addr),
                         ring_size_dw, gnm_vqid);
     LOG_INFO(Lib_GnmDriver, "ASC pipe {} queue {} mapped to vqueue {}", pipe_id, queue_id,
@@ -2369,8 +2369,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
         submission_lock = true;
     }
     liverpool->SubmitDone();
-    Gow3GpuTrace::Count(Gow3GpuTrace::CountSubmitDone);
-    Gow3GpuTrace::Event("sceGnmSubmitDone (frame %llu)", static_cast<unsigned long long>(frames_submitted));
+    IssnGpuTrace::Count(IssnGpuTrace::CountSubmitDone);
+    IssnGpuTrace::Event("sceGnmSubmitDone (frame %llu)", static_cast<unsigned long long>(frames_submitted));
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();

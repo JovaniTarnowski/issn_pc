@@ -8,9 +8,9 @@
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/gow3_bc_tiny.h"
-#include "video_core/amdgpu/gow3_block1d.h"
-#include "video_core/amdgpu/gow3_msaa.h"
+#include "video_core/amdgpu/issn_bc_tiny.h"
+#include "video_core/amdgpu/issn_block1d.h"
+#include "video_core/amdgpu/issn_msaa.h"
 #include "video_core/amdgpu/tiling.h"
 
 namespace AmdGpu {
@@ -266,7 +266,7 @@ struct Image {
 
     ImageType GetType() const noexcept {
         if (NoMsaa() && IsGuestMsaa()) {
-            // gow3: see gow3_msaa.h; shaders then fetch it without a sample index.
+            // port: see issn_msaa.h; shaders then fetch it without a sample index.
             return static_cast<ImageType>(type) == ImageType::Color2DMsaa ? ImageType::Color2D
                                                                           : ImageType::Color2DArray;
         }
@@ -319,15 +319,15 @@ struct Image {
         return base_type;
     }
 
-    /// gow3: Vulkan has no block-compressed 1D images (inFAMOUS binds BC1/BC4/BC5 1D textures),
+    /// port: Vulkan has no block-compressed 1D images (inFAMOUS binds BC1/BC4/BC5 1D textures),
     /// so these are 2D images of height 1 on the host, sampled at the middle row.
     bool IsBlock1D() const noexcept {
-        // On for drivers that refuse BC 1D, except NVIDIA (gow3_block1d.h); GOW3_BLOCK1D=0/1.
-        // GOW3_BC_TINY decodes BC1-BC5 1D textures to plain 1D images instead (gow3_bc_tiny.h).
+        // On for drivers that refuse BC 1D, except NVIDIA (issn_block1d.h); ISSN_BLOCK1D=0/1.
+        // ISSN_BC_TINY decodes BC1-BC5 1D textures to plain 1D images instead (issn_bc_tiny.h).
         const auto type = GetType();
         const auto dfmt = GetDataFmt();
         const bool is_1d = type == ImageType::Color1D || type == ImageType::Color1DArray;
-        // gow3: BP09, every 1D image (not only block-coded ones) is 2D of height 1 on the host.
+        // port: BP09, every 1D image (not only block-coded ones) is 2D of height 1 on the host.
         if (is_1d && All1DAs2D()) {
             return true;
         }
@@ -335,7 +335,7 @@ struct Image {
                !(BcTinyDecode() && IsBcTinyDecodable(dfmt));
     }
 
-    /// gow3: BC formats the GOW3_BC_TINY CPU decoder handles (texture_cache/gow3_bc_decode.h).
+    /// port: BC formats the ISSN_BC_TINY CPU decoder handles (texture_cache/issn_bc_decode.h).
     static constexpr bool IsBcTinyDecodable(DataFormat dfmt) noexcept {
         return dfmt >= DataFormat::FormatBc1 && dfmt <= DataFormat::FormatBc5;
     }

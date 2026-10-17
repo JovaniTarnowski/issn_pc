@@ -9,59 +9,59 @@
  *     distance over which a region's settings fade in (kViewFadeSites, vdivss 0x2f0(%rbx)).
  *   - new cameras copy the near (10) and far (1e7) clip planes from two globals.
  * Data writes need no hook; the two code sites jump to stubs that read the menu's floats. */
-#ifndef GOW3_VIEW_HOOK_H
-#define GOW3_VIEW_HOOK_H
+#ifndef ISSN_VIEW_HOOK_H
+#define ISSN_VIEW_HOOK_H
 #include <stdint.h>
 #include <string.h>
 
-#define GOW3_VIEW_LOD_TABLE 0xda08c0u /* 21 rows of 0x14 bytes: float lod, int shadow cascades
+#define ISSN_VIEW_LOD_TABLE 0xda08c0u /* 21 rows of 0x14 bytes: float lod, int shadow cascades
                                         delta, float max distance, float, int */
-#define GOW3_VIEW_LOD_ROWS 21u
-#define GOW3_VIEW_LOD_STRIDE 0x14u
-#define GOW3_VIEW_BANDS 0xdfaa34u      /* 6 floats: LOD band distances (a 7th, FLT_MAX, follows) */
-#define GOW3_VIEW_BAND_COUNT 6u
-#define GOW3_VIEW_NEAR_CLIP 0xdf9e64u  /* float 10.0: new cameras' near plane, the regions' default */
-#define GOW3_VIEW_FAR_CLIP 0xdf9e68u   /* float 1e7: new cameras' far plane */
-#define GOW3_VIEW_SITE_LENGTH 8u
+#define ISSN_VIEW_LOD_ROWS 21u
+#define ISSN_VIEW_LOD_STRIDE 0x14u
+#define ISSN_VIEW_BANDS 0xdfaa34u      /* 6 floats: LOD band distances (a 7th, FLT_MAX, follows) */
+#define ISSN_VIEW_BAND_COUNT 6u
+#define ISSN_VIEW_NEAR_CLIP 0xdf9e64u  /* float 10.0: new cameras' near plane, the regions' default */
+#define ISSN_VIEW_FAR_CLIP 0xdf9e68u   /* float 1e7: new cameras' far plane */
+#define ISSN_VIEW_SITE_LENGTH 8u
 
-static const float gow3_view_lod_original[GOW3_VIEW_LOD_ROWS] = {
+static const float issn_view_lod_original[ISSN_VIEW_LOD_ROWS] = {
     1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.5f, 0.4f, 0.4f, 0.3f, 0.2f,
     0.2f, 0.2f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
-static const float gow3_view_band_original[GOW3_VIEW_BAND_COUNT] = {400.0f, 750.0f, 1500.0f,
+static const float issn_view_band_original[ISSN_VIEW_BAND_COUNT] = {400.0f, 750.0f, 1500.0f,
                                                                    3500.0f, 6000.0f, 15000.0f};
-#define GOW3_VIEW_NEAR_ORIGINAL 10.0f
-#define GOW3_VIEW_FAR_ORIGINAL 1.0e7f
+#define ISSN_VIEW_NEAR_ORIGINAL 10.0f
+#define ISSN_VIEW_FAR_ORIGINAL 1.0e7f
 
 /* vmulss 0x9c(%rax),%xmm0,%xmm0, then movslq 0x1dca8(%rcx),%rax: rax is dead after the multiply. */
-static const uint32_t gow3_view_region_sites[2] = {0x581088u, 0x5811ffu};
-static const unsigned char gow3_view_region_code[15] = {0xc5, 0xfa, 0x59, 0x80, 0x9c, 0, 0, 0,
+static const uint32_t issn_view_region_sites[2] = {0x581088u, 0x5811ffu};
+static const unsigned char issn_view_region_code[15] = {0xc5, 0xfa, 0x59, 0x80, 0x9c, 0, 0, 0,
                                                        0x48, 0x63, 0x81, 0xa8, 0xdc, 0x01, 0x00};
 /* vdivss 0x2f0(%rbx),%xmm0,%xmm0 (the region's FADE_DISTANCE) */
-static const uint32_t gow3_view_fade_sites[2] = {0x1bae75u, 0x1bb1e9u};
-static const unsigned char gow3_view_fade_code[8] = {0xc5, 0xfa, 0x5e, 0x83, 0xf0, 0x02, 0, 0};
+static const uint32_t issn_view_fade_sites[2] = {0x1bae75u, 0x1bb1e9u};
+static const unsigned char issn_view_fade_code[8] = {0xc5, 0xfa, 0x5e, 0x83, 0xf0, 0x02, 0, 0};
 
-static inline int gow3_view_float_is(const unsigned char *image, uint32_t at, float value) {
+static inline int issn_view_float_is(const unsigned char *image, uint32_t at, float value) {
     float v;
     memcpy(&v, image + at, 4);
     return v == value;
 }
 
 /* The code and the data the hooks rely on, all unchanged (this eboot build). */
-static inline int gow3_view_signature_match(const unsigned char *image, uint64_t size) {
-    if (size < GOW3_VIEW_BANDS + 4 * GOW3_VIEW_BAND_COUNT) return 0;
+static inline int issn_view_signature_match(const unsigned char *image, uint64_t size) {
+    if (size < ISSN_VIEW_BANDS + 4 * ISSN_VIEW_BAND_COUNT) return 0;
     for (unsigned i = 0; i < 2; ++i) {
-        if (memcmp(image + gow3_view_region_sites[i], gow3_view_region_code, sizeof(gow3_view_region_code)) ||
-            memcmp(image + gow3_view_fade_sites[i], gow3_view_fade_code, sizeof(gow3_view_fade_code))) return 0;
+        if (memcmp(image + issn_view_region_sites[i], issn_view_region_code, sizeof(issn_view_region_code)) ||
+            memcmp(image + issn_view_fade_sites[i], issn_view_fade_code, sizeof(issn_view_fade_code))) return 0;
     }
-    for (unsigned r = 0; r < GOW3_VIEW_LOD_ROWS; ++r)
-        if (!gow3_view_float_is(image, GOW3_VIEW_LOD_TABLE + r * GOW3_VIEW_LOD_STRIDE, gow3_view_lod_original[r])) return 0;
-    for (unsigned b = 0; b < GOW3_VIEW_BAND_COUNT; ++b)
-        if (!gow3_view_float_is(image, GOW3_VIEW_BANDS + 4 * b, gow3_view_band_original[b])) return 0;
-    return gow3_view_float_is(image, GOW3_VIEW_NEAR_CLIP, GOW3_VIEW_NEAR_ORIGINAL) &&
-           gow3_view_float_is(image, GOW3_VIEW_FAR_CLIP, GOW3_VIEW_FAR_ORIGINAL);
+    for (unsigned r = 0; r < ISSN_VIEW_LOD_ROWS; ++r)
+        if (!issn_view_float_is(image, ISSN_VIEW_LOD_TABLE + r * ISSN_VIEW_LOD_STRIDE, issn_view_lod_original[r])) return 0;
+    for (unsigned b = 0; b < ISSN_VIEW_BAND_COUNT; ++b)
+        if (!issn_view_float_is(image, ISSN_VIEW_BANDS + 4 * b, issn_view_band_original[b])) return 0;
+    return issn_view_float_is(image, ISSN_VIEW_NEAR_CLIP, ISSN_VIEW_NEAR_ORIGINAL) &&
+           issn_view_float_is(image, ISSN_VIEW_FAR_CLIP, ISSN_VIEW_FAR_ORIGINAL);
 }
 
-static inline unsigned gow3_view_jump_back(unsigned char *out, uintptr_t resume) {
+static inline unsigned issn_view_jump_back(unsigned char *out, uintptr_t resume) {
     const unsigned char jmp[6] = {0xff, 0x25, 0, 0, 0, 0}; /* jmp *0(%rip) */
     memcpy(out, jmp, 6);
     memcpy(out + 6, &resume, 8);
@@ -70,7 +70,7 @@ static inline unsigned gow3_view_jump_back(unsigned char *out, uintptr_t resume)
 
 /* LOD_ADJUST weight: xmm0 *= 1 + (adjust - 1) * weight; params = {weight, 1.0f}. ymm1 is saved
  * below the red zone, rax is free (the next instruction loads it). */
-static inline unsigned gow3_view_build_region_stub(unsigned char *out, uintptr_t params, uintptr_t resume) {
+static inline unsigned issn_view_build_region_stub(unsigned char *out, uintptr_t params, uintptr_t resume) {
     static const unsigned char head[] = {
         0x48, 0x8d, 0xa4, 0x24, 0x60, 0xff, 0xff, 0xff, /* lea -0xa0(%rsp),%rsp */
         0xc5, 0xfc, 0x11, 0x0c, 0x24,                   /* vmovups %ymm1,(%rsp) */
@@ -87,11 +87,11 @@ static inline unsigned gow3_view_build_region_stub(unsigned char *out, uintptr_t
     memcpy(out + n, head, sizeof(head)); n += sizeof(head);
     memcpy(out + n, &params, 8); n += 8;
     memcpy(out + n, tail, sizeof(tail)); n += sizeof(tail);
-    return n + gow3_view_jump_back(out + n, resume);
+    return n + issn_view_jump_back(out + n, resume);
 }
 
 /* FADE_DISTANCE scale: the game's division, then xmm0 *= *inverse_scale (rax saved). */
-static inline unsigned gow3_view_build_fade_stub(unsigned char *out, uintptr_t inverse_scale, uintptr_t resume) {
+static inline unsigned issn_view_build_fade_stub(unsigned char *out, uintptr_t inverse_scale, uintptr_t resume) {
     static const unsigned char head[] = {
         0xc5, 0xfa, 0x5e, 0x83, 0xf0, 0x02, 0, 0,       /* vdivss 0x2f0(%rbx),%xmm0,%xmm0 */
         0x48, 0x8d, 0x64, 0x24, 0x80,                   /* lea -0x80(%rsp),%rsp */
@@ -105,6 +105,6 @@ static inline unsigned gow3_view_build_fade_stub(unsigned char *out, uintptr_t i
     memcpy(out + n, head, sizeof(head)); n += sizeof(head);
     memcpy(out + n, &inverse_scale, 8); n += 8;
     memcpy(out + n, tail, sizeof(tail)); n += sizeof(tail);
-    return n + gow3_view_jump_back(out + n, resume);
+    return n + issn_view_jump_back(out + n, resume);
 }
 #endif

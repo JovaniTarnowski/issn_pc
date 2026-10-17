@@ -1,7 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
-#include "gpu/gow3gpu.h"
+#include "gpu/issngpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,16 +164,16 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     fputs("STOP: guest stack protector detected corruption\n", stderr);
     exit(22);
 }
-/* issn: writes of 64 bytes or more into GPU-modified memory go through gow3gpu_cpu_write (no
- * fault and no GPU wait with GOW3_WRITE_MERGE=1, HayatoG's iss_pc); the rest write normally. */
+/* issn: writes of 64 bytes or more into GPU-modified memory go through issngpu_cpu_write (no
+ * fault and no GPU wait with ISSN_WRITE_MERGE=1, HayatoG's iss_pc); the rest write normally. */
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    if (size >= 64 && (capabilities & 1) && gow3gpu_cpu_write(dst, NULL, value, size)) return dst;
+    if (size >= 64 && (capabilities & 1) && issngpu_cpu_write(dst, NULL, value, size)) return dst;
     return memset(dst, value, size);
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    if (size >= 64 && (capabilities & 1) && gow3gpu_cpu_write(dst, src, -1, size)) return dst;
+    if (size >= 64 && (capabilities & 1) && issngpu_cpu_write(dst, src, -1, size)) return dst;
     return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
@@ -264,7 +264,7 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (file) return file;
     uintptr_t update = runtime_issn107_resolve(name); /* issn: 01.07 */
     if (update) return update;
-    return gow3gpu_resolve(name);
+    return issngpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"

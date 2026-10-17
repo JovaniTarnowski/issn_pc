@@ -1,14 +1,14 @@
-// issn.ini graphics keys (gow3_settings.cpp, gow3_graphics.h).
+// issn.ini graphics keys (issn_settings.cpp, issn_graphics.h).
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
-#include "gow3_graphics.h"
-#include "gow3_settings.h"
+#include "issn_graphics.h"
+#include "issn_settings.h"
 
-namespace G = Gow3Graphics;
+namespace G = IssnGraphics;
 
 static std::string Read(const char* path) {
     std::ifstream in(path);
@@ -40,31 +40,31 @@ int main() {
                "render_resolution=1440p\nengine_fps=240\ndeferred_readback=0\nstale_readback=1\n"
                "fsr1=1\nrcas=0\nrcas_strength=40\nframes_queued=2\n";
     }
-    _putenv_s("GOW3_CONFIG", path);
-    _putenv_s("GOW3_ASYNC_SHADERS", "");
-    auto& v = Gow3Settings::Get();
-    Gow3Settings::Load();
+    _putenv_s("ISSN_CONFIG", path);
+    _putenv_s("ISSN_ASYNC_SHADERS", "");
+    auto& v = IssnSettings::Get();
+    IssnSettings::Load();
     assert(v.display_mode == G::Borderless && !v.vsync && v.fps_limit == 240 && !v.async_shaders);
     assert(v.render_resolution == 3 && v.engine_fps == 240 && !v.deferred_readback && v.stale_readback);
-    // FSR 1 left the menus in 2.2.0: a saved fsr1=1 (or GOW3_FSR1) no longer turns it on.
+    // FSR 1 left the menus in 2.2.0: a saved fsr1=1 (or ISSN_FSR1) no longer turns it on.
     assert(!v.fsr1 && !v.rcas && v.rcas_strength == 40 && v.frames_queued == 2);
-    _putenv_s("GOW3_FSR1", "1");
-    Gow3Settings::Load();
+    _putenv_s("ISSN_FSR1", "1");
+    IssnSettings::Load();
     assert(!v.fsr1);
-    _putenv_s("GOW3_FSR1", "");
-    assert(!Gow3Settings::GraphicsNeedRestart());
-    assert(v.applied_engine_fps == 240);  // no GOW3_ENGINE_FPS: the configured rate
-    _putenv_s("GOW3_ENGINE_FPS", "60");    // run.py: the frame rate patch did not apply
-    Gow3Settings::Load();
-    assert(v.engine_fps == 240 && v.applied_engine_fps == 60 && !Gow3Settings::GraphicsNeedRestart());
-    _putenv_s("GOW3_ENGINE_FPS", "");
+    _putenv_s("ISSN_FSR1", "");
+    assert(!IssnSettings::GraphicsNeedRestart());
+    assert(v.applied_engine_fps == 240);  // no ISSN_ENGINE_FPS: the configured rate
+    _putenv_s("ISSN_ENGINE_FPS", "60");    // run.py: the frame rate patch did not apply
+    IssnSettings::Load();
+    assert(v.engine_fps == 240 && v.applied_engine_fps == 60 && !IssnSettings::GraphicsNeedRestart());
+    _putenv_s("ISSN_ENGINE_FPS", "");
     v.engine_fps = 120;
-    assert(Gow3Settings::GraphicsNeedRestart());
+    assert(IssnSettings::GraphicsNeedRestart());
     v.fps_limit = 60;  // live: no restart because of it
     v.engine_fps = 240;
-    assert(!Gow3Settings::GraphicsNeedRestart());
+    assert(!IssnSettings::GraphicsNeedRestart());
 
-    Gow3Settings::Save();
+    IssnSettings::Save();
     const std::string saved = Read(path);
     for (const char* line : {"display_mode=borderless\n", "vsync=0\n", "fps_limit=60\n", "async_shaders=0\n",
                              "render_resolution=1440p\n", "engine_fps=240\n", "deferred_readback=0\n",
@@ -78,9 +78,9 @@ int main() {
         out << "display_mode=huge\nfps_limit=7\nrender_resolution=8K\nengine_fps=1\n"
                "rcas_strength=250\nframes_queued=9\n";
     }
-    _putenv_s("GOW3_ASYNC_SHADERS", "1");  // the environment still wins at start
+    _putenv_s("ISSN_ASYNC_SHADERS", "1");  // the environment still wins at start
     v.async_shaders = false;
-    Gow3Settings::Load();
+    IssnSettings::Load();
     assert(v.display_mode == G::Windowed && v.fps_limit == 0 && v.render_resolution == 0 && v.engine_fps == 120);
     assert(v.rcas_strength == 75 && v.frames_queued == 1);
     assert(v.async_shaders);
@@ -88,8 +88,8 @@ int main() {
         std::ofstream out(path);
         out << "cheat_double_jumps=1\ncheat_very_hard=1\n";
     }
-    Gow3Settings::Load();
-    Gow3Settings::Save();
+    IssnSettings::Load();
+    IssnSettings::Save();
     const std::string cheats = Read(path);
     assert(cheats.find("cheat_double_jumps=1\n") != std::string::npos);
     assert(cheats.find("cheat_very_hard=1\n") != std::string::npos);

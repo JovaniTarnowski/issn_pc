@@ -22,8 +22,8 @@ enum class BlobType : u32 {
     ShaderProfile,
 };
 
-/// gow3: this game's shader cache folder: <gpu user>/cache/<serial>-<recompiler key>
-/// (GOW3_SHADER_CACHE_KEY), or <serial> without a key. Pipeline binaries go in it too.
+/// port: this game's shader cache folder: <gpu user>/cache/<serial>-<recompiler key>
+/// (ISSN_SHADER_CACHE_KEY), or <serial> without a key. Pipeline binaries go in it too.
 [[nodiscard]] std::filesystem::path GameCacheDir();
 
 class DataBase {
@@ -38,7 +38,7 @@ public:
         return opened;
     }
     void FinishPreload();
-    /// gow3: removes every cached blob (an incompatible cache is rebuilt, not ignored).
+    /// port: removes every cached blob (an incompatible cache is rebuilt, not ignored).
     void Clear();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
@@ -47,15 +47,15 @@ public:
     void Load(BlobType type, const std::string& name, std::vector<u8>& data);
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
 
-    /// gow3: `stop` returning true ends the walk early (background warm-up at exit).
+    /// port: `stop` returning true ends the walk early (background warm-up at exit).
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func,
                      const std::function<bool()>& stop = {});
-    /// gow3: blobs are plain files written beside and renamed into place, so other threads
+    /// port: blobs are plain files written beside and renamed into place, so other threads
     /// may read them while the IO thread saves (the zip archive cannot).
     [[nodiscard]] bool ConcurrentReads() const;
-    /// gow3: number of blobs ForEachBlob visits (the loading screen's total).
+    /// port: number of blobs ForEachBlob visits (the loading screen's total).
     size_t CountBlobs(BlobType type);
-    /// gow3: the name (no extension) of every blob of a type, without reading it.
+    /// port: the name (no extension) of every blob of a type, without reading it.
     void ForEachBlobName(BlobType type, const std::function<void(std::string_view name)>& func);
 
 private:

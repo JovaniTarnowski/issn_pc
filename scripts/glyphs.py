@@ -64,7 +64,7 @@ def entries(data):
 
 
 def pad_buttons(pad_map):
-    """Game button -> gamepad button, with a GOW3_PAD_MAP value ('cross=b,circle=a') applied.
+    """Game button -> gamepad button, with a ISSN_PAD_MAP value ('cross=b,circle=a') applied.
     L2/R2 stay on the triggers, as in the runtime."""
     buttons = dict(DEFAULT_MAP)
     for entry in (pad_map or '').split(','):
@@ -102,7 +102,7 @@ def parse_gamepad(output):
 
 
 def resolve(choice, probe_output=''):
-    """(style, faces, controller name) for a GOW3_GLYPH_STYLE value. 'auto' follows the connected
+    """(style, faces, controller name) for a ISSN_GLYPH_STYLE value. 'auto' follows the connected
     gamepad (the PlayStation glyphs without one); a chosen style uses its own letters."""
     if choice in STYLES:
         return choice, None, ''

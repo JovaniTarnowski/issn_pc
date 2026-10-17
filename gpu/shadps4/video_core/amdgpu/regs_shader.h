@@ -226,7 +226,7 @@ struct ComputeProgram {
     }
 };
 
-// gow3: nullptr when the code has no valid binary info within the search limit. inFAMOUS points
+// port: nullptr when the code has no valid binary info within the search limit. inFAMOUS points
 // a stage at code it has not finished writing yet (next to the smoke ducts the game copies the
 // effect's shaders in with the GPU right before using them), and the old UNREACHABLE stopped the
 // game ("Shader binary info not found", exit 23). Callers skip that draw or dispatch instead;
@@ -274,7 +274,7 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
     return *info;
 }
 
-/// gow3: logs a stage without binary info once per code address (up to 64 addresses, then
+/// port: logs a stage without binary info once per code address (up to 64 addresses, then
 /// silently): several effects can be waiting for their code at the same time.
 inline void LogMissingBinaryInfo(const u32* code) {
     static constexpr size_t MaxLogged = 64;
@@ -292,11 +292,11 @@ inline void LogMissingBinaryInfo(const u32* code) {
         return;
     }
     logged[slot].store(address, std::memory_order_relaxed);
-    LOG_WARNING(Render, "gow3: shader at {} has no binary info yet; draw skipped{}",
+    LOG_WARNING(Render, "port: shader at {} has no binary info yet; draw skipped{}",
                 fmt::ptr(code), slot + 1 == MaxLogged ? " (no more of these are logged)" : "");
 }
 
-/// gow3: the stage's parameters, or nothing when its code has no valid binary info yet; the
+/// port: the stage's parameters, or nothing when its code has no valid binary info yet; the
 /// caller then treats the stage as missing (the draw or dispatch is skipped).
 static std::optional<Shader::ShaderParams> TryGetParams(const auto& sh) {
     const auto* code = sh.template Address<const u32*>();

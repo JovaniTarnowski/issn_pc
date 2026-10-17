@@ -5,8 +5,8 @@
 #include <xxhash.h>
 #include "video_core/amdgpu/liverpool.h"
 
-#include "gow3_toggles.h"
-#include "gow3_freeze.h"
+#include "issn_toggles.h"
+#include "issn_freeze.h"
 #include "common/assert.h"
 #include "common/backports.h"
 #include "common/debug.h"
@@ -163,7 +163,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
                 }
             }
         }
-        Gow3Stats::Timer readback_timer{Gow3Stats::t_readback_wait};
+        IssnStats::Timer readback_timer{IssnStats::t_readback_wait};
         if (const u64 tick = pending_readbacks.RequiredTick(address, size, exact)) {
             ++readbacks_waited;
             waited = !scheduler.IsFree(tick);
@@ -178,7 +178,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
         }
         if (diag) readback_sources.Record(source, waited, wait_ns, size);
     };
-    Gow3Freeze::WaitScope wait{"GPU readback", reinterpret_cast<const void*>(address)}; // tlg
+    IssnFreeze::WaitScope wait{"GPU readback", reinterpret_cast<const void*>(address)}; // tlg
     if (assume_locks) resolve();
     else liverpool->SendCommand<true>(resolve);
     return true;
@@ -193,9 +193,9 @@ void TextureCache::CancelReadbacks(VAddr address, u64 size, bool exact) {
     }, exact);
 }
 
-// gow3: every copy is recorded first and the GPU is waited for once. A wait per image (as
+// port: every copy is recorded first and the GPU is waited for once. A wait per image (as
 // before) left the GPU mostly idle in God of War III's gameplay, at about 2 FPS.
-// tlg (GOW3_PERF_DIAG, from gow3_pc #348): a request PartialHeightViews answered with a taller
+// tlg (ISSN_PERF_DIAG, from gow3_pc #348): a request PartialHeightViews answered with a taller
 // cached image.
 void TextureCache::NotePartialView(const ImageInfo& request, const ImageInfo& used,
                                    BindingType binding) {
@@ -216,7 +216,7 @@ void TextureCache::NotePartialView(const ImageInfo& request, const ImageInfo& us
     ++slot->count;
 }
 
-// tlg (GOW3_PERF_DIAG, from gow3_pc #348): every 5 s, the images FindImage created most often.
+// tlg (ISSN_PERF_DIAG, from gow3_pc #348): every 5 s, the images FindImage created most often.
 // Takes `mutex` (held by FindImage), so it runs before ProcessDownloadImages takes readback_mutex.
 void TextureCache::ReportImageCreates() {
     const auto now = std::chrono::steady_clock::now();
@@ -367,7 +367,7 @@ void TextureCache::ProcessDownloadImages() {
 
 std::optional<TextureCache::PendingDownload> TextureCache::RecordImageDownload(ImageId image_id) {
     Image& image = slot_images[image_id];
-    // gow3: decoded texels (GOW3_BC_TINY) must never reach guest memory.
+    // port: decoded texels (ISSN_BC_TINY) must never reach guest memory.
     if (False(image.flags & ImageFlagBits::GpuModified) || image.info.props.is_bc_decoded) {
         return std::nullopt;
     }
@@ -459,7 +459,7 @@ void TextureCache::DiagDumpImage(ImageId image_id, const char* tag) {
     scheduler.Finish();
     download.Invalidate();
     static int sequence = 0;
-    const char* dir = std::getenv("GOW3_DIAG_DIR");
+    const char* dir = std::getenv("ISSN_DIAG_DIR");
     const char* dir_path = dir && *dir ? dir : "out/diag";
     std::error_code ec;
     std::filesystem::create_directories(dir_path, ec);
@@ -477,7 +477,7 @@ void TextureCache::DiagDumpImage(ImageId image_id, const char* tag) {
     }
 }
 
-// gow3: images sharing guest memory (aliases), ported from cuesta4/shadPS4 (eltutz) commit
+// port: images sharing guest memory (aliases), ported from cuesta4/shadPS4 (eltutz) commit
 // 189ca3b6. A write to one is copied into the others before they are read, as on the PS4,
 // where they are the same memory.
 static bool Covers(const Extent3D& extent, const ImageInfo& info) {
@@ -791,7 +791,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
 
-    // gow3: a GOW3_BC_TINY image holds decoded texels, nothing another image can copy from or
+    // port: a ISSN_BC_TINY image holds decoded texels, nothing another image can copy from or
     // into: treat the overlap as a chance one, like an allocation from a pool.
     if (image_info.props.is_bc_decoded != cache_image.info.props.is_bc_decoded) {
         if (safe_to_delete) {
@@ -812,13 +812,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // - Only for shaders that read with integer coordinates (ImageResource::needs_native).
         // - Known limit: the view keeps the cached size, so accesses past the requested extent but
         //   inside the cached one reach the frame buffer instead of being dropped.
-        // Off unless GOW3_PARTIAL_HEIGHT_VIEWS=1: not measured in inFAMOUS yet (GOW3_PERF_DIAG=1
+        // Off unless ISSN_PARTIAL_HEIGHT_VIEWS=1: not measured in inFAMOUS yet (ISSN_PERF_DIAG=1
         // prints 'Image creates' and 'Partial height views' every 5 s to check the pattern).
         static const bool partial_views_enabled = [] {
-            const char* value = std::getenv("GOW3_PARTIAL_HEIGHT_VIEWS");
+            const char* value = std::getenv("ISSN_PARTIAL_HEIGHT_VIEWS");
             return value && value[0] == '1';
         }();
-        if (partial_views_enabled && !Gow3Toggle::Disabled(Gow3Toggle::PartialHeightViews) &&
+        if (partial_views_enabled && !IssnToggle::Disabled(IssnToggle::PartialHeightViews) &&
             native_reads && (binding == BindingType::Texture || binding == BindingType::Storage)) {
             const auto& a = image_info;
             const auto& b = cache_image.info;
@@ -1110,7 +1110,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         cached.exact_fmt == exact_fmt && cached.binding == desc.type &&
         cached.needs_native == desc.needs_native &&
         cached.levels == info.resources.levels && cached.layers == info.resources.layers &&
-        !Gow3Toggle::Disabled(Gow3Toggle::FindImageCache)) {
+        !IssnToggle::Disabled(IssnToggle::FindImageCache)) {
         Image& image = slot_images[cached.image_id];
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
@@ -1154,7 +1154,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         image_id = cache_id;
     }
 
-    // tlg (GOW3_PERF_DIAG, from gow3_pc #348): what was cached here, read before overlap
+    // tlg (ISSN_PERF_DIAG, from gow3_pc #348): what was cached here, read before overlap
     // resolution may free it.
     const bool diag = Vulkan::WaitDiagnostics::Enabled();
     CreateStat created{};
@@ -1268,7 +1268,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    // gow3: BP02 (shadPS4 145932bf, #5240) only the bucket of the first page can hold a match.
+    // port: BP02 (shadPS4 145932bf, #5240) only the bucket of the first page can hold a match.
     const bool first_page_only =
         Common::Backports::On(Common::Backports::Id::ImageFromRangeFirst);
     const auto collect = [&](ImageId image_id, Image& image) {
@@ -1322,7 +1322,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     if (desc.type == BindingType::Storage) {
         PublishAliasWrite(image_id);
     }
-    if (memo && !Gow3Toggle::Disabled(Gow3Toggle::TextureViewMemo)) {
+    if (memo && !IssnToggle::Disabled(IssnToggle::TextureViewMemo)) {
         if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
             return slot_image_views[memo->view_id];
         }
@@ -1410,7 +1410,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageRefresh);
-    Gow3Stats::Timer timer{Gow3Stats::t_refresh};
+    IssnStats::Timer timer{IssnStats::t_refresh};
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
@@ -1440,7 +1440,7 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
-    Gow3Stats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    IssnStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
     if (image.info.props.is_bc_decoded) {
         UploadDecodedImage(image);
         return;
@@ -1498,12 +1498,12 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 void TextureCache::UploadDecodedImage(Image& image) {
-    // gow3: GOW3_BC_TINY (video_core/amdgpu/gow3_bc_tiny.h). The blocks are read from guest memory
+    // port: ISSN_BC_TINY (video_core/amdgpu/issn_bc_tiny.h). The blocks are read from guest memory
     // with the layout the GPU detiler and the BC upload copies use (mips_layout pitch and height
     // in texels; micro tiling as host_shaders/tiling.comp), decoded and uploaded as texels.
     const ImageInfo& info = image.info;
     const auto kind = BcTinyDecodeKind(info.bc_format);
-    ASSERT_MSG(kind.has_value(), "GOW3_BC_TINY image without a decodable BC format");
+    ASSERT_MSG(kind.has_value(), "ISSN_BC_TINY image without a decodable BC format");
     const u32 block_bytes = BcDecode::BlockBytes(*kind);
     const u32 texel_bytes = BcDecode::TexelBytes(*kind);
     const u32 num_layers = info.resources.layers;
@@ -1597,7 +1597,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
-    Gow3Stats::images_registered.fetch_add(1, std::memory_order_relaxed);
+    IssnStats::images_registered.fetch_add(1, std::memory_order_relaxed);
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
@@ -1765,17 +1765,17 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
-    Gow3Stats::Timer gc_timer{Gow3Stats::t_gc};
+    IssnStats::Timer gc_timer{IssnStats::t_gc};
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
-        // gow3: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
+        // port: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
         // collector evicted images used two or three frames ago on every submission and wrote
         // GPU-written ones back. Compare with the driver's current budget instead.
-        // GOW3_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
+        // ISSN_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
         static const u64 forced_budget = [] {
-            const char* env = std::getenv("GOW3_GC_BUDGET_MB");
+            const char* env = std::getenv("ISSN_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
         if (instance.IsIntegrated() || forced_budget) {
@@ -1824,7 +1824,7 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         if (download) {
-            // gow3: synchronously, while the image still protects its pages. A deferred
+            // port: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
             // had meanwhile stored there (e.g. its heap after unloading an area).
             DownloadImageMemory(image_id, true);
@@ -1855,7 +1855,7 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
-    // gow3: evictions under memory pressure, at most every 5 s (GOW3_FRAME_STATS or not).
+    // port: evictions under memory pressure, at most every 5 s (ISSN_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=inFAMOUS Second Son
+Comment=PC port of inFAMOUS Second Son (bring your own game dump)
+Exec=AppRun
+Icon=issn
+Categories=Game;
+Terminal=false
+StartupWMClass=issn

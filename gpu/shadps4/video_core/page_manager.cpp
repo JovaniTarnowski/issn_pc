@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
-#include "gow3_toggles.h"
+#include "issn_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -75,12 +75,12 @@ struct PageManager::Impl {
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
-    // gow3: GOW3_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
+    // port: ISSN_FAULT_PROFILE=1 prints, every 5 s, the guest instructions whose faults on GPU
     // tracked pages cost the most time (which game code waits on the GPU, and for what).
     struct FaultSite { u64 count = 0, ns = 0; VAddr last = 0; u64 caller = 0; bool write = false; };
     static void ProfileFault(void* context, VAddr addr, bool write, u64 ns) {
 #if defined(__linux__) || defined(_WIN32)
-        static const bool enabled = [] { const char* e = std::getenv("GOW3_FAULT_PROFILE"); return e && *e == '1'; }();
+        static const bool enabled = [] { const char* e = std::getenv("ISSN_FAULT_PROFILE"); return e && *e == '1'; }();
         if (!enabled) {
             return;
         }
@@ -141,17 +141,17 @@ struct PageManager::Impl {
     }
 
     static bool HandleGuestFault(void* context, VAddr addr) {
-        // gow3: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
+        // port: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {
-            Gow3Stats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
+            IssnStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
         if (Common::IsWriteError(context)) {
-            Gow3Stats::Timer timer{Gow3Stats::t_write_faults};
+            IssnStats::Timer timer{IssnStats::t_write_faults};
             return rasterizer->OnWriteFault(addr, is_gpu_thread);
         } else {
-            Gow3Stats::read_faults.fetch_add(1, std::memory_order_relaxed);
-            Gow3Stats::Timer timer{Gow3Stats::t_read_faults};
+            IssnStats::read_faults.fetch_add(1, std::memory_order_relaxed);
+            IssnStats::Timer timer{IssnStats::t_read_faults};
             return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
         }
         return false;
@@ -304,12 +304,12 @@ struct PageManager::Impl {
 };
 
 #ifdef __linux__
-// gow3: write tracking with userfaultfd write-protection instead of mprotect. mprotect takes
+// port: write tracking with userfaultfd write-protection instead of mprotect. mprotect takes
 // the address space lock for writing and splits mappings; while guest threads fault on
 // per-frame buffers and the GPU thread re-protects uploaded pages, every page fault in the
 // process (copy threads included) waits for it. UFFDIO_WRITEPROTECT changes page table bits
 // under the lock for reading. Read protection (readbacks) still uses mprotect: userfaultfd
-// write-protection cannot deny reads. GOW3_UFFD=1.
+// write-protection cannot deny reads. ISSN_UFFD=1.
 struct UffdImpl : public PageManager::Impl {
 private:
     std::jthread ufd_thread;
@@ -408,7 +408,7 @@ public:
     }
 
     void UffdHandler(std::stop_token token) {
-        Common::SetCurrentThreadName("gow3:Uffd");
+        Common::SetCurrentThreadName("port:Uffd");
         while (!token.stop_requested()) {
             pollfd pollfd{};
             pollfd.fd = uffd;
@@ -429,7 +429,7 @@ public:
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
             {
-                Gow3Stats::Timer timer{Gow3Stats::t_write_faults};
+                IssnStats::Timer timer{IssnStats::t_write_faults};
                 rasterizer->OnWriteFault(addr, rasterizer->IsGpuSideThreadId(ptid));
             }
             // Protect() clears with DONTWAKE (it may run for pages nobody waits on).
@@ -465,7 +465,7 @@ struct SignalImpl : public PageManager::Impl {
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__
-    if (std::getenv("GOW3_UFFD") && std::getenv("GOW3_UFFD")[0] == '1') {
+    if (std::getenv("ISSN_UFFD") && std::getenv("ISSN_UFFD")[0] == '1') {
         try {
             impl = std::make_unique<UffdImpl>(rasterizer_);
             LOG_INFO(Config, "Memory tracking method: userfaultfd");

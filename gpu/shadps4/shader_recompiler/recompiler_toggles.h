@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// gow3: recompiler fixes ported from the Shadow of the Colossus native port
+// port: recompiler fixes ported from the Shadow of the Colossus native port
 // (github.com/AjncSystem/ShadowOfTheColossus-PC, MIT/GPL-2.0, commits 6f0b3e56, debb0c49,
 // e3227814 and its vendored shared_memory_barrier_pass.cpp at 70bb4385) and the env switches
 // that turn them on or off for A/B tests. Each switch is read once. The ISS_/GR2_ names reach
-// here as GOW3_ (the probe aliases the port prefix at start-up).
+// here as ISSN_ (the probe aliases the port prefix at start-up).
 
 #pragma once
 
@@ -17,7 +17,7 @@
 namespace Shader::Toggles {
 
 namespace Detail {
-/// GOW3_<name>=0/1 when set, otherwise the default (only evaluated then).
+/// ISSN_<name>=0/1 when set, otherwise the default (only evaluated then).
 inline bool EnvFlag(const char* name, bool (*fallback)()) {
     const char* v = std::getenv(name);
     return v && *v ? std::atoi(v) != 0 : fallback();
@@ -36,9 +36,9 @@ inline bool InfamousDefault() {
 } // namespace Detail
 
 /// Workgroups smaller than one GCN wave (<64 threads) get LDS barriers like a 64-thread one.
-/// GOW3_LDS_SMALL=0/1; default on for inFAMOUS only.
+/// ISSN_LDS_SMALL=0/1; default on for inFAMOUS only.
 inline bool SmallGroupLdsBarriers() {
-    static const bool enabled = Detail::EnvFlag("GOW3_LDS_SMALL", &Detail::InfamousDefault);
+    static const bool enabled = Detail::EnvFlag("ISSN_LDS_SMALL", &Detail::InfamousDefault);
     return enabled;
 }
 
@@ -46,24 +46,24 @@ inline bool SmallGroupLdsBarriers() {
 /// ...) get barriers where the guest relies on lockstep inside one wave. On 32-wide hardware
 /// every 64-lane guest wave spans two host subgroups, so these are workgroup barriers; only
 /// when each guest wave fits in one host subgroup (64-wide hardware) is a subgroup barrier
-/// enough. GOW3_LDS_MULTI=0/1; default on for inFAMOUS only.
+/// enough. ISSN_LDS_MULTI=0/1; default on for inFAMOUS only.
 inline bool MultiWaveLdsBarriers() {
-    static const bool enabled = Detail::EnvFlag("GOW3_LDS_MULTI", &Detail::InfamousDefault);
+    static const bool enabled = Detail::EnvFlag("ISSN_LDS_MULTI", &Detail::InfamousDefault);
     return enabled;
 }
 
 /// The LDS barrier pass treats a ReadLane with a constant lane in uniform flow as uniform when
 /// it decides whether a branch is divergent (one-wave workgroups only). From Pink-shadPS4
-/// (luizgustavs) via SotC. GOW3_LDS_READLANE=0/1; default on for inFAMOUS only.
+/// (luizgustavs) via SotC. ISSN_LDS_READLANE=0/1; default on for inFAMOUS only.
 inline bool LdsUniformReadLane() {
-    static const bool enabled = Detail::EnvFlag("GOW3_LDS_READLANE", &Detail::InfamousDefault);
+    static const bool enabled = Detail::EnvFlag("ISSN_LDS_READLANE", &Detail::InfamousDefault);
     return enabled;
 }
 
-/// S_WQM_B64 writes the source mask grown to whole quads (it was a no-op). GOW3_WQM=0 restores
+/// S_WQM_B64 writes the source mask grown to whole quads (it was a no-op). ISSN_WQM=0 restores
 /// the no-op; default on for every game (correctness fix).
 inline bool WholeQuadMode() {
-    static const bool enabled = Detail::EnvFlag("GOW3_WQM", &Detail::AlwaysOn);
+    static const bool enabled = Detail::EnvFlag("ISSN_WQM", &Detail::AlwaysOn);
     return enabled;
 }
 
@@ -71,20 +71,20 @@ inline bool WholeQuadMode() {
 /// sources other than LocalInvocationId: LocalInvocationIndex, LaneId, the lane masks behind
 /// v_mbcnt (SubgroupLtMask) and the values returned by atomics. Without it the append pattern's
 /// "if (mbcnt == 0) atomic" looked uniform, so barriers (the wave64 exchanges included) landed
-/// inside a branch only one lane takes, which Vulkan leaves undefined. GOW3_LANE_DIVERGENCE=0
+/// inside a branch only one lane takes, which Vulkan leaves undefined. ISSN_LANE_DIVERGENCE=0
 /// restores the old test; default on for inFAMOUS only.
 inline bool LaneDivergence() {
-    static const bool enabled = Detail::EnvFlag("GOW3_LANE_DIVERGENCE", &Detail::InfamousDefault);
+    static const bool enabled = Detail::EnvFlag("ISSN_LANE_DIVERGENCE", &Detail::InfamousDefault);
     return enabled;
 }
 
 /// Lowers v_readfirstlane in every compute shader wider than a 32-lane host wave (not only in
 /// those that also use ballots or v_mbcnt): the two host halves of a wave64 swap the value
 /// through LDS so both read the first active lane of the whole wave, in uniform flow, unless the
-/// value is provably the same in every lane. GOW3_RFL_ALL=0/1; default off (experiment: adds two
+/// value is provably the same in every lane. ISSN_RFL_ALL=0/1; default off (experiment: adds two
 /// workgroup barriers per lowered instruction).
 inline bool ReadFirstLaneAll() {
-    static const bool enabled = Detail::EnvFlag("GOW3_RFL_ALL", [] { return false; });
+    static const bool enabled = Detail::EnvFlag("ISSN_RFL_ALL", [] { return false; });
     return enabled;
 }
 
@@ -100,14 +100,14 @@ inline std::uint32_t ShaderBinarySalt() {
 /// callback so this header stays free of the logging includes.
 template <typename Log>
 inline void LogStates(Log&& log) {
-    log("GOW3_LDS_SMALL", SmallGroupLdsBarriers(), "LDS barriers in workgroups under 64 threads");
-    log("GOW3_LDS_MULTI", MultiWaveLdsBarriers(),
+    log("ISSN_LDS_SMALL", SmallGroupLdsBarriers(), "LDS barriers in workgroups under 64 threads");
+    log("ISSN_LDS_MULTI", MultiWaveLdsBarriers(),
         "LDS barriers in workgroups over 64 threads (workgroup scope on 32-wide GPUs)");
-    log("GOW3_LDS_READLANE", LdsUniformReadLane(), "uniform constant-lane ReadLane in LDS barriers");
-    log("GOW3_WQM", WholeQuadMode(), "S_WQM_B64 grows the mask to quads");
-    log("GOW3_LANE_DIVERGENCE", LaneDivergence(),
+    log("ISSN_LDS_READLANE", LdsUniformReadLane(), "uniform constant-lane ReadLane in LDS barriers");
+    log("ISSN_WQM", WholeQuadMode(), "S_WQM_B64 grows the mask to quads");
+    log("ISSN_LANE_DIVERGENCE", LaneDivergence(),
         "mbcnt masks, lane ids and atomic results make a branch divergent");
-    log("GOW3_RFL_ALL", ReadFirstLaneAll(), "wave64 ReadFirstLane lowered in every wide compute shader");
+    log("ISSN_RFL_ALL", ReadFirstLaneAll(), "wave64 ReadFirstLane lowered in every wide compute shader");
 }
 
 } // namespace Shader::Toggles

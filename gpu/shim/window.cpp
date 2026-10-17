@@ -1,4 +1,4 @@
-// gow3: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+// port: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -7,18 +7,18 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
-#include "gow3_overlay.h"
-#include "gow3_graphics.h"
-#include "gow3_settings.h"
+#include "issn_overlay.h"
+#include "issn_graphics.h"
+#include "issn_settings.h"
 
 namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
-    // gow3: the desktop shows this name and matches the app id with the launcher's .desktop entry
-    // (Alt+Tab, dock). The launcher sets GOW3_APP_NAME / GOW3_APP_ID per game.
+    // port: the desktop shows this name and matches the app id with the launcher's .desktop entry
+    // (Alt+Tab, dock). The launcher sets ISSN_APP_NAME / ISSN_APP_ID per game.
     {
-        const char* app_name = std::getenv("GOW3_APP_NAME");
-        const char* app_id = std::getenv("GOW3_APP_ID");
+        const char* app_name = std::getenv("ISSN_APP_NAME");
+        const char* app_id = std::getenv("ISSN_APP_ID");
         SDL_SetAppMetadata(app_name && *app_name ? app_name : "The Last Guardian", nullptr,
                            app_id && *app_id ? app_id : "tlg-pc");
         SDL_SetHint(SDL_HINT_APP_ID, app_id && *app_id ? app_id : "tlg-pc");
@@ -27,7 +27,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
-    // gow3: the window opens at the game's size (1920x1080) unless the screen is smaller: on a
+    // port: the window opens at the game's size (1920x1080) unless the screen is smaller: on a
     // 1366x768 laptop it was larger than the screen and the picture was cut. It then opens at the
     // largest same-shape size that fits the usable area (taskbar and title bar kept clear); it can
     // still be maximized, resized or made fullscreen.
@@ -55,8 +55,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
-    // gow3: the game's own icon (run.py converts sce_sys/icon0.png to BMP, SDL's built-in format).
-    if (const char* icon_path = std::getenv("GOW3_WINDOW_ICON")) {
+    // port: the game's own icon (run.py converts sce_sys/icon0.png to BMP, SDL's built-in format).
+    if (const char* icon_path = std::getenv("ISSN_WINDOW_ICON")) {
         if (SDL_Surface* icon = SDL_LoadBMP(icon_path)) {
             SDL_SetWindowIcon(window, icon);
             SDL_DestroySurface(icon);
@@ -82,13 +82,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
     }
-    // gow3: GOW3_FULLSCREEN=1 (older launchers) still asks for fullscreen.
-    if (const char* fullscreen = std::getenv("GOW3_FULLSCREEN"); fullscreen && fullscreen[0] == '1' &&
-        Gow3Settings::Get().display_mode == Gow3Graphics::Windowed) {
-        Gow3Settings::Get().display_mode = Gow3Graphics::Borderless;
+    // port: ISSN_FULLSCREEN=1 (older launchers) still asks for fullscreen.
+    if (const char* fullscreen = std::getenv("ISSN_FULLSCREEN"); fullscreen && fullscreen[0] == '1' &&
+        IssnSettings::Get().display_mode == IssnGraphics::Windowed) {
+        IssnSettings::Get().display_mode = IssnGraphics::Borderless;
     }
-    ApplyDisplayMode(Gow3Settings::Get().display_mode);
-    // gow3: no system cursor over the game; the in-game menu draws its own (Gow3Overlay::SetOpen).
+    ApplyDisplayMode(IssnSettings::Get().display_mode);
+    // port: no system cursor over the game; the in-game menu draws its own (IssnOverlay::SetOpen).
     // (ps4_core: UpdateMouseCapture shows it again while Esc keeps the game's mouse released.)
     SDL_HideCursor();
     int w = 0, h = 0;
@@ -102,18 +102,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 // mode. Window thread only (SDL). The swapchain follows the size events.
 void WindowSDL::ApplyDisplayMode(int mode) {
     display_mode = mode;
-    if (mode == Gow3Graphics::Windowed) {
+    if (mode == IssnGraphics::Windowed) {
         SDL_SetWindowFullscreen(window, false);
     } else {
         const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window));
-        const bool exclusive = mode == Gow3Graphics::Fullscreen && desktop;
+        const bool exclusive = mode == IssnGraphics::Fullscreen && desktop;
         if (!SDL_SetWindowFullscreenMode(window, exclusive ? desktop : nullptr)) {
             LOG_WARNING(Frontend, "Fullscreen mode: {}", SDL_GetError());
         }
         SDL_SetWindowFullscreen(window, true);
     }
     SDL_SyncWindow(window);
-    std::printf("Window: %s\n", Gow3Graphics::DisplayModeNames[mode]);
+    std::printf("Window: %s\n", IssnGraphics::DisplayModeNames[mode]);
 }
 
 WindowSDL::~WindowSDL() {
@@ -138,7 +138,7 @@ void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
     SDL_SetWindowTitle(window, title.c_str());
-    Gow3Overlay::SetTextEntry(text_active, text_prompt, text);
+    IssnOverlay::SetTextEntry(text_active, text_prompt, text);
 }
 
 bool WindowSDL::PollEvents() {
@@ -152,9 +152,9 @@ bool WindowSDL::PollEvents() {
         }
     }
     if (!text_active) {
-        Gow3Overlay::UpdateTextInput(window);
+        IssnOverlay::UpdateTextInput(window);
     }
-    if (const int mode = Gow3Settings::Get().display_mode; mode != display_mode) {
+    if (const int mode = IssnSettings::Get().display_mode; mode != display_mode) {
         ApplyDisplayMode(mode);
     }
     SDL_Event event;
@@ -186,7 +186,7 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
-        if (Gow3Overlay::HandleEvent(event)) {
+        if (IssnOverlay::HandleEvent(event)) {
             continue;
         }
         switch (event.type) {

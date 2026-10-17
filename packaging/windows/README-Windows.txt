@@ -1,9 +1,19 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.1.0
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.2.0
 ======================================================
 
 A test build for a few testers: the game plays from the start, with stutter (shaders compiled as
-they are first used), about 25-30 FPS and some cut or broken effects. Please report how far you
-get and what goes wrong (see Reporting problems).
+they are first used), about 40-45 FPS in the open city and 35-40 FPS in combat on an RX 9060 XT,
+and some flickering effects. Please report how far you get and what goes wrong (see Reporting
+problems).
+
+What's new in 0.2.0
+- Faster: the effects the game waits for (smoke, sparks, neon, bullets) are handled before the
+  rest of the frame (combat about 29 -> 39 FPS on an RX 9060 XT). Launcher: Performance >
+  inFAMOUS > "Effects work goes ahead of drawing"; switch it off if the game freezes.
+- New launcher look, with Effects (Full, Light, Off) and Draw distance in Performance > inFAMOUS.
+- "Save a bug report" (Advanced page): a zip on the desktop with the last log and your settings.
+- The launcher checks this port's GitHub releases for updates once they are public.
+- The first start after updating compiles the shaders again (more stutter for a while).
 
 No game files are included. You need your own dump of inFAMOUS Second Son, made from your own
 copy of the game on your own PS4: CUSA00004 (Europe) or CUSA00223, base game version 01.00, as
@@ -42,8 +52,8 @@ Data
 - The game process is bin\issn-probe.exe (for RTSS, Afterburner or ReShade with Vulkan).
 
 Reporting problems
-- Send user\last_run.log (written each time the game runs) with a screenshot or a short video,
-  and say where in the game it happened.
+- Click "Save a bug report" on the Advanced page (or send user\last_run.log) with a screenshot or a
+  short video, and say where in the game it happened.
 - If the game freezes, press F10 once, wait a few seconds, then close it: the log then shows
   what each thread was doing.
 - The game does not open: check the Log page, and send user\last_run.log with your report.

@@ -31,9 +31,9 @@ std::mutex m_request{};
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
 
-#ifdef GOW3_SHADER_CACHE_KEY
-// gow3: the GPU user folder used to be chosen at load time, before the probe set
-// GOW3_GPU_USER_DIR: ~/.local/share/shadPS4 on Linux (shadPS4's own folder) and <saves>/user on
+#ifdef ISSN_SHADER_CACHE_KEY
+// port: the GPU user folder used to be chosen at load time, before the probe set
+// ISSN_GPU_USER_DIR: ~/.local/share/shadPS4 on Linux (shadPS4's own folder) and <saves>/user on
 // Windows. On the first start with the port's folder, this game's cache for the current key is
 // moved here once, so nothing is recompiled. Only that <serial>-<key> folder is taken; nothing
 // else in the shadPS4 folder is touched (an installed shadPS4 emulator may own it).
@@ -76,7 +76,7 @@ void MigrateLegacyCache(const std::filesystem::path& cache_path) {
     }
 }
 
-// gow3: shaders translated by an older recompiler are never reused: this game's folders of other
+// port: shaders translated by an older recompiler are never reused: this game's folders of other
 // keys (and the unkeyed <serial>) are removed, in the port's own cache folder only.
 void PruneOtherRevisions(const std::filesystem::path& cache_path) {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
@@ -99,9 +99,9 @@ namespace Storage {
 
 std::filesystem::path GameCacheDir() {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
-#ifdef GOW3_SHADER_CACHE_KEY
+#ifdef ISSN_SHADER_CACHE_KEY
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + GOW3_SHADER_CACHE_KEY);
+           (serial + "-" + ISSN_SHADER_CACHE_KEY);
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif
@@ -184,7 +184,7 @@ void DataBase::Open() {
         }
     } else {
         cache_path = GameCacheDir();
-#ifdef GOW3_SHADER_CACHE_KEY
+#ifdef ISSN_SHADER_CACHE_KEY
         MigrateLegacyCache(cache_path);
         PruneOtherRevisions(cache_path);
 #endif
@@ -228,7 +228,7 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
-                // gow3: write beside and rename into place, so a game that ends during the
+                // port: write beside and rename into place, so a game that ends during the
                 // write (the queue is not drained at exit) never leaves a truncated blob that
                 // the next start would load.
                 using namespace Common::FS;

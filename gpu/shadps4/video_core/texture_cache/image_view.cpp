@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/amdgpu/gow3_amd_1d.h"
+#include "video_core/amdgpu/issn_amd_1d.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -118,14 +118,14 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
-    // gow3: GOW3_BC_TINY: the image holds the decoded texels; a BC view reads them through the
+    // port: ISSN_BC_TINY: the image holds the decoded texels; a BC view reads them through the
     // matching plain format (sRGB and snorm kept), anything else through the image's own.
     if (image.info.props.is_bc_decoded) {
         const vk::Format decoded = BcTinyDecodedFormat(format);
         format = decoded != vk::Format::eUndefined ? decoded : image.info.pixel_format;
     }
 
-    // gow3: storage writes never convert to sRGB and sRGB formats cannot be storage images
+    // port: storage writes never convert to sRGB and sRGB formats cannot be storage images
     // (AMD's driver loses the device on such a view; NVIDIA tolerates it): write through the
     // UNORM format, which stores the same bytes.
     if (info.is_storage) {
@@ -153,7 +153,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
-        // gow3: views of a block-compressed 1D image are 2D (the image is 2D in Vulkan).
+        // port: views of a block-compressed 1D image are 2D (the image is 2D in Vulkan).
         .viewType = image.info.props.is_host_2d
                         ? (info.type == AmdGpu::ImageType::Color1DArray ? vk::ImageViewType::e2DArray
                                                                          : vk::ImageViewType::e2D)
@@ -176,7 +176,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     const bool trace_1d = AmdGpu::ImgTrace() && (image_view_ci.viewType == vk::ImageViewType::e1D ||
                                                  image_view_ci.viewType == vk::ImageViewType::e1DArray);
     if (trace_1d) {
-        GOW3_IMG_TRACE("create 1D view %s of image %p %s mips %u+%u layers %u+%u usage %s\n",
+        ISSN_IMG_TRACE("create 1D view %s of image %p %s mips %u+%u layers %u+%u usage %s\n",
                       vk::to_string(image_view_ci.viewType).c_str(), (void*)VkImage(image_view_ci.image),
                       vk::to_string(image_view_ci.format).c_str(), info.range.base.level,
                       info.range.extent.levels, info.range.base.layer, info.range.extent.layers,
@@ -184,7 +184,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     }
     auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
     if (trace_1d) {
-        GOW3_IMG_TRACE("created 1D view: %s\n", vk::to_string(view_result).c_str());
+        ISSN_IMG_TRACE("created 1D view: %s\n", vk::to_string(view_result).c_str());
     }
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
                vk::to_string(view_result));

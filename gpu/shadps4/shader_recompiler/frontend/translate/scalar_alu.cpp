@@ -102,7 +102,7 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
         case Opcode::S_NOT_B64:
             return S_NOT_B64(inst);
         case Opcode::S_WQM_B64: {
-            // gow3: from the SotC native port (AjncSystem/ShadowOfTheColossus-PC, commits debb0c49
+            // port: from the SotC native port (AjncSystem/ShadowOfTheColossus-PC, commits debb0c49
             // and e3227814); it was a no-op here.
             // s_wqm_b64 exec, exec needs nothing: pixel lanes already run as whole quads. Other
             // forms write the source mask grown to whole quads (a quad with any bit set gets all
@@ -110,7 +110,7 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             // s_and_saveexec_b64 vcc; leaving VCC unset made that branch take garbage and skip the
             // water normal map. A plain copy is not enough: alpha-tested foliage grows its test
             // mask to quads so the neighbours used for the texture LOD stay alive.
-            // GOW3_WQM=0 restores the old no-op (A/B comparisons).
+            // ISSN_WQM=0 restores the old no-op (A/B comparisons).
             if (!Toggles::WholeQuadMode() || (inst.dst[0].field == OperandField::ExecLo &&
                                                inst.src[0].field == OperandField::ExecLo)) {
                 break;

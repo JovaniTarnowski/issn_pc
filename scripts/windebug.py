@@ -1,4 +1,4 @@
-"""issn: runs the probe under a minimal Windows debugger (GOW3_DEBUGGER=1).
+"""issn: runs the probe under a minimal Windows debugger (ISSN_DEBUGGER=1).
 
 A fast fail (status 0xC0000409: __fastfail, a /GS stack cookie check, an invalid-parameter
 report in a DLL with its own C runtime) ends a process without running any of its handlers, and

@@ -82,7 +82,7 @@ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view pa
             return false;
         }
     } else {
-        // gow3: guest paths are translated by the port's file system (runtime_file.c).
+        // port: guest paths are translated by the port's file system (runtime_file.c).
         char host[1024];
         if (runtime_file_translate(std::string(path).c_str(), host, sizeof(host)) != 0) {
             LOG_ERROR(Lib_AvPlayer, "Cannot translate guest path {}", path);
@@ -314,7 +314,7 @@ bool AvPlayerSource::Stop() {
         m_up_data_streamer->Reset();
     }
 
-    // gow3: ask all three to stop, wake every queue they may wait on, then join. Joining one at a
+    // port: ask all three to stop, wake every queue they may wait on, then join. Joining one at a
     // time left Gravity Rush 2 stuck in sceAvPlayerStop after its opening movie: a decoder
     // waiting on its queue was not woken by the stop request alone.
     m_video_decoder_thread.RequestStop();

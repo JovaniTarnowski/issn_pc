@@ -13,7 +13,7 @@ namespace Shader {
 struct Profile;
 struct RuntimeInfo;
 
-/// gow3: thrown by a recompiler pass for a shader it cannot translate. The pipeline cache marks
+/// port: thrown by a recompiler pass for a shader it cannot translate. The pipeline cache marks
 /// the shader (or its permutation) failed and skips the draws that use it, where an ASSERT would
 /// end the whole game.
 struct UnsupportedShaderError : std::runtime_error {

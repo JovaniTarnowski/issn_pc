@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// gow3: frame recorder, for effects that flicker in a static scene. GOW3_FRAME_RECORD_TRIGGER=<file>:
+// port: frame recorder, for effects that flicker in a static scene. ISSN_FRAME_RECORD_TRIGGER=<file>:
 // once the file exists, the next two complete frames (flip to flip) are recorded command by
 // command, graphics and compute queues in the order the GPU command thread runs them, and
-// written to GOW3_DUMP_DIR (default out/dump) as frame_record_0.txt and frame_record_1.txt; the
+// written to ISSN_DUMP_DIR (default out/dump) as frame_record_0.txt and frame_record_1.txt; the
 // trigger file is removed when they are written. Each line is one command with the inputs of
 // draws and dispatches: shaders and permutations, counts (indirect arguments as the GPU reads
 // them), bound buffers with a content hash, images, render targets, viewport and blend/depth/

@@ -1,4 +1,4 @@
-// gow3: host threads that may call guest code (AvPlayer allocator callbacks).
+// port: host threads that may call guest code (AvPlayer allocator callbacks).
 // Each thread gets a guest TCB (GS base, TLS) from the C runtime before running.
 #pragma once
 #include <atomic>
@@ -21,13 +21,13 @@ public:
     void Run(std::function<void(std::stop_token)>&& func) {
         finished = std::make_shared<std::atomic<bool>>(false);
         thread = std::jthread([func = std::move(func), done = finished](std::stop_token stop) {
-            runtime_thread_attach_host("gow3:hle");
+            runtime_thread_attach_host("port:hle");
             func(stop);
             done->store(true);
         });
     }
     // A thread may stop its own Thread object (AvPlayer does); it detaches instead of joining.
-    // gow3: these are called from guest code, which a C++ exception cannot unwind: a failed
+    // port: these are called from guest code, which a C++ exception cannot unwind: a failed
     // join is logged and the thread detached instead.
     void Join() {
         if (!thread.joinable()) return;
@@ -35,7 +35,7 @@ public:
             if (thread.get_id() == std::this_thread::get_id()) thread.detach();
 #ifndef _WIN32
             else if (finished) {
-                // gow3: Gravity Rush 2 hung 86 s in sceAvPlayerStop joining an AvPlayer decoder
+                // port: Gravity Rush 2 hung 86 s in sceAvPlayerStop joining an AvPlayer decoder
                 // whose function had already returned (its exit log was printed; the join only
                 // came back when a debugger attached). Wait for the function itself, then let the
                 // exiting thread go: after `finished` it touches nothing of its owner. Linux only:
@@ -59,7 +59,7 @@ public:
         }
     }
     bool Joinable() const { return thread.joinable(); }
-    /// gow3: asks the thread to stop without waiting (Stop() joins); callers that hold several
+    /// port: asks the thread to stop without waiting (Stop() joins); callers that hold several
     /// threads ask them all first, wake what they wait on, then join.
     void RequestStop() {
         if (thread.joinable()) thread.request_stop();

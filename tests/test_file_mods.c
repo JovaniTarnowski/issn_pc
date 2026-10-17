@@ -4,13 +4,13 @@
 static int32_t guest_errno;
 int32_t *runtime_errno(void) { return &guest_errno; }
 int32_t runtime_guest_errno(int e) { return e; }
-int gow3gpu_cpu_write(void *dst, const void *src, int fill, uint64_t size) { (void)dst; (void)src; (void)fill; (void)size; return 0; }
+int issngpu_cpu_write(void *dst, const void *src, int fill, uint64_t size) { (void)dst; (void)src; (void)fill; (void)size; return 0; }
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
     for (size_t i=0;i<n;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
 }
 int main(void) {
-    char root[]="/tmp/gow3-mod-files-XXXXXX";
+    char root[]="/tmp/issn-mod-files-XXXXXX";
     assert(mkdtemp(root));
     char game[512],user[512],source[512],link[512];
     snprintf(game,sizeof(game),"%s/game",root);

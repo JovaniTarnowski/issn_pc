@@ -15,7 +15,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
-#include "gow3_freeze.h"
+#include "issn_freeze.h"
 
 namespace Libraries::Kernel {
 
@@ -322,7 +322,7 @@ static s32 NextEqueueHandle() { // tlg
 
 s32 PS4_SYSV_ABI posix_kqueue() {
     // Reserve a file handle for the kqueue
-    // gow3: equeue handles come from their own range, not the file table.
+    // port: equeue handles come from their own range, not the file table.
     s32 kqueue_handle = NextEqueueHandle();
 
     // Plenty of equeue logic uses names to identify queues.
@@ -439,7 +439,7 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name) 
     LOG_INFO(Kernel_Event, "name = {}", name);
 
     // Reserve a file handle for the kqueue
-    // gow3: equeue handles come from their own range, not the file table.
+    // port: equeue handles come from their own range, not the file table.
     OrbisKernelEqueue kqueue_handle = NextEqueueHandle();
 
     // Create the equeue
@@ -481,8 +481,8 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
     }
 
     {
-        // gow3: freeze report (the equeue name says which: flip, GPU EOP, user events...).
-        Gow3Freeze::WaitScope wait{timo ? "event queue (timed)" : "event queue",
+        // port: freeze report (the equeue name says which: flip, GPU EOP, user events...).
+        IssnFreeze::WaitScope wait{timo ? "event queue (timed)" : "event queue",
                                   reinterpret_cast<const void*>(static_cast<std::uintptr_t>(eq)),
                                   equeue->GetName().data(),
                                   reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0))};

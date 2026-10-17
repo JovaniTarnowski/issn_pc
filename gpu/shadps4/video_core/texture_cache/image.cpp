@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/amdgpu/gow3_amd_1d.h"
-#include "gow3_toggles.h"
+#include "video_core/amdgpu/issn_amd_1d.h"
+#include "issn_toggles.h"
 #include <atomic>
 #include <cstdlib>
 #include <ranges>
@@ -28,7 +28,7 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                 vk::ImageUsageFlagBits::eTransferDst |
                                 vk::ImageUsageFlagBits::eSampled;
     if (info.props.is_bc_decoded) {
-        // gow3: GOW3_BC_TINY: a texture only ever filled by uploads and sampled.
+        // port: ISSN_BC_TINY: a texture only ever filled by uploads and sampled.
         return usage;
     }
     if (!info.props.is_block) {
@@ -94,14 +94,14 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
-        GOW3_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
+        ISSN_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
-        GOW3_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
+        ISSN_IMG_TRACE("destroy image %p\n", (void*)VkImage(image));
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
@@ -126,7 +126,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-        // gow3: see UniqueBuffer::Create: past the budget, the driver moves memory out instead of
+        // port: see UniqueBuffer::Create: past the budget, the driver moves memory out instead of
         // failing (shadPS4-Infamous-FixBuild e656365e).
         LOG_WARNING(Render_Vulkan, "Allocating an image went over the memory budget, allocating "
                                    "it past the budget");
@@ -145,7 +145,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
     : guest_begin{info_.guest_address}, guest_end{info_.guest_address + info_.guest_size},
       info{info_}, runtime{&runtime_}, slot_image_views{&slot_image_views_} {
-    Gow3Stats::Timer timer{Gow3Stats::t_image_create};
+    IssnStats::Timer timer{IssnStats::t_image_create};
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
@@ -165,7 +165,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     usage_flags = ImageUsageFlags(instance, info);
-    // gow3: GOW3_1D_NO_STORAGE / GOW3_1D_NO_MUTABLE (video_core/amdgpu/gow3_amd_1d.h).
+    // port: ISSN_1D_NO_STORAGE / ISSN_1D_NO_MUTABLE (video_core/amdgpu/issn_amd_1d.h).
     const bool host_1d = !info.props.is_host_2d && ConvertImageType(info.type) == vk::ImageType::e1D;
     if (host_1d && AmdGpu::img_1d_no_storage.load(std::memory_order_relaxed)) {
         usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
@@ -192,7 +192,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     };
     auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    // gow3: storage usage is speculative (see ImageUsageFlags). Drivers that refuse it for a
+    // port: storage usage is speculative (see ImageUsageFlags). Drivers that refuse it for a
     // format (AMD's Windows driver for BC6H) get the image without it: creating the unsupported
     // combination anyway loses the device a few frames later.
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
@@ -210,17 +210,17 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
                   vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-        // gow3: GOW3_BC1D_LOG=1 (PROPOSTA_BC1D_NVIDIA.diff), diagnostics only: one line per image
+        // port: ISSN_BC1D_LOG=1 (PROPOSTA_BC1D_NVIDIA.diff), diagnostics only: one line per image
         // created although the driver reports its format/type unsupported (BC 1D on NVIDIA), to
         // tell streaming churn from one hot image and to match against flicker moments.
         static const bool bc1d_log = [] {
-            const char* e = std::getenv("GOW3_BC1D_LOG");
+            const char* e = std::getenv("ISSN_BC1D_LOG");
             return e && *e == '1';
         }();
         if (bc1d_log) {
             static std::atomic<u32> created{0};
             LOG_WARNING(Render_Vulkan,
-                        "gow3: unsupported image #{} {} {} {}x{} layers {} mips {} tile {} at "
+                        "port: unsupported image #{} {} {} {}x{} layers {} mips {} tile {} at "
                         "{:#x}+{:#x} tick {}",
                         created.fetch_add(1) + 1, vk::to_string(supported_format),
                         vk::to_string(format_info.type), info.size.width, info.size.height,
@@ -253,7 +253,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
     if (host_1d) {
-        GOW3_IMG_TRACE("create 1D image %ux%u layers %u mips %u %s flags %s usage %s at %#llx\n",
+        ISSN_IMG_TRACE("create 1D image %ux%u layers %u mips %u %s flags %s usage %s at %#llx\n",
                       info.size.width, info.size.height, u32(info.resources.layers),
                       u32(info.resources.levels), vk::to_string(supported_format).c_str(),
                       vk::to_string(flags).c_str(), vk::to_string(usage_flags).c_str(),
@@ -261,7 +261,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
     backing->image.Create(image_ci);
     if (host_1d) {
-        GOW3_IMG_TRACE("created 1D image %p\n", (void*)VkImage(backing->image.image));
+        ISSN_IMG_TRACE("created 1D image %p\n", (void*)VkImage(backing->image.image));
     }
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),

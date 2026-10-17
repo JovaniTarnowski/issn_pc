@@ -340,8 +340,8 @@ enum class InterruptSelect : u32 {
     IrqUndocumented = 3,
 };
 
-// gow3: GOW3_GPU_TIMESTAMP=fixed (ISS_GPU_TIMESTAMP): GPU timestamps advance a fixed step per
-// write (GOW3_GPU_TIMESTAMP_STEP_US, default 20 us) instead of reading the host clock when the
+// port: ISSN_GPU_TIMESTAMP=fixed (ISS_GPU_TIMESTAMP): GPU timestamps advance a fixed step per
+// write (ISSN_GPU_TIMESTAMP_STEP_US, default 20 us) instead of reading the host clock when the
 // packet is parsed. Our timestamps mark when the command processor reached the packet, not when
 // the GPU finished the work before it, so a game that budgets effects by measured GPU time sees
 // noise. Diagnostic for inFAMOUS distant smoke flickering (emitters dropped every other frame).
@@ -353,9 +353,9 @@ struct GpuTimestampOverride {
     std::atomic<u64> next_ns{};
 
     GpuTimestampOverride() {
-        const char* env = std::getenv("GOW3_GPU_TIMESTAMP");
+        const char* env = std::getenv("ISSN_GPU_TIMESTAMP");
         fixed = env && std::strcmp(env, "fixed") == 0;
-        if (const char* step = std::getenv("GOW3_GPU_TIMESTAMP_STEP_US")) {
+        if (const char* step = std::getenv("ISSN_GPU_TIMESTAMP_STEP_US")) {
             if (const u64 us = std::strtoull(step, nullptr, 10)) {
                 step_ns = us * 1000;
             }

@@ -31,7 +31,7 @@ using namespace Xbyak::util;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
-// gow3: the shader compiler and the background cache warm-up append walkers from different
+// port: the shader compiler and the background cache warm-up append walkers from different
 // threads.
 static std::mutex g_srt_codegen_mutex;
 
@@ -836,7 +836,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
             inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             continue;
         }
-        // gow3: a ReadConst pattern this pass does not know (new area of inFAMOUS, 2026-10-15) used
+        // port: a ReadConst pattern this pass does not know (new area of inFAMOUS, 2026-10-15) used
         // to abort the whole game. The shader is reported and refused instead: the pipeline cache
         // marks it failed and the draws that use it are skipped.
         if (!IsReadConstSource(base->Arg(0)) || !IsReadConstSource(base->Arg(1))) {
@@ -844,7 +844,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                 "shader {:#018x} ({}): ReadConst base {} not from constant memory",
                 program.info.pgm_hash, program.info.hw_stage,
                 IsReadConstSource(base->Arg(0)) ? "high" : "low");
-            LOG_ERROR(Render_Recompiler, "gow3: FlattenExtendedUserdataPass: {}", message);
+            LOG_ERROR(Render_Recompiler, "port: FlattenExtendedUserdataPass: {}", message);
             throw Shader::UnsupportedShaderError(message);
         }
 

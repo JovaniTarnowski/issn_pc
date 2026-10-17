@@ -172,7 +172,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_EXP_F32:
         return V_EXP_F32(inst);
     case Opcode::V_LOG_CLAMP_F32:
-        // gow3: BP04 (shadPS4 1c2b8f97 / #5346)
+        // port: BP04 (shadPS4 1c2b8f97 / #5346)
         if (Common::Backports::On(Common::Backports::Id::ClampOpsPlain)) {
             Common::Backports::Hit(Common::Backports::Id::ClampOpsPlain);
             return V_LOG_CLAMP_F32(inst);
@@ -189,21 +189,21 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_RCP_IFLAG_F32:
         return V_RCP_F32(inst);
     case Opcode::V_RCP_CLAMP_F32:
-        // gow3: BP04 (shadPS4 1c2b8f97 / #5346)
+        // port: BP04 (shadPS4 1c2b8f97 / #5346)
         if (Common::Backports::On(Common::Backports::Id::ClampOpsPlain)) {
             Common::Backports::Hit(Common::Backports::Id::ClampOpsPlain);
             return V_RCP_CLAMP_F32(inst);
         }
         return V_RCP_F32(inst);
     case Opcode::V_RSQ_CLAMP_F32:
-        // gow3: BP04 (shadPS4 1c2b8f97 / #5346)
+        // port: BP04 (shadPS4 1c2b8f97 / #5346)
         if (Common::Backports::On(Common::Backports::Id::ClampOpsPlain)) {
             Common::Backports::Hit(Common::Backports::Id::ClampOpsPlain);
             return V_RSQ_CLAMP_F32(inst);
         }
         return V_RSQ_F32(inst);
     case Opcode::V_RSQ_LEGACY_F32:
-        // gow3: BP04 (shadPS4 1c2b8f97 / #5346)
+        // port: BP04 (shadPS4 1c2b8f97 / #5346)
         if (Common::Backports::On(Common::Backports::Id::ClampOpsPlain)) {
             Common::Backports::Hit(Common::Backports::Id::ClampOpsPlain);
             return V_RSQ_LEGACY_F32(inst);

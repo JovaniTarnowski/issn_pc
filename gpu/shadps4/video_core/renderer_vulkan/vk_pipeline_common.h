@@ -31,7 +31,7 @@ class Instance;
 class Scheduler;
 class DescriptorHeap;
 
-/// gow3: whether creating a pipeline that failed with `result` on `attempt` (from 1) is tried
+/// port: whether creating a pipeline that failed with `result` on `attempt` (from 1) is tried
 /// again, after waiting a little longer each time for the driver to recover.
 bool RetryPipelineCreation(vk::Result result, u32 attempt, std::string_view kind,
                            std::string_view name);
@@ -50,14 +50,14 @@ public:
         return *pipeline;
     }
 
-    /// gow3: false while a compute pipeline met in game is still being built on a compiler
+    /// port: false while a compute pipeline met in game is still being built on a compiler
     /// thread (vk_compute_pipeline.cpp). Handle() then waits for it: bind it where the commands
     /// are recorded into Vulkan, so only the recording thread waits (DeferredBind).
     [[nodiscard]] bool IsBuilt() const noexcept {
         return !build || build->handle.load(std::memory_order_acquire) != VK_NULL_HANDLE;
     }
 
-    /// gow3: binds recorded for the Vulkan recording thread of pipelines still being built.
+    /// port: binds recorded for the Vulkan recording thread of pipelines still being built.
     static inline std::atomic<u32> deferred_binds{0};
 
     vk::PipelineLayout GetLayout() const noexcept {
@@ -87,11 +87,11 @@ public:
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
-    /// gow3: GOW3_WAVE_STATS=1: logs the subgroup width the driver compiled each stage of
+    /// port: ISSN_WAVE_STATS=1: logs the subgroup width the driver compiled each stage of
     /// `pipeline` at (vk_wave_stats.h). Call once the pipeline exists.
     void RecordWaveSizes() const;
 
-    /// gow3: a pipeline built on a compiler thread. `handle` is what Handle() returns: null until
+    /// port: a pipeline built on a compiler thread. `handle` is what Handle() returns: null until
     /// built, or the one built without optimizations until the optimized `result` replaces it.
     struct Build {
         std::atomic<VkPipeline> handle{VK_NULL_HANDLE};

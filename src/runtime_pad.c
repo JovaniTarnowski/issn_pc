@@ -1,7 +1,7 @@
 /* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
- * Default keyboard layout (GOW3_KEY_MAP changes the buttons, see apply_button_map):
+ * Default keyboard layout (ISSN_KEY_MAP changes the buttons, see apply_button_map):
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
@@ -10,15 +10,15 @@
  *
  * issn: spray pose (pads without motion sensors). L3+R3 together, or H, turns it on and off:
  * the game reads the pad held sideways (gravity along its side, the orientation turned 90
- * degrees), L1 shakes it, and the right stick turns it to aim (angular velocity). GOW3_SPRAY_SIDE
- * =left holds it the other way up; GOW3_SPRAY_AIM=0 leaves the right stick to the game alone;
- * GOW3_SPRAY_ORIENT=level keeps the orientation level (only gravity turns sideways).
+ * degrees), L1 shakes it, and the right stick turns it to aim (angular velocity). ISSN_SPRAY_SIDE
+ * =left holds it the other way up; ISSN_SPRAY_AIM=0 leaves the right stick to the game alone;
+ * ISSN_SPRAY_ORIENT=level keeps the orientation level (only gravity turns sideways).
  *
  * issn: the motion sensors of a DualShock 4/DualSense (SDL accelerometer and gyroscope) and the
  * orientation integrated from the gyroscope; scePadSetLightBar colors the pad's light bar. */
 #define _GNU_SOURCE
 #include "runtime.h"
-#include "gpu/gow3gpu.h"
+#include "gpu/issngpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,7 +82,7 @@ static uint8_t connected_count;
 /* ---- issn: motion sensors and light bar ------------------------------------------------------
  * PS4 pads report acceleration in G (1.0 = gravity) and angular velocity in rad/s, with the pad's
  * axes: x to the right, y up, z toward the player; SDL uses the same axes, in m/s^2 and rad/s.
- * GOW3_PAD_ACCEL_UNITS=ms2 passes m/s^2 unchanged (as shadPS4 does) in case a game expects it.
+ * ISSN_PAD_ACCEL_UNITS=ms2 passes m/s^2 unchanged (as shadPS4 does) in case a game expects it.
  * Orientation: the gyroscope integrated per read (scePadResetOrientation starts it again). */
 #define STANDARD_GRAVITY 9.80665f
 enum { SENSOR_ACCEL=1, SENSOR_GYRO=2 };
@@ -94,7 +94,7 @@ static struct { uint8_t rgb[3], sent[3]; int set, applied; } light;
 
 static float accel_scale(void) {
     static int mode=-1;
-    if (mode<0) { const char *u=getenv("GOW3_PAD_ACCEL_UNITS"); mode=u && !strcmp(u,"ms2"); }
+    if (mode<0) { const char *u=getenv("ISSN_PAD_ACCEL_UNITS"); mode=u && !strcmp(u,"ms2"); }
     return mode ? 1.0f : 1.0f/STANDARD_GRAVITY;
 }
 
@@ -122,22 +122,22 @@ static void motion_shake_axis(float accel[3], uint64_t now, float scale, int axi
 static void motion_shake(float accel[3], uint64_t now, float scale) { motion_shake_axis(accel,now,scale,1,1.0f); }
 
 /* issn: the spray pose. The pad turned 90 degrees about its z axis (towards the player): its
- * x axis points up, so gravity reads along +x (-x with GOW3_SPRAY_SIDE=left). */
+ * x axis points up, so gravity reads along +x (-x with ISSN_SPRAY_SIDE=left). */
 static int spray_pose, spray_chord_held;
 static uint64_t spray_time;
 static float spray_side(void) {
     static float side;
-    if (side==0.0f) { const char *e=getenv("GOW3_SPRAY_SIDE"); side=e && !SDL_strcasecmp(e,"left") ? -1.0f : 1.0f; }
+    if (side==0.0f) { const char *e=getenv("ISSN_SPRAY_SIDE"); side=e && !SDL_strcasecmp(e,"left") ? -1.0f : 1.0f; }
     return side;
 }
 static bool spray_aim(void) {
     static int aim=-1;
-    if (aim<0) { const char *e=getenv("GOW3_SPRAY_AIM"); aim=!(e && e[0]=='0'); }
+    if (aim<0) { const char *e=getenv("ISSN_SPRAY_AIM"); aim=!(e && e[0]=='0'); }
     return aim!=0;
 }
 static bool spray_level(void) {
     static int level=-1;
-    if (level<0) { const char *e=getenv("GOW3_SPRAY_ORIENT"); level=e && !SDL_strcasecmp(e,"level"); }
+    if (level<0) { const char *e=getenv("ISSN_SPRAY_ORIENT"); level=e && !SDL_strcasecmp(e,"level"); }
     return level!=0;
 }
 static void spray_pose_set(int on) {
@@ -163,9 +163,9 @@ static void apply_spray_pose(PadData *d, bool shaking) {
     if (spray_aim()) {
         /* The right stick turns the pad: left/right about the vertical (the pad's x now), up/down
          * about the horizontal axis across it (its y), up to 2 rad/s. Signs as the tester played
-         * the spray can (the first ones were backwards on both axes); GOW3_SPRAY_INVERT=1 flips. */
+         * the spray can (the first ones were backwards on both axes); ISSN_SPRAY_INVERT=1 flips. */
         static int invert=-1;
-        if (invert<0) { const char *e=getenv("GOW3_SPRAY_INVERT"); invert=e && e[0]=='1'; }
+        if (invert<0) { const char *e=getenv("ISSN_SPRAY_INVERT"); invert=e && e[0]=='1'; }
         const float sign=invert ? -1.0f : 1.0f;
         w[0]=sign*side*2.0f*stick_unit(d->right_x);
         w[1]=sign*2.0f*stick_unit(d->right_y);
@@ -176,11 +176,11 @@ static void apply_spray_pose(PadData *d, bool shaking) {
     memcpy(d->orientation,orientation_q,sizeof(orientation_q));
 }
 
-/* The pad's light bar takes the last color the game set (GOW3_LIGHTBAR=0 leaves it alone); sent
+/* The pad's light bar takes the last color the game set (ISSN_LIGHTBAR=0 leaves it alone); sent
  * again after a reconnection, and only when it changes. Called under lock. */
 static void apply_light(SDL_Gamepad *g) {
     static int enabled=-1;
-    if (enabled<0) { const char *e=getenv("GOW3_LIGHTBAR"); enabled=!(e && e[0]=='0'); }
+    if (enabled<0) { const char *e=getenv("ISSN_LIGHTBAR"); enabled=!(e && e[0]=='0'); }
     if (!g || !enabled || !light.set) return;
     if (light.applied && !memcmp(light.sent,light.rgb,3)) return;
     if (SDL_SetGamepadLED(g,light.rgb[0],light.rgb[1],light.rgb[2])) {
@@ -217,13 +217,13 @@ static void sample_motion(PadData *d, SDL_Gamepad *g) {
 }
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
-/* issn: GOW3_STICK_DEADZONE (0..0.5, default 0.05; 0.10 felt stiff on the camera): stick values inside it read as centered and
+/* issn: ISSN_STICK_DEADZONE (0..0.5, default 0.05; 0.10 felt stiff on the camera): stick values inside it read as centered and
  * the rest is rescaled, so a stick that rests a little off center (8BitDo and worn sticks) does
  * not turn the camera on its own. As HayatoG's iss_pc (TLG_STICK_DEADZONE). */
 static float stick_deadzone(void) {
     static float zone=-1.0f;
     if (zone<0.0f) {
-        const char *e=getenv("GOW3_STICK_DEADZONE");
+        const char *e=getenv("ISSN_STICK_DEADZONE");
         zone=e && *e ? (float)atof(e) : 0.05f;
         if (zone<0.0f) zone=0.0f;
         if (zone>0.5f) zone=0.5f;
@@ -376,8 +376,8 @@ static SDL_Gamepad *current_gamepad(void) {
     return gamepad;
 }
 /* Button sources: a host button or key and the PS4 button it presses. The defaults below can be
- * changed per PS4 button with GOW3_PAD_MAP (gamepad) and GOW3_KEY_MAP (keyboard), e.g.
- * GOW3_KEY_MAP="cross=Q,square=Left Shift" or GOW3_PAD_MAP="cross=b,circle=a": comma-separated
+ * changed per PS4 button with ISSN_PAD_MAP (gamepad) and ISSN_KEY_MAP (keyboard), e.g.
+ * ISSN_KEY_MAP="cross=Q,square=Left Shift" or ISSN_PAD_MAP="cross=b,circle=a": comma-separated
  * <ps4 button>=<SDL key or gamepad button name>. A mapped PS4 button loses its default sources.
  * touchpad_left (alias touchpad) and touchpad_right are the two sides of the touchpad click:
  * photo mode and the pause menu. Back/View (Share on a DualSense) is the right click, and with
@@ -419,7 +419,7 @@ static char *trim(char *text) {
     return text;
 }
 
-/* Applies a GOW3_PAD_MAP/GOW3_KEY_MAP value; returns how many entries were used. Bad entries are
+/* Applies a ISSN_PAD_MAP/ISSN_KEY_MAP value; returns how many entries were used. Bad entries are
  * logged and skipped, so their PS4 button keeps its default. */
 static int apply_button_map(ButtonMap *map, const char *spec, bool keyboard) {
     if (!spec || !*spec) return 0;
@@ -462,8 +462,8 @@ static void load_button_maps(void) {
     static bool loaded;
     if (loaded) return;
     loaded=true;
-    const int pad=apply_button_map(&pad_map,getenv("GOW3_PAD_MAP"),false);
-    const int keys=apply_button_map(&key_map,getenv("GOW3_KEY_MAP"),true);
+    const int pad=apply_button_map(&pad_map,getenv("ISSN_PAD_MAP"),false);
+    const int keys=apply_button_map(&key_map,getenv("ISSN_KEY_MAP"),true);
     if (pad || keys) printf("Runtime: pad map: %d gamepad and %d keyboard buttons remapped\n",pad,keys);
 }
 
@@ -478,7 +478,7 @@ static void sample_host(PadData *d) {
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
     sample_motion(d,g);
-    if (gow3gpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    if (issngpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     {   /* issn: F10 asks for a snapshot of the guest threads (see runtime_snapshot_request). */
         static bool f10_was_down;
@@ -526,17 +526,17 @@ static void sample_host(PadData *d) {
     key_axis(&d->right_y,k[SDL_SCANCODE_UP],k[SDL_SCANCODE_DOWN]);
 }
 
-/* GOW3_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
+/* ISSN_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
  * tokens, re-read when it changes: button names (cross circle square triangle l1 r1 l2 r2 l3 r3
  * options touchpad touchpad_left touchpad_right up down left right) are held while listed;
  * touchpad is the left side; lx= ly= rx= ry= (0..255) override the sticks. An empty file
  * releases everything. */
 static struct { uint32_t buttons; int stick[4]; } injected={0,{-1,-1,-1,-1}};
-static int replay_armed;      /* 1 while a GOW3_PAD_REPLAY recording plays, 2 once it ended */
+static int replay_armed;      /* 1 while a ISSN_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
     static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
-    if (!checked) { path=getenv("GOW3_PAD_FILE"); checked=1; }
+    if (!checked) { path=getenv("ISSN_PAD_FILE"); checked=1; }
     if (!path || !*path) return;
     uint64_t now=now_us();
     if (now-last_check<20000) return;
@@ -558,7 +558,7 @@ static void read_inject(void) {
     for (int i=0;i<4;++i) injected.stick[i]=-1;
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
-        if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* GOW3_PAD_REPLAY */
+        if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* ISSN_PAD_REPLAY */
         for (size_t i=0;i<sizeof(ps_names)/sizeof(*ps_names);++i) if (!strcmp(token,ps_names[i].name)) injected.buttons|=ps_names[i].ps;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
     }
@@ -566,9 +566,9 @@ static void read_inject(void) {
     printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
            injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
 }
-/* GOW3_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
- * the time since F9; GOW3_PAD_REPLAY=<file> plays such a recording back, started by the token
- * "replay" in GOW3_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
+/* ISSN_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
+ * the time since F9; ISSN_PAD_REPLAY=<file> plays such a recording back, started by the token
+ * "replay" in ISSN_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
  * lx ly rx ry l2 r2, written when the state changes. */
 typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; } PadSample;
 static FILE *record_file;
@@ -576,7 +576,7 @@ static uint64_t record_start;
 static PadSample record_last;
 static void record_sample(const PadData *d) {
     static const char *path; static int checked, f9_was_down;
-    if (!checked) { path=getenv("GOW3_PAD_RECORD"); checked=1; }
+    if (!checked) { path=getenv("ISSN_PAD_RECORD"); checked=1; }
     if (!path || !*path || !sdl_ready) return;
     const bool *k=SDL_GetKeyboardState(NULL);
     const int f9=k && k[SDL_SCANCODE_F9];
@@ -608,7 +608,7 @@ static void replay_sample(PadData *d) {
         static int loaded;
         if (!loaded) {
             loaded=1;
-            const char *path=getenv("GOW3_PAD_REPLAY");
+            const char *path=getenv("ISSN_PAD_REPLAY");
             FILE *f=path ? fopen(path,"r") : NULL;
             PadSample s; unsigned v[8]; size_t cap=0;
             while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
@@ -639,7 +639,7 @@ static void replay_sample(PadData *d) {
 static int hold_after_capture;
 static void sample(PadData *d) {
     sample_host(d);
-    if (gow3gpu_overlay_captures_input()) { hold_after_capture=1; click.side=-1; return; }
+    if (issngpu_overlay_captures_input()) { hold_after_capture=1; click.side=-1; return; }
     record_sample(d); /* the click sources as they are: a replay plays them again */
     read_inject();
     replay_sample(d);

@@ -56,7 +56,7 @@ static bool IsDivergentCondition(const IR::U1& condition) {
         .value_or(false);
 }
 
-// gow3: true when a value is the same in every lane of the wave for sure: its inputs reach no
+// port: true when a value is the same in every lane of the wave for sure: its inputs reach no
 // lane-varying source, no phi (its incoming edge can depend on the lane) and no LDS or memory
 // load (another lane may have written it). Such a ReadFirstLane needs no wave64 exchange.
 static bool IsProvablyWaveUniform(const IR::Value& value) {
@@ -98,7 +98,7 @@ static bool IsProvablyWaveUniform(const IR::Value& value) {
                 .value_or(false);
 }
 
-// gow3: loops whose exit depends on the lane are divergent; the others run the same iterations
+// port: loops whose exit depends on the lane are divergent; the others run the same iterations
 // in every lane (e.g. over a light list), so ballots inside can be lowered with barriers, the
 // same reasoning SharedMemoryBarrierPass applies. Before, every ballot inside any loop stayed a
 // 32-lane ballot on 32-wide hardware: half the wave64 lanes were lost (inFAMOUS particle and
@@ -118,7 +118,7 @@ static std::vector<const IR::Block*> FindDivergentLoops(const IR::Program& progr
     return divergent;
 }
 
-// gow3: also used by SharedMemoryBarrierPass (a constant-lane ReadLane in these blocks is uniform).
+// port: also used by SharedMemoryBarrierPass (a constant-lane ReadLane in these blocks is uniform).
 std::vector<IR::Block*> FindWave64UniformBlocks(const IR::Program& program) {
     using Type = IR::AbstractSyntaxNode::Type;
     const auto divergent_loops = FindDivergentLoops(program);
@@ -171,7 +171,7 @@ std::vector<IR::Block*> FindWave64UniformBlocks(const IR::Program& program) {
     return blocks;
 }
 
-// gow3: BP06 (SotC 8d84cf7). Lane identity of a reduction step, when value = op(x, ShuffleXor(x, k)).
+// port: BP06 (SotC 8d84cf7). Lane identity of a reduction step, when value = op(x, ShuffleXor(x, k)).
 // Based on the wave64_missing_lane_identity workaround of Pink-shadPS4 (luizgustavs).
 static const IR::Inst* SkipBitCasts(const IR::Value& value) {
     if (value.IsImmediate()) {
@@ -246,7 +246,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         if (!bp06) {
             return;
         }
-        // gow3: BP06 (SotC 8d84cf7). The whole workgroup fits in one host subgroup, but the guest
+        // port: BP06 (SotC 8d84cf7). The whole workgroup fits in one host subgroup, but the guest
         // code was written for a wave64 whose upper half is inactive. A read of a fixed lane in
         // that upper half (the "readlane 32" that merges the two halves of a cross-lane
         // reduction) indexes past the populated lanes, which is undefined for the broadcast -
@@ -280,7 +280,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         return;
     }
 
-    // gow3: one line per compute shader wider than a 32-lane wave that uses lane operations:
+    // port: one line per compute shader wider than a 32-lane wave that uses lane operations:
     // the candidates when wave64 code misbehaves on 32-wide hardware (flickering lights).
     bool lane_math = false; // the shader numbers lanes (ballots, prefix masks)
     {
@@ -315,7 +315,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             if (counts[i]) used += fmt::format("{}{} {}", used.empty() ? "" : ", ", names[i], counts[i]);
         }
         if (!used.empty()) {
-            LOG_WARNING(Render_Recompiler, "gow3: wave64 compute shader {:#x} ({} threads, {}x{}x{}): {}",
+            LOG_WARNING(Render_Recompiler, "port: wave64 compute shader {:#x} ({} threads, {}x{}x{}): {}",
                         program.info.pgm_hash, num_threads, size_x, size_y, size_z, used);
         }
     }
@@ -344,7 +344,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane && is_uniform &&
                        (lane_math ||
                         (Toggles::ReadFirstLaneAll() && !IsProvablyWaveUniform(inst.Arg(0))))) {
-                // gow3: append pattern: the wave counts its items (ballot / prefix mask), one
+                // port: append pattern: the wave counts its items (ballot / prefix mask), one
                 // lane reserves space with an atomic and ReadFirstLane broadcasts the base.
                 // On 32-wide hardware the second half read its own first lane, which never
                 // reserved anything (inFAMOUS: flickering lights and steam).
@@ -362,7 +362,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             }
         }
     }
-    // gow3: a ballot in divergent flow (waterfall loops) cannot gather the other 32-lane half,
+    // port: a ballot in divergent flow (waterfall loops) cannot gather the other 32-lane half,
     // but SubgroupLtMask below is always in wave64 numbering. Put the 32-lane ballot in its
     // own half of the 64-bit mask so both agree: a lane's prefix count (mbcnt) and the
     // half's popcount then index the same slots. Left in bits 0..31, lanes 32..63 computed

@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "gow3_copy.h"
+#include "issn_copy.h"
 
 #include <array>
 #include <atomic>
@@ -50,7 +50,7 @@ class PageManager;
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
-    // gow3: arena pages are 4 GiB unless the driver's buffer size limit is lower (AMD's
+    // port: arena pages are 4 GiB unless the driver's buffer size limit is lower (AMD's
     // Windows driver: 2 GiB); an arena spans up to two pages, so they shrink to half the limit.
     static constexpr u64 MAX_ARENA_PAGE_BITS = 32;
     static constexpr u64 MIN_ARENA_PAGE_BITS = 29;
@@ -58,7 +58,7 @@ class BufferCache {
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
 
 public:
-    /// Read-only bindings up to this size are copied into a stream buffer (gow3: public for
+    /// Read-only bindings up to this size are copied into a stream buffer (port: public for
     /// the draw pipeline's constant ring).
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
     /// tlg (shadPS4-Infamous-FixBuild a107bf06): uploads larger than this go through staging
@@ -99,12 +99,12 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
-    /// gow3: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
+    /// port: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
     void ExtendWriteFault(VAddr device_addr);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
-    /// gow3: a CPU read fault on pages with no GPU-modified data: lift the read protection on the
+    /// port: a CPU read fault on pages with no GPU-modified data: lift the read protection on the
     /// faulting thread instead of a round trip through the GPU command thread.
     void ReleaseReadProtection(VAddr device_addr, u64 size);
 
@@ -160,7 +160,7 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    /// gow3: residency state when EnsureResident started, and the driver allocations made since.
+    /// port: residency state when EnsureResident started, and the driver allocations made since.
     struct ResidencyAttempt {
         vk::DeviceMemory chunk;
         u64 chunk_used;
@@ -180,13 +180,13 @@ private:
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
 public:
-    /// gow3: GOW3_WRITE_MERGE=1 (precise readbacks): a guest memcpy/memset into memory with
+    /// port: ISSN_WRITE_MERGE=1 (precise readbacks): a guest memcpy/memset into memory with
     /// GPU-modified pages writes through the backing view without a fault or a GPU wait, and the
     /// exact byte range is uploaded before the GPU next uses or downloads it. Bytes the GPU
     /// wrote elsewhere on those pages stay intact. False: the caller writes normally.
     bool CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size);
 
-    /// gow3: GOW3_EAGER_READBACK=1 (precise readbacks): pages the guest reads back after GPU
+    /// port: ISSN_EAGER_READBACK=1 (precise readbacks): pages the guest reads back after GPU
     /// writes are learnt (NoteReadback). At every fence they are copied to host memory if the
     /// GPU wrote them since, and the batch is submitted (EagerCopyAtFence). A later CPU read
     /// fault on such a page is served on the faulting thread (TryEagerRead): it waits only for
@@ -225,7 +225,7 @@ private:
     std::vector<VAddr> eager_subtracts; ///< pages served on guest threads: leave gpu_modified_ranges
     std::unique_ptr<Buffer> eager_buffer;
 
-    /// gow3: GOW3_FAST_WRITE=N (precise readbacks). A guest write fault on a page marked GPU
+    /// port: ISSN_FAST_WRITE=N (precise readbacks). A guest write fault on a page marked GPU
     /// modified does not wait for the GPU when the page and its 64 KiB block score at least
     /// N-1: the page's bytes are kept (snapshot), it is unmarked and made writable at once, and
     /// a copy of it is recorded. When that copy is done the GPU bytes are compared with the
@@ -239,7 +239,7 @@ private:
         u64 tick{};      ///< submission holding the copy
         bool recorded{}; ///< owed_mutex
         bool superseded{}; ///< newer GPU data was read back over it since (owed_mutex)
-        bool read{};       ///< taken by a read fault (GOW3_FAST_READ), not a write
+        bool read{};       ///< taken by a read fault (ISSN_FAST_READ), not a write
         std::array<u8, TRACKER_BYTES_PER_PAGE> snapshot;
     };
     static u32 FastWriteThreshold();
@@ -263,7 +263,7 @@ private:
     std::unordered_map<VAddr, s8> fast_write_score;
 
 public:
-    /// issn: GOW3_FAST_READ=1 (precise readbacks). A guest read fault on memory marked GPU
+    /// issn: ISSN_FAST_READ=1 (precise readbacks). A guest read fault on memory marked GPU
     /// modified does not wait for the GPU: the GPU modified pages of its 64 KiB block are made
     /// readable at once with the bytes guest memory holds (older than the GPU's), as fast
     /// writes are, and the GPU's bytes are merged in when their copy is done (the next
@@ -275,7 +275,7 @@ public:
 
 private:
 
-    /// gow3: GOW3_DEFERRED_READBACK=1 (precise readbacks): the reads the eager copies don't cover.
+    /// port: ISSN_DEFERRED_READBACK=1 (precise readbacks): the reads the eager copies don't cover.
     /// The GPU command thread only records a copy of the GPU modified memory around the fault
     /// and submits it; the guest thread that faulted waits for that copy (not for the whole GPU
     /// to go idle) and writes it back and unmarks it itself. Guest threads touching the same
@@ -330,14 +330,14 @@ private:
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    /// gow3: batched small copies on the copy threads (Gow3Copy::QueueCopy).
-    static void RunGuestCopy(const Gow3Copy::Item& item);
-    void SmallGuestCopy(const Gow3Copy::Item& item);
+    /// port: batched small copies on the copy threads (IssnCopy::QueueCopy).
+    static void RunGuestCopy(const IssnCopy::Item& item);
+    void SmallGuestCopy(const IssnCopy::Item& item);
 
     const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
                                size_t total_size_bytes);
 
-    /// gow3: uploads the ranges (guest addresses in dstOffset) MAX_UPLOAD_PART_BYTES at a time,
+    /// port: uploads the ranges (guest addresses in dstOffset) MAX_UPLOAD_PART_BYTES at a time,
     /// waiting for the GPU to copy each part before the staging memory takes the next.
     void UploadInParts(const Buffer* arena, std::span<const vk::BufferCopy> ranges);
 
@@ -345,7 +345,7 @@ private:
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
-    // gow3: texel buffer ranges known not to alias an image, per image registry generation.
+    // port: texel buffer ranges known not to alias an image, per image registry generation.
     struct ImageMiss {
         VAddr address = 0;
         u32 size = 0;
@@ -368,7 +368,7 @@ private:
 
     std::array<const Buffer*, MAX_ARENA_PAGES> address_space{};
     u64 arena_page_bits{MAX_ARENA_PAGE_BITS};
-    /// gow3: pages one arena may join (the driver's buffer size limit / the page size, >= 2).
+    /// port: pages one arena may join (the driver's buffer size limit / the page size, >= 2).
     u64 max_arena_pages{2};
     u64 arena_page_size{u64{1} << MAX_ARENA_PAGE_BITS};
     u64 num_arena_pages{u64{1} << (ADDRESS_SPACE_BITS - MAX_ARENA_PAGE_BITS)};
@@ -387,7 +387,7 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
-    /// gow3: residency is carved out of chunks (see AllocateResidency, from the
+    /// port: residency is carved out of chunks (see AllocateResidency, from the
     /// shadPS4-Infamous-FixBuild fork). Driver allocations made for it, for the slow-bind log.
     vk::DeviceMemory residency_chunk{};
     u64 residency_chunk_used{};

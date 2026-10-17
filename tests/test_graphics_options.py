@@ -67,7 +67,7 @@ class GraphicsOptionsTest(unittest.TestCase):
 
     def test_environment(self):
         env = g.environment(g.startup_options({'stale_readback': '0'}))
-        self.assertEqual(env, {'GOW3_DEFERRED_READBACK': '1', 'GOW3_STALE_READBACK': '0', 'GOW3_ASYNC_SHADERS': '1'})
+        self.assertEqual(env, {'ISSN_DEFERRED_READBACK': '1', 'ISSN_STALE_READBACK': '0', 'ISSN_ASYNC_SHADERS': '1'})
 
 
 if __name__ == '__main__':

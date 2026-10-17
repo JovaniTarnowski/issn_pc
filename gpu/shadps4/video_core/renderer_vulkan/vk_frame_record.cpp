@@ -15,7 +15,7 @@
 #include <vk_mem_alloc.h>
 #include <xxhash.h>
 
-#include "gow3_toggles.h"
+#include "issn_toggles.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -61,12 +61,12 @@ u64 staging_used = 0;
 u64 snapshots_dropped = 0;
 
 const char* Trigger() {
-    static const char* trigger = std::getenv("GOW3_FRAME_RECORD_TRIGGER");
+    static const char* trigger = std::getenv("ISSN_FRAME_RECORD_TRIGGER");
     return trigger && trigger[0] ? trigger : nullptr;
 }
 
 std::filesystem::path DumpDir() {
-    const char* dir = std::getenv("GOW3_DUMP_DIR");
+    const char* dir = std::getenv("ISSN_DUMP_DIR");
     return dir && dir[0] ? dir : "out/dump";
 }
 
@@ -154,8 +154,8 @@ void Begin() {
     copies.clear();
     staging_used = 0;
     snapshots_dropped = 0;
-    // GOW3_FRAME_RECORD_GPU_MB (default 256): room for the buffers copied from the GPU.
-    const char* env = std::getenv("GOW3_FRAME_RECORD_GPU_MB");
+    // ISSN_FRAME_RECORD_GPU_MB (default 256): room for the buffers copied from the GPU.
+    const char* env = std::getenv("ISSN_FRAME_RECORD_GPU_MB");
     const u64 mb = env && env[0] ? std::strtoull(env, nullptr, 10) : 256;
     staging_size = mb * 1_MB;
     if (!staging_size || !instance) {
@@ -223,7 +223,7 @@ void Write() {
         }
         std::fprintf(out,
                      "# frame_record frame %u: %zu commands, %llu MB copied from the GPU, %llu "
-                     "copies over the budget (GOW3_FRAME_RECORD_GPU_MB)\n",
+                     "copies over the budget (ISSN_FRAME_RECORD_GPU_MB)\n",
                      f, frames[f].size(), static_cast<unsigned long long>(staging_used >> 20),
                      static_cast<unsigned long long>(snapshots_dropped));
         for (const auto& line : frames[f]) {

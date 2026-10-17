@@ -34,7 +34,7 @@ done
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed --copy-metadata pillow \
     --name "inFAMOUS Second Son" --icon "$(cygpath -w "$PWD/launcher/issn.ico")" --distpath out/pyi-dist \
     --workpath out/pyi-work --specpath out/pyi-work --paths "$(cygpath -w "$PWD/scripts")" "${hidden[@]}" \
-    "$(cygpath -w "$PWD/launcher/gow3_launcher_win.py")"
+    "$(cygpath -w "$PWD/launcher/issn_launcher_win.py")"
 
 # The package is assembled in a fresh staging folder and zipped from there; dist/issn-windows
 # (a playable copy that may hold saves and settings) is only refreshed afterwards.

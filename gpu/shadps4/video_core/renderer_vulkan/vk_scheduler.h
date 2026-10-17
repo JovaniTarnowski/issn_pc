@@ -18,7 +18,7 @@
 #include <thread>
 #include <queue>
 
-#include "gow3_toggles.h"
+#include "issn_toggles.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -180,7 +180,7 @@ struct DynamicState {
     /// flags that committing clears).
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
-    /// gow3: passes each dirty state change to `emit` as a small command closure holding only
+    /// port: passes each dirty state change to `emit` as a small command closure holding only
     /// its own values (recording a copy of the whole state per draw was a hot spot), and clears
     /// the flags it emitted. Flags whose test is disabled stay dirty, as in Commit.
     template <typename Emit>
@@ -347,7 +347,7 @@ struct DynamicState {
         }
     }
 
-    /// gow3: true when Commit() would record anything. Flags that Commit() defers (their
+    /// port: true when Commit() would record anything. Flags that Commit() defers (their
     /// test is disabled) do not count.
     [[nodiscard]] bool AnyDirty() const noexcept {
         auto pending = dirty_state;
@@ -372,7 +372,7 @@ struct DynamicState {
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
-        // gow3: named flags only; padding bits set by a memset made AnyDirty() always true.
+        // port: named flags only; padding bits set by a memset made AnyDirty() always true.
         dirty_state.viewports = true;
         dirty_state.scissors = true;
         dirty_state.depth_test_enabled = true;
@@ -578,7 +578,7 @@ struct DynamicState {
 
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
-/// gow3: a block of deferred Vulkan commands. Commands are closures placed in
+/// port: a block of deferred Vulkan commands. Commands are closures placed in
 /// fixed storage (no allocation per command) and run in order on the recording thread.
 class RecordChunk {
 public:
@@ -640,7 +640,7 @@ private:
     /// it back from that core. Requesting ownership a few lines ahead overlaps those
     /// transfers instead of stalling on each (RecordPrefetch).
     void PrefetchAhead() const {
-        if (!Gow3Toggle::Disabled(Gow3Toggle::RecordPrefetch)) {
+        if (!IssnToggle::Disabled(IssnToggle::RecordPrefetch)) {
             __builtin_prefetch(storage + used + 384, 1, 3);
             __builtin_prefetch(storage + used + 448, 1, 3);
         }
@@ -684,7 +684,7 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(std::source_location caller = std::source_location::current());
 
-    /// gow3: waits for the work submitted so far but leaves the command buffer being
+    /// port: waits for the work submitted so far but leaves the command buffer being
     /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
     /// recording into a submitted buffer crashes AMD's driver).
     void WaitSubmitted(std::source_location caller = std::source_location::current());
@@ -702,7 +702,7 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
-    /// gow3: GOW3_FULL_BARRIERS=1 records a full memory barrier around every render pass and
+    /// port: ISSN_FULL_BARRIERS=1 records a full memory barrier around every render pass and
     /// every compute dispatch, to tell a missing barrier from everything else.
     static bool FullBarriers();
     static void RecordFullBarrier(vk::CommandBuffer cmdbuf);
@@ -712,7 +712,7 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
-    /// gow3: while draw packets are in flight the draw recording thread (stage B) owns the
+    /// port: while draw packets are in flight the draw recording thread (stage B) owns the
     /// deferred recording state (record_chunk, full_chunks). A call from any other thread
     /// first runs `hook(context, caller)`: the rasterizer drains the pipe on stage A and logs
     /// the caller, so two threads never use record_chunk at once (EmitVertexBuffers crash).
@@ -746,7 +746,7 @@ public:
         return current_cmdbuf;
     }
 
-    /// GOW3_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
+    /// ISSN_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
     static void TraceDirectRecording(void* caller);
 
     /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
@@ -758,7 +758,7 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording)) {
+        if (IssnToggle::Disabled(IssnToggle::ThreadedRecording)) {
             SyncRecording();
             direct_mode = true;
             func(current_cmdbuf);
@@ -772,16 +772,16 @@ public:
         }
     }
 
-    /// gow3: true when commands passed to Record() normally go to the Vulkan recording thread
+    /// port: true when commands passed to Record() normally go to the Vulkan recording thread
     /// (it may still record some directly, after a CommandBuffer() call).
     [[nodiscard]] bool RecordsOnThread() const noexcept {
-        return recording_threaded && !Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording);
+        return recording_threaded && !IssnToggle::Disabled(IssnToggle::ThreadedRecording);
     }
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
         return recording_threaded && !direct_mode &&
-               !Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording);
+               !IssnToggle::Disabled(IssnToggle::ThreadedRecording);
     }
 
     /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
@@ -831,8 +831,8 @@ public:
     /// Waits until every recorded command is in the command buffer.
     void SyncRecording();
 
-    /// gow3: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
-    /// copy threads (Gow3Copy::Async) must be done before the guest learns the GPU is past them
+    /// port: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
+    /// copy threads (IssnCopy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
     /// submission that reads them. Waits for all.
     void WaitHostCopies();
@@ -848,12 +848,12 @@ public:
         });
     }
 
-    /// gow3: runs `signal` once the guest memory copies issued so far are done, without
+    /// port: runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
-    /// it to the copy threads' completion (Gow3Copy::AfterCopies).
+    /// it to the copy threads' completion (IssnCopy::AfterCopies).
     void SignalAfterHostCopies(std::function<void()> signal);
 
-    /// gow3: before a guest-visible write that is not deferred (WriteData, end-of-shader
+    /// port: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
@@ -864,12 +864,12 @@ public:
         return is_rendering && render_state == state;
     }
 
-    /// gow3: counts a draw or dispatch recorded since the last submission.
+    /// port: counts a draw or dispatch recorded since the last submission.
     void CountWork() noexcept {
         work_since_submit.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// gow3: draws and dispatches recorded since the last submission.
+    /// port: draws and dispatches recorded since the last submission.
     [[nodiscard]] u32 WorkSinceSubmit() const noexcept {
         return work_since_submit.load(std::memory_order_relaxed);
     }
@@ -879,7 +879,7 @@ public:
         return !(is_rendering && render_state == state);
     }
 
-    /// CommandBuffer() calls that waited for a recording thread (GOW3_FRAME_STATS).
+    /// CommandBuffer() calls that waited for a recording thread (ISSN_FRAME_STATS).
     static inline std::atomic<u64> direct_recordings{0};
 
     /// Returns the current command buffer tick.
@@ -947,15 +947,15 @@ private:
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
     u32 pending_polls = 0; // tlg
-    bool popping_pending_ops = false; ///< gow3: guarded by pending_ops_mutex (recursive)
-    std::atomic<u32> num_pending_ops{0}; ///< gow3: pending_ops.size(), checked without the lock
+    bool popping_pending_ops = false; ///< port: guarded by pending_ops_mutex (recursive)
+    std::atomic<u32> num_pending_ops{0}; ///< port: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
-    // gow3: threaded recording
+    // port: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
     void (*owner_hook)(void*, void*) = nullptr;
     void* owner_context = nullptr;
@@ -974,14 +974,14 @@ private:
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
-    std::atomic<u32> work_since_submit{0}; ///< gow3: CountWork(), reset by each submission
+    std::atomic<u32> work_since_submit{0}; ///< port: CountWork(), reset by each submission
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
-    // gow3: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
+    // port: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
     std::jthread recorder_thread;

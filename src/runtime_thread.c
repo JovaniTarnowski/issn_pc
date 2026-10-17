@@ -50,7 +50,7 @@ typedef struct GuestThread {
     HANDLE native; /* issn: this thread's own handle, for the watchdog (runtime_thread_snapshot) */
 #endif
 #ifdef _WIN32
-    gow3_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
+    issn_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
     jmp_buf exit_jump;
 #endif
@@ -141,12 +141,12 @@ void runtime_thread_attach_host(const char *name) {
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
 }
 #ifdef _WIN32
-/* gow3: GOW3_SAMPLE=1 also samples the guest's threads (gpu/shim/gow3_sampler.cpp). */
-void gow3_sampler_register_thread(const char *name);
+/* port: ISSN_SAMPLE=1 also samples the guest's threads (gpu/shim/issn_sampler.cpp). */
+void issn_sampler_register_thread(const char *name);
 #endif
 void runtime_thread_attach_main(void) {
 #ifdef _WIN32
-    gow3_sampler_register_thread("guest main");
+    issn_sampler_register_thread("guest main");
 #endif
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
@@ -262,8 +262,8 @@ static void set_host_name(const char *name) {
     pthread_setname_np(pthread_self(),host);
 }
 #ifdef _WIN32
-#define exit_setjmp(t) gow3_setjmp((t)->exit_jump)
-#define exit_longjmp(t) gow3_longjmp((t)->exit_jump,1)
+#define exit_setjmp(t) issn_setjmp((t)->exit_jump)
+#define exit_longjmp(t) issn_longjmp((t)->exit_jump,1)
 #else
 #define exit_setjmp(t) setjmp((t)->exit_jump)
 #define exit_longjmp(t) longjmp((t)->exit_jump,1)
@@ -273,7 +273,7 @@ static void *host_start(void *p) {
     attach(t);
     set_host_name(t->name);
 #ifdef _WIN32
-    gow3_sampler_register_thread(t->name);
+    issn_sampler_register_thread(t->name);
 #endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();

@@ -133,12 +133,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         return std::move(created.value);
     };
 
-    // gow3: a dispatch is waiting for a pipeline met in game, and compute work cannot be skipped
+    // port: a dispatch is waiting for a pipeline met in game, and compute work cannot be skipped
     // (5e7995ac skipped it: not taken, for fidelity). Built on the GPU thread, a new one took
     // 60-190 ms in inFAMOUS Second Son and an effect brings a few dozen: freezes of 0.6-3.8 s.
-    // GOW3_COMPUTE_ASYNC_BUILD=0 builds every one here as before.
+    // ISSN_COMPUTE_ASYNC_BUILD=0 builds every one here as before.
     static const bool async_build = [] {
-        const char* env = std::getenv("GOW3_COMPUTE_ASYNC_BUILD");
+        const char* env = std::getenv("ISSN_COMPUTE_ASYNC_BUILD");
         return !(env && env[0] == '0');
     }();
     if (builder && !preloading && async_build &&
@@ -152,11 +152,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         }
         auto state = std::make_shared<Build>();
         const auto caches = builder->caches;
-        // issn: GOW3_COMPUTE_FAST_FIRST=1 always builds an unoptimized pipeline here first (the
+        // issn: ISSN_COMPUTE_FAST_FIRST=1 always builds an unoptimized pipeline here first (the
         // optimized one replaces it later), even with the recording thread: on AMD's driver an
         // optimized compute pipeline takes ~90 ms, and the dispatch waits for it.
         static const bool fast_first = [] {
-            const char* env = std::getenv("GOW3_COMPUTE_FAST_FIRST");
+            const char* env = std::getenv("ISSN_COMPUTE_FAST_FIRST");
             return env && env[0] == '1';
         }();
         const bool deferred_bind = scheduler.RecordsOnThread() && !fast_first;
@@ -170,7 +170,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             [state, create, caches, deferred_bind, debug_str] {
                 const auto start = std::chrono::steady_clock::now();
                 auto built = create(*caches[AsyncCompiler::WorkerIndex()], {});
-                LOG_INFO(Render_Vulkan, "gow3: compute pipeline {} built on a compiler thread in "
+                LOG_INFO(Render_Vulkan, "port: compute pipeline {} built on a compiler thread in "
                          "{:.1f} ms{}", debug_str,
                          std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - start).count(),

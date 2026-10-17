@@ -33,7 +33,7 @@ std::string_view BufferTypeName(MemoryType type) {
     }
 }
 
-/// gow3: where the stream buffer lives (GOW3_STREAM_MEMORY). Every draw copies its small
+/// port: where the stream buffer lives (ISSN_STREAM_MEMORY). Every draw copies its small
 /// read-only buffers from guest memory into it on the Vulkan recording thread. "device"
 /// (shadPS4's choice) is VRAM written through the PCIe BAR: cheap with AMD Smart Access Memory
 /// on a desktop, but on a laptop NVIDIA GPU these writes took half of that thread's time and
@@ -42,7 +42,7 @@ std::string_view BufferTypeName(MemoryType type) {
 enum class StreamPlacement { Device, Host, Cached };
 static StreamPlacement StreamMemory() {
     static const StreamPlacement placement = [] {
-        const char* env = std::getenv("GOW3_STREAM_MEMORY");
+        const char* env = std::getenv("ISSN_STREAM_MEMORY");
         const std::string_view value = env ? env : "cached";
         if (value == "device") {
             return StreamPlacement::Device;
@@ -132,7 +132,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-            // gow3: from shadPS4-Infamous-FixBuild e656365e. The budget shrinks as other programs
+            // port: from shadPS4-Infamous-FixBuild e656365e. The budget shrinks as other programs
             // take video memory, and going over it ended the game. Past it the driver moves
             // memory out to system memory instead: slower, but the game keeps going.
             LOG_WARNING(Render_Vulkan,
