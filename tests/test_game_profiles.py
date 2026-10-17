@@ -22,6 +22,7 @@ class GameProfileTests(unittest.TestCase):
                 found, env = game_profiles.environment(game(tmp, title), {})
                 self.assertEqual(found, title)
                 self.assertEqual(env['GOW3_READBACKS'], '2')
+                self.assertEqual(env['GOW3_COMPUTE_PRIORITY'], '1')
                 # The fence addresses are the EU 01.00 eboot's.
                 self.assertEqual('GOW3_WATCHDOG_PEEK' in env, title == 'CUSA00004')
 
