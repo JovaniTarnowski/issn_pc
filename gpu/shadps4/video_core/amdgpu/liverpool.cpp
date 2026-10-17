@@ -1523,9 +1523,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             case PM4ItOpcode::AcquireMem:     // nothing to do here
             case PM4ItOpcode::IndirectBuffer: // its packets decide for themselves
             case PM4ItOpcode::DispatchDirect: // handed over (Rasterizer::DispatchDirect)
+            case PM4ItOpcode::EventWrite:     // nothing to do here (partial flushes)
                 break;
             default:
-                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+                // The opcode as the reason: GOW3_FRAME_STATS shows which ones still wait.
+                rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                 break;
             }
         }
@@ -1750,6 +1752,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
                 rasterizer->EagerCopyAtFence();
+                rasterizer->SubmitAtFence(); // GOW3_FLUSH_AT_FENCE: compute fences too
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
