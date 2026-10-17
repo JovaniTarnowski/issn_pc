@@ -169,6 +169,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
 
+                if (curr_qid != GfxQueueId) {
+                    pending_asc.fetch_sub(1, std::memory_order_relaxed);
+                }
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
@@ -761,8 +764,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // issn: GOW3_COMPUTE_PRIORITY=1: a graphics submission ran to its end (or to a wait) before
+    // the compute queues were looked at, so a compute fence the game's main thread waits for
+    // came after thousands of draws (GOW3_LATENCY: 4.7 ms from submit to fence on average in
+    // inFAMOUS Second Son's combat; ~30 such fences per frame). On the GPU the compute queues
+    // run beside graphics: here the graphics stream steps aside every few packets while
+    // compute work is queued.
+    static const bool compute_priority = [] {
+        const char* env = std::getenv("GOW3_COMPUTE_PRIORITY");
+        return env && env[0] == '1';
+    }();
+    u32 packets_since_yield = 0;
     while (!dcb.empty()) {
         ProcessCommands();
+        if (compute_priority && ++packets_since_yield >= 32 &&
+            pending_asc.load(std::memory_order_relaxed) != 0) {
+            packets_since_yield = 0;
+            YIELD_GFX();
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1875,6 +1894,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     Gow3GpuTrace::Event("compute submit: queue %u acb %p %zu dwords", gnm_vqid,
                         static_cast<const void*>(acb.data()), acb.size());
     const auto& task = ProcessCompute(acb, vqid);
+    pending_asc.fetch_add(1, std::memory_order_relaxed); // before the GPU thread can finish it
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

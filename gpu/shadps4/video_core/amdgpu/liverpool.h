@@ -242,6 +242,8 @@ private:
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
+    /// issn: compute submissions not finished yet (GOW3_COMPUTE_PRIORITY).
+    std::atomic<u32> pending_asc{0};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
