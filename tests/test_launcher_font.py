@@ -45,7 +45,7 @@ class HeadingFontTest(unittest.TestCase):
 
     def test_english_titles_use_the_loaded_font(self):
         launcher.LANG, launcher.FONT_LOADED = 'en', True
-        self.assertEqual(launcher.heading_font(12), ('GodOfWar', 12))
+        self.assertEqual(launcher.heading_font(12), (launcher.HEADING_FAMILY, 12))
 
     def test_other_languages_keep_the_fallback(self):
         launcher.LANG, launcher.FONT_LOADED = 'ru', True
@@ -58,7 +58,7 @@ class HeadingFontTest(unittest.TestCase):
 
     def test_game_name_uses_the_font_in_every_language(self):
         launcher.LANG, launcher.FONT_LOADED = 'ru', True
-        self.assertEqual(launcher.heading_font(15, every_language=True), ('GodOfWar', 15))
+        self.assertEqual(launcher.heading_font(15, every_language=True), (launcher.HEADING_FAMILY, 15))
         launcher.FONT_LOADED = False
         self.assertEqual(launcher.heading_font(15, every_language=True), ('Georgia', 15))
 
@@ -75,7 +75,7 @@ class LatinHeadingsTest(unittest.TestCase):
     def test_latin_script_languages_use_the_loaded_font(self):
         for lang in ('pt', 'es', 'fr', 'de', 'it'):
             launcher.LANG = lang
-            self.assertEqual(launcher.heading_font(12), ('GodOfWar', 12), lang)
+            self.assertEqual(launcher.heading_font(12), (launcher.HEADING_FAMILY, 12), lang)
 
     def test_other_scripts_keep_the_fallback(self):
         for lang in ('ru', 'ar'):

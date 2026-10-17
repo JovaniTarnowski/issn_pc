@@ -548,14 +548,17 @@ class GpuChoiceTest(unittest.TestCase):
 
 
 class ReleaseVersionTest(unittest.TestCase):
-    def test_god_of_war_release_is_newer_than_the_inherited_tags(self):
-        self.assertEqual(launcher.VERSION, '2.2.0')
-        self.assertGreater(launcher.version_tuple(launcher.VERSION), launcher.version_tuple('windows-v1.5'))
-        self.assertGreater(launcher.version_tuple('windows-v2.2.1'), launcher.version_tuple(launcher.VERSION))
+    def test_updates_come_from_this_ports_releases(self):
+        # issn: own version line and own releases; the God of War III port's are never offered.
+        self.assertEqual(launcher.VERSION, '0.2.0')
+        self.assertIn('/Liondarkz/issn_pc/', launcher.RELEASES_API)
+        self.assertNotIn('gow3_pc', launcher.RELEASES_API + launcher.RELEASES_PAGE)
+        self.assertGreater(launcher.version_tuple('windows-v0.2.1'), launcher.version_tuple(launcher.VERSION))
 
-    def test_first_start_is_in_english(self):
-        # The translations are partial; 'System' stays a choice in Advanced.
-        self.assertEqual(launcher.APP_DEFAULTS['ui_language'], 'en')
+    def test_first_start_follows_windows(self):
+        # issn: the testers play in Portuguese; '' follows the Windows language (English for
+        # the languages without a translation). English stays a choice in Advanced.
+        self.assertEqual(launcher.APP_DEFAULTS['ui_language'], '')
 
 
 if __name__ == '__main__':
