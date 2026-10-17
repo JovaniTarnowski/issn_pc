@@ -78,14 +78,35 @@ int Walk(CONTEXT context, Key* frames) {
     for (; count < MaxFrames && context.Rip; ++count) {
         DWORD64 image_base = 0;
         PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-        if (!function) {
-            // A leaf function without unwind data (or code outside any image: guest code,
-            // JIT): the return address is at the stack pointer.
-            frames[count] = {0, context.Rip & ~0x3full}; // guest code: 64-byte buckets
-            if (!image_base && count > 0) {
-                ++count;
-                break; // not in an image: stop rather than guess
+        if (!function && !image_base) {
+            // Guest code (the PS4 executable is not a Windows image): its functions keep frame
+            // pointers (push rbp; mov rbp, rsp), so the callers follow the rbp chain. The
+            // running place is bucketed by 64 bytes, return addresses (call sites) are exact.
+            const DWORD64 here = count == 0 ? context.Rip & ~0x3full : context.Rip;
+            frames[count] = {0, here};
+            ++count;
+            DWORD64 rbp = context.Rbp;
+            for (int depth = 0; depth < 10 && count < MaxFrames; ++depth) {
+                if (rbp < context.Rsp || rbp - context.Rsp > (64ull << 20) || (rbp & 7) ||
+                    IsBadReadPtr(reinterpret_cast<void*>(rbp), 16)) {
+                    break;
+                }
+                const DWORD64 ret = reinterpret_cast<DWORD64*>(rbp)[1];
+                const DWORD64 next = reinterpret_cast<DWORD64*>(rbp)[0];
+                if (!ret) {
+                    break;
+                }
+                frames[count++] = {0, ret};
+                if (next <= rbp) {
+                    break;
+                }
+                rbp = next;
             }
+            break;
+        }
+        if (!function) {
+            // A leaf function without unwind data: the return address is at the stack pointer.
+            frames[count] = {image_base, context.Rip - image_base};
             if (context.Rsp == 0 || IsBadReadPtr(reinterpret_cast<void*>(context.Rsp), 8)) {
                 ++count;
                 break;
