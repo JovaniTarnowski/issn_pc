@@ -1072,6 +1072,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         static const char* scene_debug = std::getenv("GOW3_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
+    } else if (auto* profiler = GpuProfiler::Get(); profiler && regs.color_buffers[0] &&
+               FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        // issn: without camera motion (upscaler off) frames are still counted for
+        // GOW3_GPU_PROFILE at the display pass; nothing else of NoteFrameStart runs.
+        profiler->BeginFrame();
     }
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
