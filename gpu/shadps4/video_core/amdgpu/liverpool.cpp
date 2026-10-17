@@ -11,6 +11,7 @@
 #include "issn_latency.h"
 #include "issn_sampler.h"
 #include "issn_toggles.h"
+#include <cstring>
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -90,21 +91,47 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
+namespace {
+/// port: SendOrderedCommand's work on the draw recording thread (Rasterizer::RunInOrder).
+void RunOrderedCommand(Vulkan::Rasterizer&, const u8* data) {
+    Common::UniqueFunction<void>* body;
+    std::memcpy(&body, data, sizeof(body));
+    (*body)();
+}
+} // namespace
+
 void Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
+        Common::UniqueFunction<void>* ordered = nullptr;
+        Common::UniqueFunction<void> callback{};
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (!ordered_queue.empty()) {
+                ordered = ordered_queue.front();
+                ordered_queue.pop();
+            } else {
+                callback = std::move(command_queue.front());
+                command_queue.pop();
+            }
+            --num_commands;
+        }
+        if (ordered) {
+            // issn: handed to the draw recording thread behind the draws already decoded (or run
+            // here after a drain when the pipeline is off); this thread does not wait for it.
+            if (rasterizer) {
+                rasterizer->RunInOrder(&RunOrderedCommand, &ordered, sizeof(ordered),
+                                       IssnToggle::PipelinedTasks);
+            } else {
+                (*ordered)();
+            }
+            continue;
+        }
         // port: commands touch the caches. issn: drained for each command, inside the loop: a
         // command queued after a check made outside it ran while the draw recording thread was
         // still recording (two threads in the Vulkan recorder: inFAMOUS Second Son's spray can).
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
-        }
-        Common::UniqueFunction<void> callback{};
-        {
-            std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
-            command_queue.pop();
-            --num_commands;
         }
         callback();
     }

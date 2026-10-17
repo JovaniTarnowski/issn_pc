@@ -576,3 +576,22 @@ now reads guest memory for the constant ring, is not treated as a GPU-side threa
 (`IsGpuSideThreadId` accepts only stage B). Next: a run with `ISSN_WRITE_LOG=1` that crashes
 prints which logged write landed near the corrupted block; bisect the pipeline toggles
 (38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
+
+## inFAMOUS Second Son: compute ahead of graphics, readbacks off stage A (2026-10-17)
+
+The game's main thread waits on compute-queue fence labels and on readbacks of what those
+dispatches wrote; the GPU itself idled ~20 of ~33 ms per frame in combat (`ISSN_GPU_PROFILE`).
+Measured with `ISSN_LATENCY=1` on an RX 9060 XT: a compute fence took ~5 ms from submit to
+written, ~3.3 ms of it before its first packet, because graphics command buffers ran unpreempted.
+
+- `ISSN_COMPUTE_PIPELINE=1`: compute rings no longer drain stage B for Nop, SetShReg, AcquireMem,
+  IndirectBuffer, DispatchDirect and EventWrite (the dispatches go into the draw pipe).
+- `ISSN_COMPUTE_PRIORITY=1`: the graphics ring yields every `ISSN_COMPUTE_PRIORITY_PACKETS`
+  (8) packets while compute work is queued. Combat median 29 -> 39 FPS (8; 32 gave 33, 1 gave
+  32 and froze once). Both are in the game profile.
+- `ISSN_ORDERED_READBACK=1` (opt-in, being measured): a guest thread's readback request no longer
+  stops stage A (drain stage B, record the copy, submit). It goes into the draw pipe as an
+  ordered task (`Liverpool::SendOrderedCommand`, `Rasterizer::RunInOrder`) and runs on stage B
+  behind the draws already decoded; stage A keeps decoding compute. The guest thread waits for
+  the copy as before. The order with later packets holds: everything stage A does on the caches
+  drains stage B first, and pipelined writes queue behind the task.

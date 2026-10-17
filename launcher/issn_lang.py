@@ -759,6 +759,8 @@ EXTRA = {
         'Effects work goes ahead of drawing (faster)': 'Efeitos passam na frente do desenho (mais rápido)',
         'The effects the game waits for are handled before the rest of the frame. About 29 to 39 FPS in combat on an RX 9060 XT. Switch it off if the game freezes.': 'Os efeitos que o jogo espera são atendidos antes do resto do quadro. Cerca de 29 para 39 FPS em combate numa RX 9060 XT. Desligue se o jogo congelar.',
         'Draw distance': 'Distância de detalhe',
+        'Effects readbacks off the GPU thread (test)': 'Leituras de efeitos fora da thread da GPU (teste)',
+        'The copies the game reads back no longer pause the thread that feeds the graphics card. Being tested: compare the FPS in combat, switch it off if the game freezes.': 'As cópias que o jogo lê de volta não pausam mais a thread que alimenta a placa de vídeo. Em teste: compare o FPS em combate e desligue se o jogo congelar.',
         'Balanced (default)': 'Equilibrada (padrão)',
         'Short (faster)': 'Curta (mais rápido)',
         'Long': 'Longa',

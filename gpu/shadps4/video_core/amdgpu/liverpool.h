@@ -154,6 +154,39 @@ public:
         }
     }
 
+    /// port: SendCommand<true> for work that only needs to run in order with the draws (a
+    /// readback's copy): with the draw pipeline it runs on the draw recording thread, and the
+    /// GPU command thread hands it over without waiting for that thread to run dry, so its
+    /// compute and graphics packets go on (ISSN_ORDERED_READBACK=1). Otherwise SendCommand<true>.
+    template <typename F>
+    void SendOrderedCommand(F&& func) {
+        if (!OrderedCommandsEnabled()) {
+            SendCommand<true>(std::forward<F>(func));
+            return;
+        }
+        std::binary_semaphore sem{0};
+        Common::UniqueFunction<void> body{[&sem, &func] {
+            func();
+            sem.release();
+        }};
+        {
+            std::scoped_lock lk{submit_mutex};
+            ordered_queue.push(&body);
+            ++num_commands;
+            submit_cv.notify_one();
+        }
+        IssnFreeze::WaitScope wait{"GPU thread (ordered command)"};
+        sem.acquire();
+    }
+
+    static bool OrderedCommandsEnabled() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("ISSN_ORDERED_READBACK");
+            return env && env[0] == '1';
+        }();
+        return enabled;
+    }
+
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
@@ -281,6 +314,8 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    /// SendOrderedCommand's work, owned by the waiting caller; counted in num_commands.
+    std::queue<Common::UniqueFunction<void>*> ordered_queue{};
     std::thread::id gpu_id;
 #if defined(__linux__) || defined(_WIN32)
     u32 gpu_tid{};

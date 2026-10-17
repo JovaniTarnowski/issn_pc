@@ -318,7 +318,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const bool lat = IssnLatency::Enabled();
         const s64 lat_start = lat ? IssnLatency::Now() : 0;
         s64 lat_picked = 0;
-        liverpool->SendCommand<true>([&] {
+        liverpool->SendOrderedCommand([&] {
             if (lat) {
                 lat_picked = IssnLatency::Now();
             }

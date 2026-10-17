@@ -318,7 +318,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
-                'glyph_style': 'off', 'compute_priority': True, 'draw_distance': ''}
+                'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': ''}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
 # from the analog triggers and the left touchpad click (photo mode) from L1 + the right click's
@@ -763,6 +763,7 @@ def game_environment(s):
     if gpu_id.isdigit():
         env['ISSN_GPU_ID'] = gpu_id
     env['ISSN_COMPUTE_PRIORITY'] = '1' if s.get('compute_priority', True) else '0'
+    env['ISSN_ORDERED_READBACK'] = '1' if s.get('ordered_readback', False) else '0'
     if s.get('draw_distance'):
         env['ISSN_LOD_SCALE'] = str(s['draw_distance'])
     env['ISSN_BACKGROUND_WARMUP'] = '1' if s.get('background_warmup', True) else '0'
@@ -1267,6 +1268,9 @@ class Launcher:
         self.check(f, 'compute_priority', 'app', _('Effects work goes ahead of drawing (faster)'),
                    _('The effects the game waits for are handled before the rest of the frame. About 29 to 39 '
                      'FPS in combat on an RX 9060 XT. Switch it off if the game freezes.'), restart=True)
+        self.check(f, 'ordered_readback', 'app', _('Effects readbacks off the GPU thread (test)'),
+                   _('The copies the game reads back no longer pause the thread that feeds the graphics card. '
+                     'Being tested: compare the FPS in combat, switch it off if the game freezes.'), restart=True)
         self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
                  _('How far buildings and details keep their full detail in the open city.'), restart=True)
         self.section(f, _('Shaders'))
