@@ -1482,6 +1482,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const char* env = std::getenv("GOW3_COMPUTE_PIPELINE");
         return env && env[0] == '1';
     }();
+    s64 lat_first = 0;
+    if constexpr (!is_indirect) {
+        if (Gow3Latency::Enabled()) {
+            lat_first = Gow3Latency::Now();
+            Gow3Latency::Add(Gow3Latency::ComputeStart,
+                             lat_first - mapped_queues[vqid + 1].last_submit_ns.load(
+                                             std::memory_order_relaxed));
+        }
+    }
     while (!acb.empty()) {
         ProcessCommands();
         if (rasterizer && !compute_pipeline) {
@@ -1551,10 +1560,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             case PM4ItOpcode::DispatchDirect: // handed over (Rasterizer::DispatchDirect)
             case PM4ItOpcode::EventWrite:     // nothing to do here (partial flushes)
                 break;
-            default:
+            default: {
                 // The opcode as the reason: GOW3_FRAME_STATS shows which ones still wait.
+                const s64 drain_start = opcode == PM4ItOpcode::ReleaseMem && Gow3Latency::Enabled()
+                                            ? Gow3Latency::Now()
+                                            : 0;
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                if (drain_start) {
+                    Gow3Latency::Add(Gow3Latency::ComputeFenceDrain,
+                                     Gow3Latency::Now() - drain_start);
+                    if (lat_first) {
+                        Gow3Latency::Add(Gow3Latency::ComputeToFence, drain_start - lat_first);
+                    }
+                }
                 break;
+            }
             }
         }
         Gow3GpuTrace::Event("compute %u%s packet %#x (%u dwords)", vqid + 1,

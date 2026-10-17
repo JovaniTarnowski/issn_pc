@@ -9,7 +9,7 @@
 namespace Gow3Latency {
 enum Kind : std::uint32_t {
     ComputeFence, GfxFence, ReadbackQueue, ReadbackRecord, ReadbackGpu, ReadbackApply,
-    EagerWait, NumKinds
+    EagerWait, ComputeStart, ComputeToFence, ComputeFenceDrain, NumKinds
 };
 bool Enabled();
 std::int64_t Now();

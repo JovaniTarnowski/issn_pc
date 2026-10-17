@@ -18,6 +18,8 @@ constexpr const char* Names[NumKinds] = {
     "compute fence (submit -> written)", "graphics fence (submit -> written)",
     "readback: to the GPU command thread", "readback: recording the copy",
     "readback: waiting for the GPU", "readback: writing it back", "eager copy: waiting for the GPU",
+    "compute: submit -> first packet", "compute: first packet -> its fence",
+    "compute fence: waiting for the recorder",
 };
 
 void Report(std::int64_t now) {
