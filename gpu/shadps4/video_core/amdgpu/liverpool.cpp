@@ -1447,9 +1447,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     Gow3GpuTrace::Dump(is_indirect ? "compute indirect buffer" : "compute ring", acb.data(),
                        acb.size());
+    // issn: GOW3_COMPUTE_PIPELINE=1: like the graphics ring, only packets that touch the caches
+    // on this thread wait for the draw recording thread; dispatches go to it as packets. A
+    // drain before every compute packet made each dispatch a round trip between the two threads
+    // (~11,000 a second in inFAMOUS Second Son's combat), and the compute fences the game's
+    // main thread waits for came that much later.
+    static const bool compute_pipeline = [] {
+        const char* env = std::getenv("GOW3_COMPUTE_PIPELINE");
+        return env && env[0] == '1';
+    }();
     while (!acb.empty()) {
         ProcessCommands();
-        if (rasterizer) {
+        if (rasterizer && !compute_pipeline) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // gow3: compute work uses the caches
         }
 
@@ -1507,6 +1516,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (rasterizer && compute_pipeline) {
+            switch (opcode) {
+            case PM4ItOpcode::Nop:
+            case PM4ItOpcode::SetShReg:       // this queue's state, or registers stage B copies
+            case PM4ItOpcode::AcquireMem:     // nothing to do here
+            case PM4ItOpcode::IndirectBuffer: // its packets decide for themselves
+            case PM4ItOpcode::DispatchDirect: // handed over (Rasterizer::DispatchDirect)
+                break;
+            default:
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+                break;
+            }
+        }
         Gow3GpuTrace::Event("compute %u%s packet %#x (%u dwords)", vqid + 1,
                             is_indirect ? " indirect" : "", static_cast<u32>(opcode),
                             header->type3.NumWords() + 1);
