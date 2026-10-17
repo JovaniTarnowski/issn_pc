@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 #include "gow3_copy.h"
+#include "gow3_latency.h"
 #include "gow3_toggles.h"
 #include "common/alignment.h"
 #include "core/memory.h"
@@ -314,13 +315,35 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         // gow3: the GPU command thread only records the copy and goes on with the game's
         // commands; this thread waits for the copy, as it would for the GPU on a console.
         std::shared_ptr<DeferredReadback> readback;
+        const bool lat = Gow3Latency::Enabled();
+        const s64 lat_start = lat ? Gow3Latency::Now() : 0;
+        s64 lat_picked = 0;
         liverpool->SendCommand<true>([&] {
+            if (lat) {
+                lat_picked = Gow3Latency::Now();
+            }
             readback = StartDeferredReadback(device_addr, size);
             if (!readback && is_write) {
                 // Nothing to copy back, as when DownloadMemory finds nothing.
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
             }
         });
+        if (lat && readback) {
+            const s64 recorded = Gow3Latency::Now();
+            Gow3Latency::Add(Gow3Latency::ReadbackQueue, lat_picked - lat_start);
+            Gow3Latency::Add(Gow3Latency::ReadbackRecord, recorded - lat_picked);
+            scheduler.GetWorkSemaphore()->Wait(readback->tick);
+            const s64 gpu_done = Gow3Latency::Now();
+            Gow3Latency::Add(Gow3Latency::ReadbackGpu, gpu_done - recorded);
+            const bool ok = FinishDeferredReadback(*readback, true);
+            Gow3Latency::Add(Gow3Latency::ReadbackApply, Gow3Latency::Now() - gpu_done);
+            if (!ok) {
+                liverpool->SendCommand<true>(flush_request);
+            } else if (is_write) {
+                memory_tracker->MarkRegionAsCpuModifiedUnlessGpu(device_addr, size);
+            }
+            return;
+        }
         if (readback && !FinishDeferredReadback(*readback, true)) {
             // The GPU (or a CPU write without a fault) changed the memory after the copy was
             // recorded: download it the old way, which first recovers the stale copy's ranges.
@@ -1050,7 +1073,11 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         offset = it->second.offset;
         tick = it->second.tick;
     }
+    const s64 eager_wait = Gow3Latency::Enabled() ? Gow3Latency::Now() : 0;
     scheduler.GetWorkSemaphore()->Wait(tick);
+    if (eager_wait) {
+        Gow3Latency::Add(Gow3Latency::EagerWait, Gow3Latency::Now() - eager_wait);
+    }
     std::scoped_lock lock{eager_mutex};
     const auto it = eager_pages.find(page_addr);
     if (it == eager_pages.end() || !it->second.valid || it->second.tick != tick) {

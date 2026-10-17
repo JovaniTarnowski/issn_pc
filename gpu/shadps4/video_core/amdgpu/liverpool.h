@@ -238,6 +238,7 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        std::atomic<s64> last_submit_ns{0}; ///< issn: GOW3_LATENCY
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available

@@ -8,6 +8,7 @@
 #endif
 #include <time.h>
 #include "gow3_copy.h"
+#include "gow3_latency.h"
 #include "gow3_sampler.h"
 #include "gow3_toggles.h"
 #include <cstdio>
@@ -256,7 +257,13 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 } // namespace
 
 namespace {
+std::atomic<s64> gfx_submit_ns{0}; ///< issn: GOW3_LATENCY, the last graphics submission
+
 void SignalEop(const PM4CmdEventWriteEop& eop) {
+    if (Gow3Latency::Enabled()) {
+        Gow3Latency::Add(Gow3Latency::GfxFence,
+                         Gow3Latency::Now() - gfx_submit_ns.load(std::memory_order_relaxed));
+    }
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
@@ -1746,6 +1753,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            if (Gow3Latency::Enabled()) {
+                Gow3Latency::Add(Gow3Latency::ComputeFence,
+                                 Gow3Latency::Now() - mapped_queues[vqid + 1].last_submit_ns.load(
+                                                          std::memory_order_relaxed));
+            }
             Gow3GpuTrace::ReleaseMem(vqid + 1, release_mem->Address<VAddr>(),
                                      release_mem->data_lo | u64(release_mem->data_hi) << 32,
                                      static_cast<u32>(release_mem->data_sel.Value()));
@@ -1818,6 +1830,9 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    if (Gow3Latency::Enabled()) {
+        gfx_submit_ns.store(Gow3Latency::Now(), std::memory_order_relaxed);
+    }
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
@@ -1853,6 +1868,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    if (Gow3Latency::Enabled()) {
+        queue.last_submit_ns.store(Gow3Latency::Now(), std::memory_order_relaxed);
+    }
     Gow3GpuTrace::Count(Gow3GpuTrace::CountAscSubmit);
     Gow3GpuTrace::Event("compute submit: queue %u acb %p %zu dwords", gnm_vqid,
                         static_cast<const void*>(acb.data()), acb.size());
