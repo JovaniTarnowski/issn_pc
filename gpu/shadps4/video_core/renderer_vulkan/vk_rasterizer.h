@@ -51,6 +51,10 @@ public:
         buffer_cache.EagerCopyAtFence();
     }
 
+    /// issn: GOW3_FLUSH_AT_FENCE=1, submits the recorded work at an end-of-pipe fence (see the
+    /// definition). On the thread recording draws.
+    void SubmitAtFence();
+
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
         return buffer_cache;
     }

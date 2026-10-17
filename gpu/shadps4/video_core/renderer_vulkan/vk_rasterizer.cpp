@@ -1490,6 +1490,33 @@ void Rasterizer::SubmitIfWorkPiledUp(const RenderState& next_state) {
     scheduler.Flush();
 }
 
+void Rasterizer::SubmitAtFence() {
+    // issn: a fence label is written when the recording reaches it, not when the GPU has run
+    // the work before it. inFAMOUS Second Son's main thread waits for such labels and then reads
+    // what the dispatches before them wrote: those reads wait for the GPU (readbacks), which
+    // only starts on the work when it is submitted (GOW3_GPU_PROFILE: the GPU idle 21 of 37 ms
+    // per frame in combat). Submitting at the fence starts it right away.
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_FLUSH_AT_FENCE");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || scheduler.WorkSinceSubmit() == 0) {
+        return;
+    }
+    // As in SubmitIfWorkPiledUp: not behind a compute pipeline being built, nor while the
+    // frame recorder or capture follow the submissions.
+    if (Pipeline::deferred_binds.load(std::memory_order_relaxed) != 0 ||
+        FrameRecord::IsRecording() || FrameCapture::Active()) {
+        return;
+    }
+    static std::atomic<u64> fence_submits{0};
+    if ((fence_submits.fetch_add(1, std::memory_order_relaxed) & 4095) == 0) {
+        std::printf("GPU: %llu submissions at fences so far (GOW3_FLUSH_AT_FENCE)\n",
+                    static_cast<unsigned long long>(fence_submits.load()));
+    }
+    scheduler.Flush();
+}
+
 Rasterizer::ComputeBinder Rasterizer::ComputeBind(const ComputePipeline* pipeline) {
     if (pipeline->IsBuilt()) {
         return {pipeline->Handle(), nullptr};
