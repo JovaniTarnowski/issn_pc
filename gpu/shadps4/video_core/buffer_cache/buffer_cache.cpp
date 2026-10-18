@@ -176,6 +176,12 @@ struct ReadbackStats {
     std::atomic<u64> deferred{0}, joined{0}, applied{0}, stale{0}, deferred_ns{0}, deferred_bytes{0};
     /// Eager copies: pages copied, used by a fault, gone stale unread, skipped for backoff.
     std::atomic<u64> eager_copied{0}, eager_used{0}, eager_stale{0}, eager_skipped{0};
+    /// issn: why a read fault on GPU data missed the eager copies (TryEagerRead): page never
+    /// read back before, its copy skipped for backoff, GPU wrote it after the last fence copy,
+    /// learnt but not copied yet, CPU bytes merged, across pages, GPU wrote it while waiting,
+    /// no room left for a new page; and the pages followed.
+    std::atomic<u64> miss_new{0}, miss_skip{0}, miss_dirty{0}, miss_uncopied{0}, miss_merged{0},
+        miss_cross{0}, miss_raced{0}, eager_full{0};
     /// Fast writes (ISSN_FAST_WRITE): taken, and their copies found unchanged, merged (the GPU
     /// had changed the page), with the page GPU modified again by then, or read back since.
     std::atomic<u64> fast{0}, owed_same{0}, owed_merged{0}, owed_conflict{0}, owed_superseded{0},
@@ -229,6 +235,17 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.eager_used.exchange(0)),
                 static_cast<unsigned long long>(r.eager_stale.exchange(0)),
                 static_cast<unsigned long long>(r.eager_skipped.exchange(0)));
+    std::printf("  eager misses: new page %llu, skipped (backoff) %llu, GPU wrote after the copy "
+                "%llu, not copied yet %llu, merged CPU bytes %llu, across pages %llu, rewritten "
+                "while waiting %llu; no room %llu\n",
+                static_cast<unsigned long long>(r.miss_new.exchange(0)),
+                static_cast<unsigned long long>(r.miss_skip.exchange(0)),
+                static_cast<unsigned long long>(r.miss_dirty.exchange(0)),
+                static_cast<unsigned long long>(r.miss_uncopied.exchange(0)),
+                static_cast<unsigned long long>(r.miss_merged.exchange(0)),
+                static_cast<unsigned long long>(r.miss_cross.exchange(0)),
+                static_cast<unsigned long long>(r.miss_raced.exchange(0)),
+                static_cast<unsigned long long>(r.eager_full.exchange(0)));
     if (const u64 writes = r.write_readbacks.exchange(0); writes) {
         std::printf("  write faults on GPU data: %llu; fast path not taken: across pages %llu, no "
                     "history %llu, marked unsafe %llu, merged CPU bytes %llu, read back meanwhile "
@@ -929,6 +946,9 @@ void BufferCache::NoteReadback(VAddr addr, u64 size) {
             eager_next_offset += EagerPageSize;
         } else {
             eager_pages.erase(it);
+            if (ReadbackStatsEnabled()) {
+                Readbacks().eager_full.fetch_add(1);
+            }
             break;
         }
         it->second = EagerPage{offset, 0, true, false, 0, 0, 0};
@@ -1051,7 +1071,11 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         return false;
     }
     const VAddr page_addr = Common::AlignDown(addr, EagerPageSize);
+    const bool stats = ReadbackStatsEnabled();
     if (addr + size > page_addr + EagerPageSize || !eager_buffer) {
+        if (stats) {
+            Readbacks().miss_cross.fetch_add(1);
+        }
         return false;
     }
     u64 offset, tick;
@@ -1060,12 +1084,29 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         const auto it = eager_pages.find(page_addr);
         if (it == eager_pages.end() || !it->second.valid ||
             !memory_tracker->IsRegionGpuModified(page_addr, EagerPageSize)) {
+            if (stats) {
+                auto& r = Readbacks();
+                if (it == eager_pages.end()) {
+                    r.miss_new.fetch_add(1);
+                } else if (it->second.valid) {
+                    // not GPU modified: the plain fault path handles it (not counted)
+                } else if (it->second.skip > 0) {
+                    r.miss_skip.fetch_add(1);
+                } else if (it->second.tick == 0) {
+                    r.miss_uncopied.fetch_add(1);
+                } else {
+                    r.miss_dirty.fetch_add(1);
+                }
+            }
             return false;
         }
         if (merged_count.load(std::memory_order_acquire)) {
             std::scoped_lock merge_lock{merge_mutex};
             const auto m = merged_writes.upper_bound(page_addr + EagerPageSize - 1);
             if (m != merged_writes.begin() && std::prev(m)->second > page_addr) {
+                if (stats) {
+                    Readbacks().miss_merged.fetch_add(1);
+                }
                 return false; // CPU bytes not yet on the GPU: the copy would lose them
             }
         }
@@ -1081,6 +1122,9 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
     std::scoped_lock lock{eager_mutex};
     const auto it = eager_pages.find(page_addr);
     if (it == eager_pages.end() || !it->second.valid || it->second.tick != tick) {
+        if (stats) {
+            Readbacks().miss_raced.fetch_add(1);
+        }
         return false; // the GPU wrote it again meanwhile
     }
     eager_buffer->Invalidate(offset, EagerPageSize);
