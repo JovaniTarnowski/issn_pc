@@ -33,6 +33,10 @@ PROFILES = {
         # effect lost.
         'ISSN_COMPUTE_PIPELINE': '1',
         'ISSN_COMPUTE_PRIORITY': '1',
+        # Saving pipeline binaries (VK_KHR_pipeline_binary) for pipelines compiled into an empty
+        # shader cache crashed AMD's Windows driver (amdvlk64.dll) at the first boot after the
+        # cache was rebuilt (tester, RX 9060 XT); loading saved ones worked. Off until found.
+        'ISSN_PIPELINE_BINARIES': '0',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'ISSN_LOD_SCALE': '0.6',

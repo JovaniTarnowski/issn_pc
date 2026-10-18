@@ -34,10 +34,12 @@ class ControlMapTest(unittest.TestCase):
 
     def test_pipeline_binary_cache_switch(self):
         settings = {**launcher.APP_DEFAULTS}
-        self.assertTrue(settings['pipeline_binary_cache'])
-        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '1')
-        settings['pipeline_binary_cache'] = False
+        self.assertFalse(settings['pipeline_binaries'])  # issn: froze AMD with an empty cache
         self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '0')
+        settings['pipeline_binary_cache'] = True  # the old key, saved by 0.1.0: ignored
+        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '0')
+        settings['pipeline_binaries'] = True
+        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '1')
 
     def test_changed_buttons_in_table_order(self):
         controls = {'key': {'circle': ' Left Shift ', 'cross': 'Q', 'square': ''}, 'pad': {'cross': 'b'}}

@@ -314,7 +314,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'video_backend': 'auto', 'gamemode': False, 'mangohud': False, 'desktop_integration': True, 'user_dir': '',
                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
                 'player_name': '', 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'no_msaa': '', 'stream_memory': 'cached',
-                'gpu_id': '', 'background_warmup': True, 'parallel_warmup': True, 'pipeline_binary_cache': True,
+                'gpu_id': '', 'background_warmup': True, 'parallel_warmup': True, 'pipeline_binaries': False,
                 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
@@ -768,7 +768,8 @@ def game_environment(s):
         env['ISSN_LOD_SCALE'] = str(s['draw_distance'])
     env['ISSN_BACKGROUND_WARMUP'] = '1' if s.get('background_warmup', True) else '0'
     env['ISSN_PARALLEL_WARMUP'] = '1' if s.get('parallel_warmup', True) else '0'
-    env['ISSN_PIPELINE_BINARIES'] = '1' if s.get('pipeline_binary_cache', True) else '0'
+    # issn: a new key, so a switch saved on by an older launcher does not turn it back on.
+    env['ISSN_PIPELINE_BINARIES'] = '1' if s.get('pipeline_binaries', False) else '0'
     env['ISSN_PERF_DIAG'] = '1' if s.get('perf_diag', False) else '0'
     for key, name in (('frame_stats', 'ISSN_FRAME_STATS'), ('gpu_profile', 'ISSN_GPU_PROFILE'),
                       ('vk_validation', 'ISSN_VK_VALIDATION'), ('frame_capture_key', 'ISSN_FRAME_CAPTURE_KEY')):
@@ -1274,9 +1275,9 @@ class Launcher:
         self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
                  _('How far buildings and details keep their full detail in the open city.'), restart=True)
         self.section(f, _('Shaders'))
-        self.check(f, 'pipeline_binary_cache', 'app', _('Use pipeline binary cache (A/B test)'),
-                   _('Reuse saved Vulkan pipelines. Disable to compare FPS with normal compilation. '
-                     'Takes effect on the next launch; saved caches are preserved.'))
+        self.check(f, 'pipeline_binaries', 'app', _('Use pipeline binary cache (experimental)'),
+                   _('Saves the compiled Vulkan pipelines to load faster. Off by default: with an empty shader '
+                     'cache it froze AMD cards at the first start. Takes effect on the next launch.'))
         self.check(f, 'background_warmup', 'app', _('Load shader cache in the background'),
                    _('The game opens at once and the saved shaders load while you play; a small note in the '
                      'corner shows the progress. Switch it off to wait on the loading screen instead.'))
