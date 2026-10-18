@@ -41,7 +41,11 @@ struct Target {
     std::unordered_map<Key, std::uint64_t, KeyHash> self, total;
     /// Whole stacks (up to StackDepth frames from the top), to see who calls what.
     std::unordered_map<std::string, std::uint64_t> stacks;
+    /// The same thread's samples taken while compute work waits (ComputeWaiting), or null.
+    Target* twin = nullptr;
+    std::uint64_t window_samples = 0; ///< the owner's samples in this report, for the twin
 };
+std::atomic<int> compute_waiting{0};
 constexpr int StackDepth = 14;
 
 std::mutex targets_mutex;
@@ -136,6 +140,10 @@ void Print(Target& t) {
     std::printf("Sampler thread %s: %llu samples in %u s, busy %.1f%%\n", t.name.c_str(),
                 static_cast<unsigned long long>(t.samples), unsigned(ReportMs / 1000),
                 t.samples ? 100.0 * t.busy / t.samples : 0.0);
+    if (t.window_samples) {
+        std::printf("  (compute waiting in %.1f%% of the thread's samples)\n",
+                    100.0 * t.samples / t.window_samples);
+    }
     const bool quiet = t.guest && t.busy * 100 < t.samples * 3;
     const std::size_t self_lines = t.guest ? 15 : 30;
     const std::size_t stack_lines = t.guest ? 8 : 15;
@@ -217,34 +225,46 @@ void Run() {
             if (!count) {
                 continue;
             }
-            ++t->samples;
-            if (!frames[0].base || (ModuleName(frames[0].base) != "ntdll.dll" &&
-                                    ModuleName(frames[0].base) != "win32u.dll")) {
-                ++t->busy;
-            }
-            ++t->self[frames[0]];
-            {
-                std::string stack;
-                for (int i = 0; i < count && i < StackDepth; ++i) {
-                    char part[64];
-                    std::snprintf(part, sizeof(part), "%s%llx:%llx", i ? " < " : "",
-                                  static_cast<unsigned long long>(frames[i].base),
-                                  static_cast<unsigned long long>(frames[i].begin));
-                    stack += part;
+            const bool waiting = t->twin && compute_waiting.load(std::memory_order_relaxed) > 0;
+            for (Target* into : {t, waiting ? t->twin : nullptr}) {
+                if (!into) {
+                    continue;
                 }
-                ++t->stacks[stack];
-            }
-            seen.clear();
-            for (int i = 0; i < count; ++i) {
-                if (seen.insert(frames[i].base * 31 + frames[i].begin).second) {
-                    ++t->total[frames[i]];
+                ++into->samples;
+                if (!frames[0].base || (ModuleName(frames[0].base) != "ntdll.dll" &&
+                                        ModuleName(frames[0].base) != "win32u.dll")) {
+                    ++into->busy;
+                }
+                ++into->self[frames[0]];
+                {
+                    std::string stack;
+                    for (int i = 0; i < count && i < StackDepth; ++i) {
+                        char part[64];
+                        std::snprintf(part, sizeof(part), "%s%llx:%llx", i ? " < " : "",
+                                      static_cast<unsigned long long>(frames[i].base),
+                                      static_cast<unsigned long long>(frames[i].begin));
+                        stack += part;
+                    }
+                    ++into->stacks[stack];
+                }
+                seen.clear();
+                for (int i = 0; i < count; ++i) {
+                    if (seen.insert(frames[i].base * 31 + frames[i].begin).second) {
+                        ++into->total[frames[i]];
+                    }
                 }
             }
         }
         if (GetTickCount() - last_report >= ReportMs) {
             last_report = GetTickCount();
             for (Target* t : list) {
+                if (t->twin) {
+                    t->twin->window_samples = t->samples;
+                }
                 Print(*t);
+                if (t->twin) {
+                    Print(*t->twin);
+                }
             }
             std::fflush(stdout);
         }
@@ -256,6 +276,12 @@ static void Register(const char* name, bool guest);
 
 void RegisterThisThread(const char* name) {
     Register(name, false);
+}
+
+void ComputeWaiting(int delta) {
+    if (Enabled()) {
+        compute_waiting.fetch_add(delta, std::memory_order_relaxed);
+    }
 }
 
 static void Register(const char* name, bool guest) {
@@ -274,6 +300,10 @@ static void Register(const char* name, bool guest) {
         target->handle = handle;
         target->id = GetCurrentThreadId();
         target->guest = guest;
+        if (!guest && target->name == "GPU command") {
+            target->twin = new Target;
+            target->twin->name = "GPU command, compute waiting";
+        }
         targets.push_back(target);
     }
     std::call_once(start_once, [] { std::thread(Run).detach(); });
@@ -288,6 +318,7 @@ extern "C" void issn_sampler_register_thread(const char* name) {
 
 namespace IssnSampler {
 void RegisterThisThread(const char*) {}
+void ComputeWaiting(int) {}
 } // namespace IssnSampler
 
 #endif

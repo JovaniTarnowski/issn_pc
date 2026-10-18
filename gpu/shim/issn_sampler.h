@@ -9,4 +9,8 @@
 namespace IssnSampler {
 /// Registers the calling thread under `name` (no-op unless ISSN_SAMPLE=1 on Windows).
 void RegisterThisThread(const char* name);
+/// issn: compute submissions not started yet (+1 on submit, -1 at their first packet). While it
+/// is above zero, the GPU command thread's samples also go to a second report, "GPU command,
+/// compute waiting": what that thread does while the compute work the game waits for queues.
+void ComputeWaiting(int delta);
 } // namespace IssnSampler

@@ -1518,6 +1518,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     }();
     s64 lat_first = 0;
     if constexpr (!is_indirect) {
+        IssnSampler::ComputeWaiting(-1);
         if (IssnLatency::Enabled()) {
             lat_first = IssnLatency::Now();
             IssnLatency::Add(IssnLatency::ComputeStart,
@@ -1949,6 +1950,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
                         static_cast<const void*>(acb.data()), acb.size());
     const auto& task = ProcessCompute(acb, vqid);
     pending_asc.fetch_add(1, std::memory_order_relaxed); // before the GPU thread can finish it
+    IssnSampler::ComputeWaiting(1); // until its first packet (ISSN_SAMPLE)
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
