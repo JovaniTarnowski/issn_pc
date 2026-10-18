@@ -929,12 +929,29 @@ void BufferCache::NoteReadback(VAddr addr, u64 size) {
     if (!EagerEnabled()) {
         return;
     }
+    // issn: ISSN_EAGER_LEARN_KB (default 4: the faulting page only) learns the aligned block
+    // around a read. The game reads GPU-written records spread over pages it has not read back
+    // before (ISSN_READBACK_STATS "new page", ~100 slow readbacks a second in combat).
+    static const u64 learn = [] {
+        const char* e = std::getenv("ISSN_EAGER_LEARN_KB");
+        const u64 kb = e && *e ? std::strtoull(e, nullptr, 10) : 4;
+        return std::bit_ceil(std::clamp<u64>(kb, 4, 1024)) * 1024;
+    }();
+    const VAddr first = Common::AlignDown(addr, learn);
+    const VAddr last = Common::AlignUp(addr + size, learn);
     std::scoped_lock lock{eager_mutex};
-    for (VAddr page = Common::AlignDown(addr, EagerPageSize); page < addr + size; page += EagerPageSize) {
+    for (VAddr page = first; page < last; page += EagerPageSize) {
+        const bool neighbour = page + EagerPageSize <= addr || page >= addr + size;
+        if (neighbour && !memory_tracker->IsRegionGpuModified(page, EagerPageSize)) {
+            // Nothing the GPU wrote there: learnt if it ever faults itself.
+            continue;
+        }
         auto [it, inserted] = eager_pages.try_emplace(page);
         if (!inserted) {
-            it->second.idle = 0;
-            it->second.skip = 0; // a copy at the next fence would have spared this fault
+            if (!neighbour) { // a neighbour keeps its backoff: it was not read
+                it->second.idle = 0;
+                it->second.skip = 0; // a copy at the next fence would have spared this fault
+            }
             continue;
         }
         u64 offset;
