@@ -335,6 +335,48 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 }
 
+// issn: a compute queue's ReleaseMem in order with the draws and dispatches before it
+// (ISSN_COMPUTE_FENCE_PIPE=1), as RunEventWriteEop does for the graphics fences.
+struct ComputeRelease {
+    PM4CmdReleaseMem release;
+    u32 pipe_id;
+    s64 submit_ns; ///< ISSN_LATENCY: when its submission came
+};
+
+void SignalComputeRelease(const ComputeRelease& c) {
+    if (c.submit_ns) {
+        IssnLatency::Add(IssnLatency::ComputeFence, IssnLatency::Now() - c.submit_ns);
+    }
+    c.release.SignalFence(
+        [pipe_id = c.pipe_id] {
+            Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+        },
+        [](VAddr, u16, u16) { UNREACHABLE_MSG("GDS fence on the pipelined compute path"); });
+}
+
+void RunComputeRelease(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    // The task's copy (RunInOrder keeps it 8-byte aligned in the pipe).
+    const ComputeRelease& c = *reinterpret_cast<const ComputeRelease*>(data);
+    rasterizer.ProcessDownloadImages();
+    rasterizer.EagerCopyAtFence();
+    rasterizer.SubmitAtFence();
+    if (Vulkan::DrawPipe::OnStageB() && !IssnToggle::Disabled(IssnToggle::RecorderFences)) {
+        rasterizer.SignalAfterHostCopies([c] { SignalComputeRelease(c); });
+    } else {
+        rasterizer.WaitHostCopies();
+        rasterizer.WaitDeferredSignals();
+        SignalComputeRelease(c);
+    }
+}
+
+bool ComputeFencePipe() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ISSN_COMPUTE_FENCE_PIPE");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* dma_data = reinterpret_cast<const PM4DmaData*>(data);
     ASSERT(dma_data->command.das == 0);
@@ -1595,6 +1637,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             case PM4ItOpcode::DispatchDirect: // handed over (Rasterizer::DispatchDirect)
             case PM4ItOpcode::EventWrite:     // nothing to do here (partial flushes)
                 break;
+            case PM4ItOpcode::ReleaseMem:
+                // issn: handed to the recording thread in order (RunComputeRelease).
+                if (ComputeFencePipe() &&
+                    reinterpret_cast<const PM4CmdReleaseMem*>(header)->data_sel.Value() !=
+                        DataSelect::GdsMemStore) {
+                    break;
+                }
+                [[fallthrough]];
             default: {
                 // The opcode as the reason: ISSN_FRAME_STATS shows which ones still wait.
                 const s64 drain_start = opcode == PM4ItOpcode::ReleaseMem && IssnLatency::Enabled()
@@ -1820,6 +1870,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
+            if (const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+                rasterizer && compute_pipeline && ComputeFencePipe() &&
+                release_mem->data_sel.Value() != DataSelect::GdsMemStore) {
+                IssnGpuTrace::ReleaseMem(vqid + 1, release_mem->Address<VAddr>(),
+                                         release_mem->data_lo | u64(release_mem->data_hi) << 32,
+                                         static_cast<u32>(release_mem->data_sel.Value()));
+                const ComputeRelease c{*release_mem, queue.pipe_id,
+                                       IssnLatency::Enabled()
+                                           ? mapped_queues[vqid + 1].last_submit_ns.load(
+                                                 std::memory_order_relaxed)
+                                           : 0};
+                // Not drained above: in order on the recording thread, or here after a drain.
+                rasterizer->RunInOrder(&RunComputeRelease, &c, sizeof(c));
+                break;
+            }
             // port: copies deferred to the recording thread precede writes the guest sees, and
             // so do graphics fences deferred to it (the pipe was drained before this packet).
             if (rasterizer) {

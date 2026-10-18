@@ -595,3 +595,14 @@ written, ~3.3 ms of it before its first packet, because graphics command buffers
   behind the draws already decoded; stage A keeps decoding compute. The guest thread waits for
   the copy as before. The order with later packets holds: everything stage A does on the caches
   drains stage B first, and pipelined writes queue behind the task.
+
+### What stage A does while compute waits (2026-10-18, `ISSN_SAMPLE=1`, RX 9060 XT, combat)
+
+The sampler's "GPU command, compute waiting" report: 98% of those samples are inside another
+compute submission (`ProcessCompute<true>`), i.e. compute queued behind compute. Of that time,
+~33% drains stage B (mostly before compute `ReleaseMem`, ~500/s) and ~24% copies finished image
+readbacks into guest memory (`ProcessDownloadImages` -> `RetireReadbacks` -> memcpy), also at
+`ReleaseMem`. `ISSN_COMPUTE_FENCE_PIPE=1` (opt-in, being measured) hands compute `ReleaseMem`
+to stage B in order (`RunComputeRelease`, like `RunEventWriteEop`): no drain, and the readback
+copies, eager copies and the label write move to stage B.
+`ISSN_ORDERED_READBACK=1` measured slower (172 vs 160 graphics fences/s): off.
