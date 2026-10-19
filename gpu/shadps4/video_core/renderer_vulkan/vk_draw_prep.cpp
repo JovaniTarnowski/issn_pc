@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "issn_reclaim.h"
 #include "issn_threads.h"
 #include "issn_toggles.h"
 #include "common/thread.h"
@@ -320,6 +321,7 @@ void DrawPreparation::Collect() {
             tail_seq = front->seq + 1;
             tail_checksum = front->end_checksum;
         }
+        IssnReclaim::Later(std::move(submissions.front())); // ISSN_ASYNC_FREE
         submissions.pop_front();
     }
 }

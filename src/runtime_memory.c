@@ -772,12 +772,21 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
  * has no backing (the caller then reads the guest address directly). GPU-internal threads use it
  * so a read of a page protected for readback (ISSN_READBACKS=2) cannot fault into a readback that
  * waits for the same thread (the Vulkan recorder). From HayatoG's iss_pc. */
+static int read_backing_fast(uintptr_t address, void *data, uint64_t size);
+static void cache_region(size_t i);
+static int lockfree_reads(void) {
+    static int enabled=-1;
+    if (enabled<0) { const char *e=getenv("ISSN_LOCKFREE_READ"); enabled=e && *e=='1'; }
+    return enabled;
+}
 int runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
+    if (lockfree_reads() && read_backing_fast(address,data,size)) return 1;
     read_lock();
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
+        if (at==address && lockfree_reads()) cache_region(i);
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
         memcpy((unsigned char *)data+(at-address),backing_base+vmas[i].phys+(at-vmas[i].start),n);
         at+=n;
@@ -787,7 +796,7 @@ int runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
 }
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
-typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
+typedef struct { uint64_t generation; uintptr_t start, end; int kind; uint64_t phys; } CachedRegion;
 static __thread CachedRegion region_cache[8];
 static __thread unsigned region_cache_next;
 static const CachedRegion *cached_region(uintptr_t address) {
@@ -803,7 +812,23 @@ static const CachedRegion *cached_region(uintptr_t address) {
 static void cache_region(size_t i) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
+    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,vmas[i].phys};
+}
+/* issn: ISSN_LOCKFREE_READ=1. The GPU threads read guest memory through the backing view for
+ * every draw (constants, CopySparseMemory): ~130k draws/s in the city, and each read took the
+ * table lock (two winpthreads mutex round trips, contended by the game's threads), ~7% of the GPU
+ * command thread. With the region in this thread's cache the copy runs without the lock, as a
+ * seqlock reader: the backing view stays mapped, and a copy that overlapped a table change
+ * (generation moved) is discarded and redone under the lock. */
+static int read_backing_fast(uintptr_t address, void *data, uint64_t size) {
+    if (runtime_disabled_optimizations & 1) return 0;
+    const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    if (generation & 1) return 0;
+    const CachedRegion *c=cached_region(address);
+    if (!c || c->kind==KIND_RESERVED || size>c->end-address) return 0;
+    memcpy(data,backing_base+c->phys+(address-c->start),size);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&table_generation,__ATOMIC_RELAXED)==generation;
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {

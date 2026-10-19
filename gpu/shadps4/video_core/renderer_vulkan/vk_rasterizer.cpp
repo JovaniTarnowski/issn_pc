@@ -16,6 +16,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "issn_toggles.h"
+#include "issn_reclaim.h"
 #include "issn_readback_diff.h"
 #include "issn_settings.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -738,6 +739,7 @@ void Rasterizer::RetireSubmission() {
         return;
     }
     while (!pipe_keepalive.empty() && draw_pipe->Reached(pipe_keepalive.front().first)) {
+        IssnReclaim::Later(std::move(pipe_keepalive.front().second)); // ISSN_ASYNC_FREE
         pipe_keepalive.pop_front();
     }
     if (!draw_pipe->Idle()) {
