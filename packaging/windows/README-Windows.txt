@@ -12,6 +12,9 @@ What's new in 0.2.0
   inFAMOUS > "Effects work goes ahead of drawing"; switch it off if the game freezes.
 - New launcher look, with Effects (Full, Light, Off) and Draw distance in Performance > inFAMOUS.
 - "Save a bug report" (Advanced page): a zip on the desktop with the last log and your settings.
+- Game language: Portuguese (Brazil) and the other languages of the game; Automatic (default)
+  follows the launcher's language.
+- Controls: "Controller without touchpad" (Automatic, On, Off).
 - The launcher checks this port's GitHub releases for updates once they are public.
 - Faster in the open city (about 36 -> 39-41 FPS standing still on an RX 9060 XT): the thread
   that feeds the graphics card no longer frees memory nor waits on a lock for every draw, and
@@ -42,7 +45,8 @@ Starting
 Controller
 - DualShock 4 and DualSense: touchpad, motion sensors (shake and tilt the spray can) and the
   light bar work as on the PS4.
-- Pads without a touchpad or motion sensors (Xbox, 8BitDo, ...):
+- Pads without a touchpad or motion sensors (Xbox, 8BitDo, ...), on by itself for them (launcher:
+  Game > Controls > Controller without touchpad):
   - Spray can: L3 + R3 together (or H) holds the pad like the spray can; L1 shakes it, the right
     stick aims. L3 + R3 again ends it.
   - Touchpad swipe (lift, push): hold Select/Back and push the right stick that way.

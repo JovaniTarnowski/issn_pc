@@ -557,6 +557,20 @@ class ReleaseVersionTest(unittest.TestCase):
         self.assertNotIn('gow3_pc', launcher.RELEASES_API + launcher.RELEASES_PAGE)
         self.assertGreater(launcher.version_tuple('windows-v0.2.1'), launcher.version_tuple(launcher.VERSION))
 
+    def test_game_language_follows_the_launcher(self):
+        # issn: Automatic: Portuguese launcher -> Brazilian Portuguese game (17), as the profile.
+        self.assertEqual(launcher.APP_DEFAULTS['game_language'], '')
+        self.assertEqual(launcher.game_language({'game_language': '', 'ui_language': 'pt'}), '17')
+        self.assertEqual(launcher.game_language({'game_language': '1', 'ui_language': 'pt'}), '1')
+        self.assertEqual(launcher.game_language({'game_language': '', 'ui_language': 'en'}), '1')
+        self.assertIn('17', [value for value, _text in launcher.LANGUAGES])
+
+    def test_pad_emulation_switch(self):
+        env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x'})
+        self.assertNotIn('ISSN_PAD_EMULATION', env)  # automatic: the runtime decides
+        env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x', 'pad_emulation': '0'})
+        self.assertEqual(env['ISSN_PAD_EMULATION'], '0')
+
     def test_first_start_follows_windows(self):
         # issn: the testers play in Portuguese; '' follows the Windows language (English for
         # the languages without a translation). English stays a choice in Advanced.

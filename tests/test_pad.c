@@ -60,6 +60,9 @@ int main(void) {
     close(fd);
     setenv("ISSN_PAD_FILE",path,1);
     setenv("SDL_VIDEODRIVER","dummy",1);
+    /* issn: the virtual pad below has a touchpad and sensors (emulation off on Automatic); the
+     * tests also cover the touchpad and spray emulation, so it is forced on. */
+    setenv("ISSN_PAD_EMULATION","1",1);
     /* Only the virtual test controller is a gamepad, whatever is plugged in. */
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
     assert(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD));

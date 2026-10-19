@@ -11,6 +11,7 @@
 #endif
 #include <functional>
 
+#include "issn_sampler.h"
 #include "issn_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "issn_toggles.h"
@@ -316,6 +317,7 @@ void Scheduler::SyncRecording() {
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("port:VkRecorder");
+    IssnSampler::RegisterThisThread("vk recorder");
     while (true) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few

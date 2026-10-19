@@ -188,6 +188,22 @@ static void apply_light(SDL_Gamepad *g) {
     }
 }
 
+/* issn: ISSN_PAD_EMULATION (launcher: Controls > Controller without touchpad): the touchpad
+ * swipes and two fingers (Select/Back + right stick, + R1) and the spray pose (L3+R3) for pads
+ * without a touchpad or motion sensors. auto (default): on when the pad lacks a touchpad or
+ * motion sensors (Xbox, 8BitDo, ...), off on a DualShock 4 / DualSense, whose L3+R3 then reach the
+ * game; 1: always; 0: never. */
+static int pad_emulation_auto=1; /* set when a gamepad opens */
+static bool pad_emulation(void) {
+    static int mode=-2;
+    if (mode==-2) {
+        const char *e=getenv("ISSN_PAD_EMULATION");
+        mode=e && e[0]=='1' ? 1 : e && e[0]=='0' ? 0 : -1;
+        printf("Runtime: pad emulation for pads without a touchpad: %s\n",mode==1 ? "on" : mode==0 ? "off" : "auto");
+    }
+    return mode<0 ? pad_emulation_auto : mode;
+}
+
 /* Called under lock with the gamepad just opened: its motion sensors, its light bar. */
 static void open_sensors(SDL_Gamepad *g) {
     sensors=0;
@@ -195,6 +211,10 @@ static void open_sensors(SDL_Gamepad *g) {
     if (SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true)) sensors|=SENSOR_GYRO;
     printf("Runtime: gamepad motion sensors: %s%s%s\n",sensors ? "" : "none",
            (sensors & SENSOR_ACCEL) ? "accelerometer " : "", (sensors & SENSOR_GYRO) ? "gyroscope" : "");
+    pad_emulation_auto=SDL_GetNumGamepadTouchpads(g)<=0 || !(sensors & SENSOR_ACCEL);
+    printf("Runtime: gamepad %s: touchpad emulation (Select + right stick, L3+R3 spray) %s\n",
+           SDL_GetNumGamepadTouchpads(g)>0 ? "with a touchpad" : "without a touchpad",
+           pad_emulation() ? "on" : "off");
     light.applied=0;
     apply_light(g);
 }
@@ -650,7 +670,7 @@ static void sample(PadData *d) {
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     /* issn: spray pose: L3+R3 together (hidden from the game) or a SPRAY_POSE source toggles it;
      * in it L1 shakes the can. */
-    const bool chord=(d->buttons & BTN_L3) && (d->buttons & BTN_R3);
+    const bool chord=pad_emulation() && (d->buttons & BTN_L3) && (d->buttons & BTN_R3);
     if (chord || (d->buttons & SPRAY_POSE)) {
         if (!spray_chord_held) spray_pose_set(!spray_pose);
         spray_chord_held=1;
@@ -663,7 +683,7 @@ static void sample(PadData *d) {
     d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
     if (spray_pose) apply_spray_pose(d,shaking);
     else if (shaking) motion_shake(d->acceleration,d->timestamp,accel_scale());
-    play_swipe(d);
+    if (pad_emulation()) play_swipe(d);
     play_click(d);
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;

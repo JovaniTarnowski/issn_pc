@@ -312,7 +312,7 @@ PAGES = ('home', 'graphics', 'performance', 'game', 'advanced')
 PAGE_REFRESH = {'home': ('refresh_status',), 'game': ('refresh_lists', 'refresh_game_patches')}
 APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', str(PORT_DIR.parent / 'CUSA00004') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False,
                 'video_backend': 'auto', 'gamemode': False, 'mangohud': False, 'desktop_integration': True, 'user_dir': '',
-                'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
+                'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1', 'game_language': '', 'pad_emulation': '',
                 'player_name': '', 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'no_msaa': '', 'stream_memory': 'cached',
                 'gpu_id': '', 'background_warmup': True, 'parallel_warmup': True, 'pipeline_binaries': False,
                 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
@@ -391,9 +391,34 @@ OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 
            ('2560x1440', ('2560 × 1440',)), ('3840x2160', ('3840 × 2160 (4K)',))]
 LIVE = [('auto', ('Auto (by graphics card)', 'Авто (по видеокарте)')), ('0', ('Off (faster)', 'Выключена (быстрее)')),
         ('1', ('On (change without restarting)', 'Включена (без перезапуска)'))]
-LANGUAGES = [('1', ('English', 'Английский')), ('8', ('Russian', 'Русский')), ('0', ('Japanese', 'Японский')),
-             ('2', ('French', 'Французский')), ('3', ('Spanish', 'Испанский')), ('4', ('German', 'Немецкий')),
-             ('5', ('Italian', 'Итальянский'))]
+# PS4 system language ids (sceSystemServiceParamGetInt). '' follows the launcher's language.
+# The US release (CUSA00223) has the Brazilian Portuguese dub and text; a language the dump does
+# not have falls back to the game's own default.
+LANGUAGES = [('', ('Automatic (launcher language)', 'Автоматически (язык лаунчера)')),
+             ('17', ('Portuguese (Brazil)', 'Португальский (Бразилия)')),
+             ('7', ('Portuguese (Portugal)', 'Португальский (Португалия)')),
+             ('1', ('English', 'Английский')), ('18', ('English (UK)', 'Английский (Великобритания)')),
+             ('3', ('Spanish', 'Испанский')), ('20', ('Spanish (Latin America)', 'Испанский (Латинская Америка)')),
+             ('2', ('French', 'Французский')), ('4', ('German', 'Немецкий')),
+             ('5', ('Italian', 'Итальянский')), ('6', ('Dutch', 'Нидерландский')),
+             ('16', ('Polish', 'Польский')), ('8', ('Russian', 'Русский')), ('19', ('Turkish', 'Турецкий')),
+             ('21', ('Arabic', 'Арабский')), ('0', ('Japanese', 'Японский')), ('9', ('Korean', 'Корейский')),
+             ('11', ('Chinese (Simplified)', 'Китайский (упрощённый)')),
+             ('10', ('Chinese (Traditional)', 'Китайский (традиционный)'))]
+# issn: touchpad and motion emulation for pads without them (runtime_pad.c, ISSN_PAD_EMULATION).
+PAD_EMULATION = [('', ('Automatic (on for pads without a touchpad)',)), ('1', ('On',)), ('0', ('Off',))]
+# Launcher language -> PS4 language id for the Automatic game language.
+GAME_LANGUAGE_OF_UI = {'pt': '17', 'en': '1', 'es': '3', 'fr': '2', 'de': '4', 'it': '5', 'pl': '16',
+                       'ru': '8', 'tr': '19', 'ar': '21', 'ja': '0', 'ko': '9', 'zh': '11'}
+
+
+def game_language(s):
+    """The PS4 language id for the game: the Game language choice, else the launcher's."""
+    chosen = str(s.get('game_language', ''))
+    if chosen in {value for value, _text in LANGUAGES if value}:
+        return chosen
+    ui = s.get('ui_language') or (windows_language() if WINDOWS else 'en')
+    return GAME_LANGUAGE_OF_UI.get(ui, '1')
 DRAW_PIPE = [('', ('Auto (8+ threads)', 'Авто (8+ потоков)')), ('1', ('On', 'Включён')),
              ('0', ('Off (more stable)', 'Выключен (стабильнее)'))]
 # inFAMOUS: the game profile reads GPU results back precisely (smoke, sparks, neon need them).
@@ -747,7 +772,8 @@ def game_environment(s):
     env['ISSN_MODS_ENABLED'] = '1' if s['mods_enabled'] else '0'
     env['ISSN_PATCHES_DIR'] = s['patches_dir'] or str(DATA_DIR / 'patches')
     env['ISSN_PATCHES_CONFIG'] = str(DATA_DIR / 'patches.json')
-    env['ISSN_LANGUAGE'] = s['language']
+    # issn: a new key ('language' was saved as English by earlier launchers).
+    env['ISSN_LANGUAGE'] = game_language(s)
     if str(s['player_name']).strip():
         env['ISSN_USER_NAME'] = str(s['player_name']).strip()
     if s['hdr']:
@@ -775,6 +801,9 @@ def game_environment(s):
                       ('vk_validation', 'ISSN_VK_VALIDATION'), ('frame_capture_key', 'ISSN_FRAME_CAPTURE_KEY')):
         if s[key]:
             env[name] = '1'
+    env.pop('ISSN_PAD_EMULATION', None)
+    if s.get('pad_emulation') in ('0', '1'):
+        env['ISSN_PAD_EMULATION'] = s['pad_emulation']
     for kind, name in (('key', 'ISSN_KEY_MAP'), ('pad', 'ISSN_PAD_MAP')):
         if value := control_map(s.get('controls', {}), kind):
             env[name] = value
@@ -1333,7 +1362,9 @@ class Launcher:
         self.section(f, _('Saves'))
         self.build_save_backups(f)
         self.section(f, _('Language'))
-        self.row(f, _('Game language', 'Язык игры'), self.choice(f, 'language', 'app', LANGUAGES))
+        self.row(f, _('Game language', 'Язык игры'), self.choice(f, 'game_language', 'app', LANGUAGES),
+                 _('Text and voices. Automatic follows the launcher language (Portuguese: the Brazilian dub).'),
+                 restart=True)
         self.build_patches(f)
         self.build_mods(f)
         self.build_controls(f)
@@ -1462,6 +1493,11 @@ class Launcher:
             ttk.Radiobutton(names, text=label, value=value, variable=self.pad_style,
                             command=self.relabel_pad_controls).pack(side='left', padx=(0, 14))
         self.row(f, _('Gamepad names'), names)
+        self.row(f, _('Controller without touchpad'), self.choice(f, 'pad_emulation', 'app', PAD_EMULATION),
+                 _('For Xbox, 8BitDo and other pads without a touchpad or motion sensors. Touchpad click: '
+                   'Select/Back (with L1: the left side). Swipe: hold Select/Back and push the right stick. '
+                   'Two fingers: hold Select/Back + RB. Spray can: L3 + R3 together, LB shakes it, the right '
+                   'stick aims. Automatic turns it off on a DualShock 4 or DualSense.'), restart=True)
         self.row(f, _('In-game button icons'), self.choice(f, 'glyph_style', 'app', GLYPH_STYLES),
                  hint=_('Replaces the PlayStation button icons inside the game with the ones of your controller. '
                         'Works on a copy of two game files in the port\'s data folder (about 70 MB); your game folder '
