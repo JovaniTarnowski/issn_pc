@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 
@@ -97,9 +98,11 @@ public:
             CountWriteFaults(start_page, end_page);
         }
         if constexpr (enable) {
+            NoteBitsSet<type>(); // before the bits: see AnyFlag
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
+            NoteBitsCleared<type>();
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
@@ -122,6 +125,7 @@ public:
         if (add.None()) {
             return;
         }
+        NoteBitsSet<Type::CPU>();
         cpu |= add;
         UpdateProtection<false, false>();
     }
@@ -149,8 +153,9 @@ public:
         // port: nothing modified in the range means nothing to clear or re-protect (CPU bits
         // always match `writeable` after a change); this runs for every buffer binding, so
         // it is checked before building the range mask.
-        if (type == Type::CPU && !bits.AnyInRange(start_page, end_page) &&
-            !IssnToggle::Disabled(IssnToggle::PageTrackingEarlyExit)) {
+        if (type == Type::CPU && !IssnToggle::Disabled(IssnToggle::PageTrackingEarlyExit) &&
+            ((AnyFlagsEnabled() && !AnyFlag<type>().load(std::memory_order_acquire)) ||
+             !bits.AnyInRange(start_page, end_page))) {
             return;
         }
         RegionBits mask(bits, start_page, end_page);
@@ -159,9 +164,13 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 KeepHotPagesModified(start_page, end_page);
+                NoteBitsCleared<type>();
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                NoteBitsCleared<type>();
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                    UpdateProtection<false, true>();
+                }
             }
         }
 
@@ -186,6 +195,12 @@ public:
             return false;
         }
 
+        // issn: nothing of the region modified (the common case) costs one load instead of a
+        // scan of the bitmap; asked for every buffer of every draw and every guest memcpy into
+        // GPU-tracked memory (HayatoG's iss_pc 1241218 and 7326e04, RTX 2060 27.7 -> 30.8 FPS).
+        if (AnyFlagsEnabled() && !AnyFlag<type>().load(std::memory_order_acquire)) {
+            return false;
+        }
         const RegionBits& bits = GetRegionBits<type>();
         return bits.AnyInRange(start_page, end_page);
     }
@@ -274,6 +289,7 @@ private:
             num_hot = 0;
             return;
         }
+        NoteBitsSet<Type::CPU>();
         cpu |= RegionBits(hot, start_page, end_page);
     }
 
@@ -282,8 +298,38 @@ private:
     u32 num_hot = 0;
     std::chrono::steady_clock::time_point hot_since{};
 
+    // issn: true whenever a bit of `cpu` / `gpu` may be set. Stored before the bits on every
+    // path that sets them (all under `lock`), so a reader without the lock that sees a set bit
+    // also sees the flag (x86 keeps store order); a reader racing with a clear may see a stale
+    // true and falls back to the exact scan.
+    /// ISSN_REGION_ANY=0 turns the early-out off (A/B); the flags are kept either way.
+    static bool AnyFlagsEnabled() noexcept {
+        static const bool enabled = [] {
+            const char* env = std::getenv("ISSN_REGION_ANY");
+            return !(env && env[0] == '0');
+        }();
+        return enabled;
+    }
+    template <Type type>
+    std::atomic<bool>& AnyFlag() noexcept {
+        return type == Type::CPU ? cpu_any : gpu_any;
+    }
+    template <Type type>
+    void NoteBitsSet() noexcept {
+        auto& flag = AnyFlag<type>();
+        if (!flag.load(std::memory_order_relaxed)) {
+            flag.store(true, std::memory_order_seq_cst);
+        }
+    }
+    template <Type type>
+    void NoteBitsCleared() noexcept {
+        AnyFlag<type>().store(GetRegionBits<type>().Any(), std::memory_order_release);
+    }
+
     PageManager* tracker;
     VAddr cpu_addr = 0;
+    std::atomic<bool> cpu_any{true};  ///< the constructor fills `cpu`
+    std::atomic<bool> gpu_any{false}; ///< the constructor clears `gpu`
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;
