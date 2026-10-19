@@ -46,6 +46,9 @@ PROFILES = {
         # time went 12% -> 22%, 36 -> 38.9 FPS and steadier (tester, RX 9060 XT).
         'ISSN_ASYNC_FREE': '1',
         'ISSN_LOCKFREE_READ': '1',
+        # Draw-preparation submissions reused instead of allocated and zeroed on the game's main
+        # thread each frame: standing in the city 37.0 -> 38.4 FPS (41 at times).
+        'ISSN_RECYCLE_PREP': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'ISSN_LOD_SCALE': '0.6',
