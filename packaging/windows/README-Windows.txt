@@ -1,4 +1,4 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.2.0
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.2.1
 ======================================================
 
 A test build for a few testers: the game plays from the start, with stutter (shaders compiled as
@@ -15,7 +15,7 @@ What's new in 0.2.0
 - Game language: Portuguese (Brazil) and the other languages of the game; Automatic (default)
   follows the launcher's language.
 - Controls: "Controller without touchpad" (Automatic, On, Off).
-- The launcher checks this port's GitHub releases for updates once they are public.
+- The launcher checks github.com/Liondarkz/issn_pc-releases for updates (from 0.2.1).
 - Faster in the open city (about 36 -> 39-41 FPS standing still on an RX 9060 XT): the thread
   that feeds the graphics card no longer frees memory nor waits on a lock for every draw, and
   the game's main thread no longer allocates several MB each frame.
