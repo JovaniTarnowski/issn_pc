@@ -309,6 +309,22 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (is_write && !assume_locks && TryFastWrite(device_addr, size)) {
         return;
     }
+    // issn: ISSN_EAGER_WRITE=1. A guest write to a page the GPU modified needs the GPU's bytes
+    // first; the game's main thread did that ~300 times a second through a deferred readback
+    // (~1 ms each: the GPU command thread, the recording thread and the GPU itself), ~23% of
+    // that thread standing in the city. The eager copies made at every fence serve it like a
+    // read fault, waiting only for that copy; the page is learnt here for the next time.
+    static const bool eager_write = [] {
+        const char* env = std::getenv("ISSN_EAGER_WRITE");
+        return env && env[0] == '1';
+    }();
+    if (is_write && !assume_locks && eager_write && EagerEnabled()) {
+        if (TryEagerRead(device_addr, size)) {
+            memory_tracker->MarkRegionAsCpuModifiedUnlessGpu(device_addr, size);
+            return;
+        }
+        NoteReadback(device_addr, size);
+    }
     const s64 queued_at = ReadbackStatsEnabled() ? NowNs() : 0;
     const auto flush_request = [this, device_addr, size, is_write, queued_at] {
         const s64 started_at = queued_at ? NowNs() : 0;
