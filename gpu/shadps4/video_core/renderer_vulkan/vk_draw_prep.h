@@ -121,6 +121,7 @@ public:
         std::vector<u32> commands;
         std::unique_ptr<PreparedDraw[]> draws;
         u32 num_draws{};
+        u32 draws_capacity{}; ///< entries in `draws` (a recycled submission keeps its array)
         std::vector<std::unique_ptr<u32[]>> flat_chunks; ///< from the claiming worker
         u64 start_checksum{}, end_checksum{}; ///< set by the scanner
         AmdGpu::RegDelta delta;                ///< registers written, values at the end
@@ -130,6 +131,21 @@ public:
     };
 
 private:
+    /// issn: ISSN_RECYCLE_PREP=1. Submissions go back to this pool instead of the heap: each
+    /// held its command copy and ~1 KB per draw (thousands a frame) allocated, zeroed and freed
+    /// on the game's main thread (Build, inside sceGnmSubmit*), ~25% of that thread standing
+    /// in the city (ISSN_SAMPLE). Shared: the last reference may outlive this object.
+    struct Pool {
+        std::mutex mutex;
+        std::vector<Submission*> free;
+        ~Pool() {
+            for (Submission* s : free) {
+                delete s;
+            }
+        }
+    };
+    std::shared_ptr<Pool> pool = std::make_shared<Pool>();
+
     void ScannerLoop(std::stop_token stop);
     void WorkerLoop(std::stop_token stop, u32 index);
     void Collect();

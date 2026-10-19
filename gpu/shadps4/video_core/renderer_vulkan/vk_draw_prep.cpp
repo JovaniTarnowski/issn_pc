@@ -227,12 +227,68 @@ std::shared_ptr<DrawPreparation::Submission> DrawPreparation::Build(
     if (!Enabled()) {
         return {};
     }
-    auto submission = std::make_shared<Submission>();
-    submission->commands.assign(commands.begin(), commands.end());
+    static const bool recycle = [] {
+        const char* env = std::getenv("ISSN_RECYCLE_PREP");
+        return env && env[0] == '1';
+    }();
+    if (!recycle) {
+        auto submission = std::make_shared<Submission>();
+        submission->commands.assign(commands.begin(), commands.end());
+        ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
+            submission->num_draws += IsDirectDraw(header->type3.opcode);
+        });
+        submission->draws = std::make_unique<PreparedDraw[]>(submission->num_draws);
+        submission->draws_capacity = submission->num_draws;
+        return submission;
+    }
+    Submission* raw = nullptr;
+    {
+        std::scoped_lock lk{pool->mutex};
+        if (!pool->free.empty()) {
+            raw = pool->free.back();
+            pool->free.pop_back();
+        }
+    }
+    if (!raw) {
+        raw = new Submission;
+    }
+    // The deleter runs where the last reference goes (the reclaim thread with ISSN_ASYNC_FREE):
+    // the workers' flat chunks are freed there, the rest goes back to the pool.
+    std::shared_ptr<Submission> submission{raw, [pool = pool](Submission* s) {
+        s->flat_chunks.clear();
+        {
+            std::scoped_lock lk{pool->mutex};
+            if (pool->free.size() < 16) {
+                pool->free.push_back(s);
+                return;
+            }
+        }
+        delete s;
+    }};
+    submission->seq = 0;
+    submission->num_draws = 0;
+    submission->start_checksum = submission->end_checksum = 0;
+    submission->delta.reset = false;
+    submission->delta.blocks.clear();
+    submission->delta.words.clear();
+    submission->scanned.store(false, std::memory_order_relaxed);
+    submission->claimed.store(false, std::memory_order_relaxed);
+    submission->gpu_done.store(false, std::memory_order_relaxed);
+    submission->commands.assign(commands.begin(), commands.end()); // keeps its capacity
     ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
         submission->num_draws += IsDirectDraw(header->type3.opcode);
     });
-    submission->draws = std::make_unique<PreparedDraw[]>(submission->num_draws);
+    if (submission->draws_capacity < submission->num_draws) {
+        // Some headroom: the next frames' buffers have about as many draws.
+        const u32 capacity = submission->num_draws + submission->num_draws / 4 + 16;
+        submission->draws = std::make_unique<PreparedDraw[]>(capacity);
+        submission->draws_capacity = capacity;
+    } else {
+        // Workers fill every field a draw marked Ready uses; only the state is reset.
+        for (u32 i = 0; i < submission->num_draws; ++i) {
+            submission->draws[i].state.store(PreparedDraw::Pending, std::memory_order_relaxed);
+        }
+    }
     return submission;
 }
 
