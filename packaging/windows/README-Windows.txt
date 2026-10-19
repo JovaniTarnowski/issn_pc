@@ -13,6 +13,11 @@ What's new in 0.2.0
 - New launcher look, with Effects (Full, Light, Off) and Draw distance in Performance > inFAMOUS.
 - "Save a bug report" (Advanced page): a zip on the desktop with the last log and your settings.
 - The launcher checks this port's GitHub releases for updates once they are public.
+- Faster in the open city (about 36 -> 39-41 FPS standing still on an RX 9060 XT): the thread
+  that feeds the graphics card no longer frees memory nor waits on a lock for every draw, and
+  the game's main thread no longer allocates several MB each frame.
+- Fixed: on AMD cards the first start with an empty shader cache could stop on a black window
+  (pipeline binary cache, now off by default; Performance > Shaders turns it back on).
 - The first start after updating compiles the shaders again (more stutter for a while).
 
 No game files are included. You need your own dump of inFAMOUS Second Son, made from your own
