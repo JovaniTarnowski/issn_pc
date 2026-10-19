@@ -37,6 +37,10 @@ PROFILES = {
         # shader cache crashed AMD's Windows driver (amdvlk64.dll) at the first boot after the
         # cache was rebuilt (tester, RX 9060 XT); loading saved ones worked. Off until found.
         'ISSN_PIPELINE_BINARIES': '0',
+        # Smaller batches reach the GPU sooner: what the game reads back waits less for it.
+        # Combat (tester, RX 9060 XT): 1024 (default) median 30.6 / mean 29.1 FPS, 256 31.8 /
+        # 32.4; compute fence 3.8 -> 3.1 ms, graphics fence 16.4 -> 12.3 ms.
+        'ISSN_SUBMIT_DRAWS': '256',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'ISSN_LOD_SCALE': '0.6',
