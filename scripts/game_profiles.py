@@ -41,6 +41,11 @@ PROFILES = {
         # Combat (tester, RX 9060 XT): 1024 (default) median 30.6 / mean 29.1 FPS, 256 31.8 /
         # 32.4; compute fence 3.8 -> 3.1 ms, graphics fence 16.4 -> 12.3 ms.
         'ISSN_SUBMIT_DRAWS': '256',
+        # The GPU command thread no longer frees the draw-preparation submissions (~18% of it) nor
+        # takes the memory table lock for each constant copy (~7%): standing in the city its idle
+        # time went 12% -> 22%, 36 -> 38.9 FPS and steadier (tester, RX 9060 XT).
+        'ISSN_ASYNC_FREE': '1',
+        'ISSN_LOCKFREE_READ': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
         # distance means far fewer draws in the open city, the bottleneck here.
         'ISSN_LOD_SCALE': '0.6',
