@@ -1557,6 +1557,21 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
+    // issn: ISSN_SUBMIT_DISPATCHES=N. The GPU idled ~14 of 26 ms a frame between submissions in
+    // the city (ISSN_GPU_PROFILE) while ~1400 dispatches a frame went out only where a render
+    // pass began (SubmitIfWorkPiledUp). A dispatch is outside any render pass: submitting before
+    // it costs no pass restart, and the GPU starts on what is recorded sooner.
+    static const u32 dispatch_limit = [] {
+        const char* env = std::getenv("ISSN_SUBMIT_DISPATCHES");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    if (dispatch_limit && scheduler.WorkSinceSubmit() >= dispatch_limit &&
+        Pipeline::deferred_binds.load(std::memory_order_relaxed) == 0 &&
+        !FrameRecord::IsRecording() && !FrameCapture::Active()) {
+        scheduler.EndRendering();
+        scheduler.Flush();
+    }
+
     if (!BindResources(pipeline)) {
         return;
     }
