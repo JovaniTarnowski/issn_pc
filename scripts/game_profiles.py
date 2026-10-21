@@ -194,10 +194,11 @@ PROFILES = {
         # Precise GPU readbacks: the game reads GPU particle results back (the smoke to drain,
         # drones); without them those effects are missing (axylpup's config: readbacks_mode 2).
         'ISSN_READBACKS': '2',
-        # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
-        # distance means fewer draws in the open city (launcher: Draw distance).
-        'ISSN_LOD_SCALE': '0.6',
-        'ISSN_REGION_FADE': '0.8',
+        # Draw distance (1.07 only: src/view_hook.h; launcher: Draw distance). The old core needed
+        # a shorter LOD distance (0.6) for fewer draws; the new one runs the city at 90-105 FPS
+        # on the tester's PC, so the game's own distance is back (less pop-in).
+        'ISSN_LOD_SCALE': '1.0',
+        'ISSN_REGION_FADE': '1.0',
         # The game reads rdtsc itself and scales it by sceKernelGetTscFrequency: the host's TSC
         # and frequency, or it runs several times too fast (runtime_kernel.c).
         'ISSN_TSC': 'host',

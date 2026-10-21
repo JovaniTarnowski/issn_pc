@@ -32,14 +32,37 @@ class ControlMapTest(unittest.TestCase):
         self.assertIn('cheat_double_jumps', launcher.INI_FLAGS)
         self.assertIn('cheat_very_hard', launcher.INI_FLAGS)
 
-    def test_pipeline_binary_cache_switch(self):
-        settings = {**launcher.APP_DEFAULTS}
-        self.assertFalse(settings['pipeline_binaries'])  # issn: froze AMD with an empty cache
-        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '0')
-        settings['pipeline_binary_cache'] = True  # the old key, saved by 0.1.0: ignored
-        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '0')
-        settings['pipeline_binaries'] = True
-        self.assertEqual(launcher.game_environment(settings)['ISSN_PIPELINE_BINARIES'], '1')
+    def test_old_core_switches_reach_nothing(self):
+        # issn-axy: the new GPU core has no pipeline binaries, warm-up modes, draw pipe or compute
+        # priority; settings saved by 0.2 keep their keys and the environment does not carry them.
+        settings = {**launcher.APP_DEFAULTS, 'pipeline_binaries': True, 'draw_pipe': '1', 'no_msaa': '1'}
+        env = launcher.game_environment(settings)
+        for name in ('ISSN_PIPELINE_BINARIES', 'ISSN_PARALLEL_WARMUP', 'ISSN_BACKGROUND_WARMUP', 'ISSN_DRAW_PIPE',
+                     'ISSN_COMPUTE_PRIORITY', 'ISSN_ORDERED_READBACK', 'ISSN_NO_MSAA', 'ISSN_PERF_DIAG'):
+            self.assertNotIn(name, {k for k in env if k not in __import__('os').environ})
+
+    def test_anti_aliasing_choice(self):
+        base = {**launcher.APP_DEFAULTS}
+        self.assertEqual(base['anti_aliasing'], 'game')
+        env = launcher.game_environment(base)
+        self.assertNotIn('ISSN_FSR4', env)
+        self.assertNotIn('SHADPS4_DLSS', env)
+        env = launcher.game_environment({**base, 'anti_aliasing': 'fsr4'})
+        self.assertEqual(env['ISSN_FSR4'], '1')
+        self.assertNotIn('SHADPS4_DLSS', env)
+        env = launcher.game_environment({**base, 'anti_aliasing': 'dlss'})
+        self.assertEqual((env['SHADPS4_DLSS'], env['SHADPS4_DLSS_UPSCALE']), ('1', '1'))
+        self.assertNotIn('ISSN_FSR4', env)
+        with __import__('unittest').mock.patch.dict(__import__('os').environ, {'ISSN_FSR4': '1'}):
+            self.assertNotIn('ISSN_FSR4', launcher.game_environment(base))  # never mixed with a stale one
+
+    def test_draw_distance(self):
+        base = {**launcher.APP_DEFAULTS}
+        self.assertNotIn('ISSN_LOD_SCALE', {k for k in launcher.game_environment(base) if k not in __import__('os').environ})
+        self.assertEqual(launcher.game_environment({**base, 'draw_distance': '1.5'})['ISSN_LOD_SCALE'], '1.5')
+        # 0.2's choices are gone: the profile's original distance instead.
+        self.assertNotIn('ISSN_LOD_SCALE', {k for k in launcher.game_environment({**base, 'draw_distance': '0.45'})
+                                            if k not in __import__('os').environ})
 
     def test_changed_buttons_in_table_order(self):
         controls = {'key': {'circle': ' Left Shift ', 'cross': 'Q', 'square': ''}, 'pad': {'cross': 'b'}}
@@ -85,19 +108,12 @@ class ControlMapTest(unittest.TestCase):
         env = launcher.game_environment(settings)
         self.assertEqual(env['ISSN_KEY_MAP'], 'cross=Q')
         self.assertNotIn('ISSN_PAD_MAP', env)
-        self.assertEqual(env['ISSN_PARALLEL_WARMUP'], '1')
-        self.assertEqual(env['ISSN_BACKGROUND_WARMUP'], '1')
-        self.assertEqual(env['ISSN_PERF_DIAG'], '0')
-        self.assertNotIn('ISSN_FRAME_CAPTURE_KEY', {k for k in env if k not in __import__('os').environ})
-        self.assertEqual(launcher.game_environment({**settings, 'frame_capture_key': True})['ISSN_FRAME_CAPTURE_KEY'], '1')
         # Graphics options live in issn.ini (run.py and the in-game menu), not in the environment.
         for name in ('ISSN_FULLSCREEN', 'ISSN_PRESENT_MODE', 'ISSN_FPS_LIMIT', 'ISSN_ASYNC_SHADERS',
                      'ISSN_DEFERRED_READBACK', 'ISSN_STALE_READBACK', 'ISSN_FSR1', 'ISSN_RCAS'):
             self.assertNotIn(name, {k for k in env if k not in __import__('os').environ})
         old = launcher.game_environment({**settings, 'extra_env': 'ISSN_DRAW_PIPE=0'})
         self.assertNotIn('ISSN_DRAW_PIPE', old)  # the old free-text field is ignored
-        self.assertEqual(launcher.game_environment({**settings, 'parallel_warmup': False})['ISSN_PARALLEL_WARMUP'], '0')
-        self.assertEqual(launcher.game_environment({**settings, 'background_warmup': False})['ISSN_BACKGROUND_WARMUP'], '0')
 
     def test_temporal_upscaler_stays_off_with_a_saved_2_1_8_switch(self):
         # 2.1.8 showed the experimental switch; a player who turned it on must not keep it on now that it is hidden.
@@ -552,10 +568,10 @@ class GpuChoiceTest(unittest.TestCase):
 class ReleaseVersionTest(unittest.TestCase):
     def test_updates_come_from_this_ports_releases(self):
         # issn: own version line and own releases; the God of War III port's are never offered.
-        self.assertEqual(launcher.VERSION, '0.2.1')
+        self.assertEqual(launcher.VERSION, '0.3.0')
         self.assertIn('/Liondarkz/issn_pc-releases/', launcher.RELEASES_API)
         self.assertNotIn('gow3_pc', launcher.RELEASES_API + launcher.RELEASES_PAGE)
-        self.assertGreater(launcher.version_tuple('windows-v0.2.2'), launcher.version_tuple(launcher.VERSION))
+        self.assertGreater(launcher.version_tuple('windows-v0.3.1'), launcher.version_tuple(launcher.VERSION))
 
     def test_game_language_follows_the_launcher(self):
         # issn: Automatic: Portuguese launcher -> Brazilian Portuguese game (17), as the profile.

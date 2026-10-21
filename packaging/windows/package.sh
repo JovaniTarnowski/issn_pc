@@ -69,6 +69,11 @@ if [[ -n $forbidden ]]; then
     echo "$forbidden" >&2
     exit 1
 fi
+# FSR 4 Native AA (MIT, AMD's model; third_party/fsr4/README.md): shipped after the check above,
+# which keeps any other .spv out.
+cp -r third_party/fsr4 "$dest/fsr4_shaders"
+# The title face of the launcher (Bebas Neue, SIL Open Font License).
+cp launcher/OFL-BebasNeue.txt "$dest/launcher/"
 mkdir -p dist
 rm -f dist/issn-windows.zip
 (cd out/stage && powershell -NoProfile -Command \

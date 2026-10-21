@@ -35,7 +35,12 @@ constexpr VAddr DepthAddr = 0x26b200000;   ///< D32S8, reversed Z
 inline int Mode() {
     static const int mode = [] {
         const char* v = std::getenv("SHADPS4_DLSS");
-        return v && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+        if (v && (v[0] == '1' || v[0] == '2')) {
+            return v[0] - '0';
+        }
+        // issn-axy: ISSN_FSR4=1 - FSR 4 Native AA in the same slot (issn_fsr4.h).
+        const char* fsr4 = std::getenv("ISSN_FSR4");
+        return fsr4 && fsr4[0] == '1' ? 3 : 0;
     }();
     return mode;
 }

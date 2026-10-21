@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/amdgpu/mtb_census.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/issn_fsr4.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_upscale.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
@@ -1677,7 +1678,55 @@ void Rasterizer::DlssResolve() {
     scheduler.EndRendering();
     bool evaluated = false;
     bool hud_layer = false;
-    if (Dlss::Mode() == 1) {
+    if (Dlss::Mode() == 3) {
+        // issn-axy: ISSN_FSR4 - FSR 4 Native AA from the same inputs (issn_fsr4.h).
+        VideoCore::Image* motion = find(Dlss::MotionAddr);
+        VideoCore::Image* depth = find(Dlss::DepthAddr);
+        if (motion && depth) [[likely]] {
+            for (VideoCore::Image* image : {in, motion, depth}) {
+                image->Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {});
+            }
+            out.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                        {});
+            const auto input = [](VideoCore::Image& image) {
+                VideoCore::ImageViewInfo view_info{};
+                view_info.type = AmdGpu::ImageType::Color2D;
+                view_info.format = image.info.pixel_format;
+                const auto& view = image.FindView(view_info);
+                return Fsr4Aa::Input{image.GetImage(), *view.image_view, image.info.size.width,
+                                     image.info.size.height};
+            };
+            float jx = 0.0f, jy = 0.0f;
+            if (dlss_phase_in == 1 || dlss_phase_in == 2) {
+                const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
+                const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
+                jx = (combo & 1) ? -j : j;
+                jy = (combo & 2) ? -j : j;
+            }
+            if (!fsr4) {
+                fsr4 = std::make_unique<Fsr4Aa::Upscaler>(instance, scheduler);
+            }
+            const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
+            evaluated = fsr4->Record(cmdbuf, input(*in), input(*motion), input(*depth),
+                                     out.GetImage(), out.info.size.width, out.info.size.height,
+                                     jx, jy, dlss_reset_pending);
+            dlss_reset_pending = false;
+            scheduler.GetDynamicState().Invalidate();
+            GraphicsBindTracker::Invalidate();
+            scheduler.InvalidateNativeHeaps();
+            if (!evaluated && !Fsr4Aa::DeviceSupported()) {
+                Dlss::g_ready.store(false, std::memory_order_relaxed);
+            }
+            if (!evaluated && !fsr4->Problem().empty() &&
+                fsr4->Problem().starts_with("missing")) {
+                // Assets missing: from the next frame on the game's own T2x runs again.
+                Dlss::g_ready.store(false, std::memory_order_relaxed);
+            }
+        } else if (++dlss_missing <= 8) {
+            LOG_WARNING(Render_Vulkan, "FSR 4: motion vectors {} / depth {} missing - copy this frame",
+                        motion ? "found" : "missing", depth ? "found" : "missing");
+        }
+    } else if (Dlss::Mode() == 1) {
         VideoCore::Image* motion = find(Dlss::MotionAddr);
         VideoCore::Image* depth = find(Dlss::DepthAddr);
         if (motion && depth) [[likely]] {

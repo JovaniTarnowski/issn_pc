@@ -381,25 +381,10 @@ void ImageTab() {
     if (BeginRows("##display")) {
         ChoiceRow("Display mode", s.display_mode, G::DisplayModeNames.data(), nullptr, G::DisplayModeCount,
                   "Windowed, borderless window or exclusive fullscreen.");
-        CheckRow("VSync", s.vsync, "Waits for the monitor: no tearing, a little more input delay.");
+        CheckRow("VSync (on restart)", s.vsync, "Waits for the monitor: no tearing, a little more input delay.");
         ImGui::EndTable();
     }
     const int iw = s.image_width, ih = s.image_height, ww = s.window_width, wh = s.window_height;
-    const bool downscaling = iw > ww || ih > wh;
-    const bool rcas_blocked = s.rcas && !s.rcas_applied;
-    ImGui::SeparatorText("Sharpening");
-    if (BeginRows("##scaling")) {
-        ImGui::BeginDisabled(rcas_blocked);
-        CheckRow("Sharpening (RCAS)", s.rcas,
-                 rcas_blocked && downscaling ? "No effect: the game's image is larger than the window."
-                 : rcas_blocked              ? "No effect: the game's image is smaller than the window."
-                                             : "Sharpens the final image.");
-        ImGui::EndDisabled();
-        ImGui::BeginDisabled(!s.rcas || rcas_blocked);
-        SliderRow("Sharpening strength", s.rcas_strength, 0, 100, "%d%%", "How strong the sharpening is.");
-        ImGui::EndDisabled();
-        ImGui::EndTable();
-    }
     ImGui::SeparatorText("Information");
     if (BeginRows("##image_info")) {
         char text[96];
@@ -407,47 +392,51 @@ void ImageTab() {
         InfoRow("Game image", text);
         std::snprintf(text, sizeof(text), "%d x %d", ww, wh);
         InfoRow("Window", text);
-        InfoRow("Sharpening", s.rcas_applied ? "applied" : "not applied");
         ImGui::EndTable();
     }
+}
+
+// issn-axy: the new GPU core reads the frame rate limit (its vblank rate) and VSync (the present
+// mode) when it starts, so both apply on restart; the old core's live options are gone.
+struct StartupGraphics {
+    int fps_limit = -1;
+    bool vsync = false;
+};
+StartupGraphics& Startup() {
+    static StartupGraphics startup = [] {
+        const auto& s = IssnSettings::Get();
+        return StartupGraphics{s.fps_limit.load(), s.vsync.load()};
+    }();
+    return startup;
+}
+
+const char* AntiAliasingName() {
+    const char* dlss = std::getenv("SHADPS4_DLSS");
+    if (dlss && dlss[0] == '1') {
+        return "DLSS (NVIDIA)";
+    }
+    const char* fsr4 = std::getenv("ISSN_FSR4");
+    if (fsr4 && fsr4[0] == '1') {
+        return "FSR 4 Native AA (AMD)";
+    }
+    return "The game's own (SMAA T2x)";
 }
 
 void PerformanceTab() {
     namespace G = IssnGraphics;
     auto& s = IssnSettings::Get();
-    ImGui::SeparatorText("Live");
-    if (BeginRows("##live")) {
-        static const char* const fps_labels[] = {"30", "60", "120", "240", "Unlimited"};
-        ChoiceRow("Frame rate limit", s.fps_limit, fps_labels, G::FpsLimits.data(), int(G::FpsLimits.size()),
-                  "Caps the frame rate. The engine frame rate (below) is the highest it can go.");
-        const int effective = G::EffectiveFps(s.fps_limit, s.applied_engine_fps);
-        if (s.fps_limit == 0 || effective < s.fps_limit) {
-            char text[48];
-            std::snprintf(text, sizeof(text), "%d FPS (engine frame rate)", effective);
-            InfoRow("Effective limit", text);
-        }
-        if (s.applied_engine_fps < s.startup_engine_fps) {
-            InfoRow("Engine frame rate", "60 FPS: the frame rate patch is not available for this game build");
-        }
-        static const char* const queued_labels[] = {"1 (lowest latency)", "2", "Unlimited"};
-        ChoiceRow("Frames queued", s.frames_queued, queued_labels, G::FramesQueued.data(),
-                  int(G::FramesQueued.size()), "More frames queued: steadier FPS, slower response to input.");
-        CheckRow("Compile new shaders in the background", s.async_shaders,
-                 "Fewer stutters in new areas; an object or effect may appear a moment later.");
-        ImGui::EndTable();
-    }
+    Startup();
     ImGui::SeparatorText("Applied on restart");
     if (BeginRows("##restart")) {
-        static const char* const resolution_labels[] = {"Native (1080p)", "480p", "720p", "1440p", "1800p", "4K"};
-        ChoiceRow("Render resolution", s.render_resolution, resolution_labels, nullptr, int(G::Resolutions.size()),
-                  "The resolution the game draws at. Higher is sharper and slower.");
-        static const char* const engine_labels[] = {"60 (original)", "120", "240"};
-        ChoiceRow("Engine frame rate", s.engine_fps, engine_labels, G::EngineFps.data(), int(G::EngineFps.size()),
-                  "The highest frame rate the game itself runs at.");
-        CheckRow("Game reads GPU data without waiting", s.stale_readback,
-                 "Big FPS gain. Switch it off if lighting or objects look wrong.");
-        CheckRow("Deferred GPU readbacks", s.deferred_readback,
-                 "Fewer waits for the GPU. Switch it off if textures or shadows look wrong.");
+        static const char* const fps_labels[] = {"30", "60", "120", "240", "Unlimited"};
+        ChoiceRow("Frame rate limit", s.fps_limit, fps_labels, G::FpsLimits.data(), int(G::FpsLimits.size()),
+                  "The highest frame rate. Unlimited lets the game run as fast as the PC allows.");
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText("Information");
+    if (BeginRows("##perf_info")) {
+        InfoRow("Anti-aliasing", AntiAliasingName());
+        InfoRow("Change it in", "the launcher: Graphics > Anti-aliasing");
         ImGui::EndTable();
     }
 }
@@ -527,8 +516,8 @@ void OverlayTab() {
 // Startup options changed since this launch (applied by "Apply and restart").
 int RestartChanges() {
     const auto& s = IssnSettings::Get();
-    return (s.render_resolution != s.startup_render_resolution) + (s.engine_fps != s.startup_engine_fps) +
-           (s.deferred_readback != s.startup_deferred_readback) + (s.stale_readback != s.startup_stale_readback);
+    const auto& startup = Startup();
+    return (s.fps_limit != startup.fps_limit) + (s.vsync != startup.vsync);
 }
 
 void Menu() {

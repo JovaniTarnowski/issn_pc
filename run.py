@@ -307,6 +307,13 @@ def main():
             env['ISSN_FILE_ALIAS'] = ';'.join(aliases)
             derived.append('ISSN_FILE_ALIAS')
             print(f'Voices: {voice} (with the text of ISSN_LANGUAGE)', flush=True)
+        # issn-axy: FSR 4 Native AA's model (ISSN_FSR4): fsr4_shaders in a package, else the
+        # repository's copy.
+        if 'ISSN_FSR4_DIR' not in env:
+            for candidate in (PORT / 'fsr4_shaders', PORT / 'third_party' / 'fsr4'):
+                if (candidate / 'rcas.spv').is_file():
+                    env['ISSN_FSR4_DIR'] = str(candidate)
+                    break
         env['ISSN_DERIVED'] = ','.join(derived)
         # The guest memory pool is committed in full at start: a resolution patch above 1080p
         # can need more than 16 GB of RAM, and the game then closes when the page file cannot grow.

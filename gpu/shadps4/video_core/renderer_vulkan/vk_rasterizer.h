@@ -35,6 +35,9 @@ class DrawSampleProbe;
 }
 
 namespace Vulkan {
+namespace Fsr4Aa {
+class Upscaler;
+}
 
 class Scheduler;
 class RenderState;
@@ -332,6 +335,7 @@ public:
     u64 dlss_evaluated{};
     u32 dlss_last_combo{};
     bool dlss_reset_pending{true};
+    std::unique_ptr<Fsr4Aa::Upscaler> fsr4; ///< ISSN_FSR4 (issn_fsr4.h), made at the first resolve
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;
     VAddr neo_depth_addr{};

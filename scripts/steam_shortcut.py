@@ -19,7 +19,10 @@ APP_NAME = 'inFAMOUS Second Son'
 CAPSULE = (600, 900)    # vertical capsule: <id>p.png
 WIDE = (920, 430)       # horizontal capsule: <id>.png
 HERO = (1920, 620)      # library background: <id>_hero.png
-GOLD = (233, 214, 164)
+WHITE = (242, 242, 244)
+SMOKE_RED = (226, 38, 59)
+# The launcher's title face (Bebas Neue, OFL) first: the logo then matches the launcher.
+TITLE_FONT = Path(__file__).resolve().parent.parent / 'launcher' / 'issn_font.ttf'
 
 WINDOWS = os.name == 'nt'
 LINUX_ROOTS = ('~/.local/share/Steam', '~/.steam/steam', '~/.var/app/com.valvesoftware.Steam/.local/share/Steam')
@@ -105,6 +108,39 @@ def steam_running():
     return subprocess.run(['pgrep', '-x', 'steam'], capture_output=True).returncode == 0
 
 
+def steam_executable():
+    """steam.exe (Windows) or steam (Linux) of the first Steam installation found, else None."""
+    if not WINDOWS:
+        return shutil.which('steam')
+    for root in steam_roots():
+        exe = Path(root) / 'steam.exe'
+        if exe.is_file():
+            return str(exe)
+    return None
+
+
+def close_steam(timeout=40, running=steam_running, sleep=None):
+    """Asks Steam to exit (steam -shutdown) and waits for it; True once it is closed."""
+    import time
+    sleep = sleep or time.sleep
+    exe = steam_executable()
+    if exe is None:
+        return not running()
+    subprocess.Popen([exe, '-shutdown'], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    for _ in range(timeout * 2):
+        if not running():
+            sleep(2)  # Steam writes shortcuts.vdf on the way out
+            return True
+        sleep(0.5)
+    return False
+
+
+def start_steam():
+    exe = steam_executable()
+    if exe:
+        subprocess.Popen([exe], creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0))
+
+
 def steam_roots():
     """Steam installation folders to look in, the registry's first on Windows."""
     if WINDOWS:
@@ -140,7 +176,7 @@ def account_folders(root=None):
 
 def font(size):
     from PIL import ImageFont
-    for path in FONTS:
+    for path in (str(TITLE_FONT), *FONTS):
         if os.path.isfile(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default(size)
@@ -186,26 +222,28 @@ def usable_emblem(image):
 
 
 def make_logo(emblem, width):
-    """Transparent logo: the emblem (when there is one) over GOD OF WAR III and REMASTERED, `width` px wide."""
+    """Transparent logo, `width` px wide: the emblem (when there is one) over INFAMOUS in white and
+    SECOND SON in smoke red."""
     from PIL import Image, ImageDraw, ImageFilter
     scale = 2
     w = width * scale
     emblem_size = round(w * 0.30) if emblem is not None else 0
     probe = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
-    title_face, title_gap = fit_face(probe, 'GOD OF WAR III', w * 0.94, 0.04)
-    sub_face, sub_gap = fit_face(probe, 'REMASTERED', w * 0.60, 0.45)
+    title_face, title_gap = fit_face(probe, 'INFAMOUS', w * 0.96, 0.02)
+    sub_face, sub_gap = fit_face(probe, 'SECOND SON', w * 0.62, 0.12)
     title_y = emblem_size + (w * 0.03 if emblem is not None else 0)
-    sub_y = title_y + title_face.size * 1.35
-    height = round(sub_y + sub_face.size * 1.5)
+    sub_y = title_y + title_face.size * 1.02
+    height = round(sub_y + sub_face.size * 1.25)
     canvas = Image.new('RGBA', (w, height), (0, 0, 0, 0))
     if emblem is not None:
         mark = emblem.convert('RGBA').resize((emblem_size, emblem_size), Image.LANCZOS)
         canvas.alpha_composite(mark, ((w - emblem_size) // 2, 0))
     shadow = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
-    for layer, fill, offset in ((shadow, (0, 0, 0, 220), 3 * scale), (canvas, GOLD + (255,), 0)):
+    for layer, colors, offset in ((shadow, ((0, 0, 0, 220), (0, 0, 0, 220)), 3 * scale),
+                                  (canvas, (WHITE + (255,), SMOKE_RED + (255,)), 0)):
         draw = ImageDraw.Draw(layer)
-        spaced(draw, w / 2 + offset, title_y + offset, 'GOD OF WAR III', title_face, fill, title_gap)
-        spaced(draw, w / 2 + offset, sub_y + offset, 'REMASTERED', sub_face, fill, sub_gap)
+        spaced(draw, w / 2 + offset, title_y + offset, 'INFAMOUS', title_face, colors[0], title_gap)
+        spaced(draw, w / 2 + offset, sub_y + offset, 'SECOND SON', sub_face, colors[1], sub_gap)
     blurred = shadow.filter(ImageFilter.GaussianBlur(2 * scale))
     blurred.alpha_composite(canvas)
     return blurred.resize((width, round(height / scale)), Image.LANCZOS)

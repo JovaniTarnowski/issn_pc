@@ -57,7 +57,7 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEW_GROUP = {} if WINDOWS else {'start_new_session': True}
 UI_FONT, MONO_FONT, SERIF_FONT = 'Segoe UI', 'Consolas', 'Georgia'
 # This build; GitHub release tags are windows-v<VERSION>.
-VERSION = '0.2.1'
+VERSION = '0.3.0'
 # This port's own test builds (never the God of War III port's: they must not be installed over
 # it). The source repository is private; the builds are published in a public repository that
 # holds only releases (tag windows-v<VERSION>, the zip from packaging/windows/package.sh).
@@ -68,10 +68,10 @@ UPDATES = bool(RELEASES_API)
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'issn-update'
 # Never copied over an installation by an update (the package does not hold them either).
 USER_FILES = ('user', 'out', 'mods', 'issn.ini', 'mods.json', 'mods_presets.json', 'patches.json', 'last_run.log')
-# A display face for titles (launcher/issn_font.ttf, none shipped yet: titles use the serif);
-# main() registers it for this process only.
+# The display face for titles: Bebas Neue (launcher/issn_font.ttf, SIL Open Font License, with the
+# accents of the Latin-script languages); main() registers it for this process only.
 FONT_FILE = PORT_DIR / 'launcher' / 'issn_font.ttf'
-HEADING_FAMILY = 'IssnTitle'  # the family name inside issn_font.ttf
+HEADING_FAMILY = 'Bebas Neue'  # the family name inside issn_font.ttf
 FR_PRIVATE = 0x10
 
 
@@ -286,12 +286,10 @@ def plain_letter(c):
 
 
 def heading_text(text, every_language=False):
-    """A heading's text for its font: in the title face the accents go (GRÁFICOS becomes
-    GRAFICOS) and the letters it lacks become their plain pair (ß becomes ss)."""
-    if not heading_face(every_language):
-        return text
-    text = ''.join(HEADING_LETTERS.get(c, c) for c in text)
-    return ''.join(plain_letter(c) for c in text)
+    """A heading's text for its font. Bebas Neue has the accents of every Latin-script language
+    the launcher speaks, so the text stays as written (HEADING_LETTERS and plain_letter remain for
+    a face without them)."""
+    return text
 
 
 # ---------------------------------------------------------------------------------------------
@@ -320,7 +318,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
-                'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': ''}
+                'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': '',
+                'anti_aliasing': 'game'}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
 # from the analog triggers and the left touchpad click (photo mode) from L1 + the right click's
@@ -426,9 +425,15 @@ DRAW_PIPE = [('', ('Auto (8+ threads)', 'Авто (8+ потоков)')), ('1', 
 # inFAMOUS: the game profile reads GPU results back precisely (smoke, sparks, neon need them).
 READBACKS = [('', ('Full effects (default)',)), ('1', ('Light: faster, some effects missing',)),
              ('0', ('Off: fastest, most effects missing',))]
-# ISSN_LOD_SCALE: how far detail is drawn in the city ('' = the game profile's 0.6).
-DRAW_DISTANCE = [('', ('Balanced (default)',)), ('0.45', ('Short (faster)',)), ('0.8', ('Long',)),
-                 ('1.0', ('Original (slowest)',))]
+# ISSN_LOD_SCALE: how far detail is drawn in the city ('' = the game profile's 1.0, the game's own).
+DRAW_DISTANCE = [('', ('Original (default)',)), ('0.6', ('Short (faster)',)), ('1.5', ('Long (less pop-in)',)),
+                 ('2.0', ('Very long (least pop-in, slower)',))]
+# issn-axy: what replaces the game's own temporal anti-aliasing (SMAA T2x). FSR 4 ships with the
+# port (third_party/fsr4); DLSS needs NVIDIA's Streamline files in dlss_folder().
+ANTI_ALIASING = [('game', ("The game's own (SMAA T2x)",)), ('fsr4', ('FSR 4 Native AA (AMD Radeon RX 7000 / 9000)',)),
+                 ('dlss', ('DLSS (NVIDIA RTX)',))]
+DLSS_FILES = ('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.pcl.dll', 'nvngx_dlss.dll')
+STREAMLINE_PAGE = 'https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16'
 # ISSN_NO_MSAA: '' leaves the game's own default, off on AMD's and Intel's Windows drivers
 # (video_core/amdgpu/issn_msaa_default.h); no_msaa_options names the chosen card in Automatic.
 NO_MSAA = [('', ('Automatic',)), ('1', ('Off (fixes black lines)',)), ('0', ('On',))]
@@ -441,6 +446,20 @@ STREAM_MEMORY = [('cached', ('System RAM (cached, default)',)),
                  ('device', ('GPU memory (previous behavior)',))]
 FRAMES_QUEUED = [('1', ('1 (lowest latency)',)), ('2', ('2',)), ('0', ('Unlimited',))]
 UI_LANGUAGES = issn_lang.LANGUAGE_NAMES
+
+def dlss_folder():
+    """Where the GPU library looks for NVIDIA's DLSS files: dlss beside issn-probe.exe."""
+    for exe_dir in (PORT_DIR / 'bin', PORT_DIR / 'out'):
+        if (exe_dir / ('issn-probe.exe' if WINDOWS else 'issn-probe')).is_file():
+            return exe_dir / 'dlss'
+    return PORT_DIR / 'bin' / 'dlss'
+
+
+def dlss_missing():
+    """NVIDIA's files not yet in dlss_folder()."""
+    folder = dlss_folder()
+    return [name for name in DLSS_FILES if not (folder / name).is_file()]
+
 
 def fsr4_folder():
     """Next to the port; in the data directory when the port is read-only (AppImage)."""
@@ -767,7 +786,16 @@ def game_environment(s):
         env['ISSN_PATCHES_ONLY'] = '1'
     if s['user_dir']:
         env['ISSN_USER_DIR'] = s['user_dir']
-    if not WINDOWS:
+    # issn-axy: the anti-aliasing choice (ANTI_ALIASING); an inherited switch never mixes them.
+    for name in ('SHADPS4_DLSS', 'SHADPS4_DLSS_UPSCALE', 'ISSN_FSR4'):
+        env.pop(name, None)
+    anti_aliasing = s.get('anti_aliasing', 'game')
+    if anti_aliasing == 'fsr4':
+        env['ISSN_FSR4'] = '1'
+    elif anti_aliasing == 'dlss':
+        env['SHADPS4_DLSS'] = '1'
+        env['SHADPS4_DLSS_UPSCALE'] = '1'  # the game's 1080p up to the window (DLAA at 1080p)
+    if (fsr4_folder() / 'rcas.spv').is_file():
         env['ISSN_FSR4_DIR'] = str(fsr4_folder())
     env['ISSN_MODS_DIR'] = s['mods_dir'] or str(DATA_DIR / 'mods')
     env['ISSN_MODS_CONFIG'] = str(DATA_DIR / 'mods.json')
@@ -780,9 +808,8 @@ def game_environment(s):
         env['ISSN_USER_NAME'] = str(s['player_name']).strip()
     if s['hdr']:
         env['ISSN_HDR'] = '1'
-    for key, name in (('draw_pipe', 'ISSN_DRAW_PIPE'), ('readbacks', 'ISSN_READBACKS'), ('no_msaa', 'ISSN_NO_MSAA')):
-        if s.get(key):
-            env[name] = s[key]
+    if s.get('readbacks'):
+        env['ISSN_READBACKS'] = s['readbacks']
     # The saved UI choice wins over inherited diagnostic overrides, including when reverting.
     stream_memory = s.get('stream_memory', APP_DEFAULTS['stream_memory'])
     env['ISSN_STREAM_MEMORY'] = stream_memory if stream_memory in ('cached', 'host', 'device') else 'cached'
@@ -790,17 +817,11 @@ def game_environment(s):
     env.pop('ISSN_GPU_ID', None)
     if gpu_id.isdigit():
         env['ISSN_GPU_ID'] = gpu_id
-    env['ISSN_COMPUTE_PRIORITY'] = '1' if s.get('compute_priority', True) else '0'
-    env['ISSN_ORDERED_READBACK'] = '1' if s.get('ordered_readback', False) else '0'
-    if s.get('draw_distance'):
+    # The old core's switches (draw pipe, compute priority, warm-up, pipeline binaries, ...) are
+    # gone with it: settings saved by 0.2 keep their keys and nothing reads them.
+    if s.get('draw_distance') in {value for value, _text in DRAW_DISTANCE if value}:
         env['ISSN_LOD_SCALE'] = str(s['draw_distance'])
-    env['ISSN_BACKGROUND_WARMUP'] = '1' if s.get('background_warmup', True) else '0'
-    env['ISSN_PARALLEL_WARMUP'] = '1' if s.get('parallel_warmup', True) else '0'
-    # issn: a new key, so a switch saved on by an older launcher does not turn it back on.
-    env['ISSN_PIPELINE_BINARIES'] = '1' if s.get('pipeline_binaries', False) else '0'
-    env['ISSN_PERF_DIAG'] = '1' if s.get('perf_diag', False) else '0'
-    for key, name in (('frame_stats', 'ISSN_FRAME_STATS'), ('gpu_profile', 'ISSN_GPU_PROFILE'),
-                      ('vk_validation', 'ISSN_VK_VALIDATION'), ('frame_capture_key', 'ISSN_FRAME_CAPTURE_KEY')):
+    for key, name in (('frame_stats', 'ISSN_FRAME_STATS'), ('vk_validation', 'ISSN_VK_VALIDATION')):
         if s[key]:
             env[name] = '1'
     env.pop('ISSN_PAD_EMULATION', None)
@@ -821,10 +842,12 @@ def game_environment(s):
 # ---------------------------------------------------------------------------------------------
 # The window.
 
-# inFAMOUS Second Son: Seattle at night, the red of smoke and the cyan of neon.
-BG, PANEL, CARD, LINE = '#06080c', '#0d1118', '#141a24', '#222b39'
-TEXT, MUTED, ACCENT, ACCENT_HI = '#eef1f5', '#8590a0', '#d8323c', '#ff4d57'
-NEON, HOVER = '#2ec4ff', '#121a26'
+# inFAMOUS Second Son: Seattle's wet concrete at night, the red of Delsin's smoke and the pink /
+# cyan of neon. Titles in Bebas Neue; the art of the player's own dump fills the home page.
+BG, PANEL, CARD, LINE = '#09090c', '#101116', '#181a21', '#262935'
+TEXT, MUTED, ACCENT, ACCENT_HI = '#f2f2f4', '#8c90a0', '#e2263b', '#ff4359'
+NEON, HOVER = '#24d3f2', '#15171e'
+NEON_PINK = '#ff3ea5'
 RESOLUTION_CHOICES = [('native', ('Native (1080p)',)), ('480p', ('480p',)), ('720p', ('720p',)),
                       ('1440p', ('1440p',)), ('1800p', ('1800p',)), ('4K', ('4K',))]
 ENGINE_FPS_CHOICES = [('60', ('60 (original)',)), ('120', ('120',)), ('240', ('240',))]
@@ -860,6 +883,92 @@ def window_icon(root, tk, game_icon, own_icon, ico_file):
     return None
 
 
+def hero_image(art, width, height):
+    """The home page's background: the dump's art scaled to cover the page, darkened towards the
+    title in the lower left; without a dump, smoke and neon streaks on black. None without Pillow."""
+    try:
+        from PIL import Image, ImageDraw, ImageFilter, ImageTk
+    except ImportError:
+        return None
+    width, height = max(width, 1), max(height, 1)
+    hex_rgb = lambda c: tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+    if art is not None:
+        try:
+            with Image.open(art) as source:
+                image = source.convert('RGB')
+        except OSError:
+            image = None
+    else:
+        image = None
+    if image is not None:
+        scale = max(width / image.width, height / image.height)
+        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS)
+        left, top = (image.width - width) // 2, max(0, round((image.height - height) * 0.35))
+        image = image.crop((left, top, left + width, top + height)).convert('RGBA')
+    else:
+        image = Image.new('RGBA', (width, height), hex_rgb(BG) + (255,))
+        streaks = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(streaks)
+        for color, x, thickness, alpha in ((ACCENT, 0.58, 0.10, 150), (NEON_PINK, 0.74, 0.03, 170),
+                                           (NEON, 0.83, 0.02, 190), (ACCENT, 0.95, 0.05, 90)):
+            x0, slant, span = width * x, height * 0.55, width * thickness
+            draw.polygon([(x0, 0), (x0 + span, 0), (x0 + span - slant, height), (x0 - slant, height)],
+                         fill=hex_rgb(color) + (alpha,))
+        image.alpha_composite(streaks.filter(ImageFilter.GaussianBlur(max(6, width // 60))))
+    # Shade: black from the left edge (where the title sits) and from the bottom.
+    shade = Image.new('L', (width, height))
+    pixels = []
+    for y in range(height):
+        fy = max(0.0, (y / height - 0.35) / 0.65)
+        pixels.extend(min(255, int(255 * max(0.0, 0.92 - x / width * 1.15) + 210 * fy * fy))
+                      for x in range(0, width, 8))
+    small = Image.new('L', ((width + 7) // 8, height))
+    small.putdata(pixels)
+    shade = small.resize((width, height), Image.BILINEAR)
+    image = Image.composite(Image.new('RGBA', (width, height), hex_rgb(BG) + (255,)), image, shade)
+    return ImageTk.PhotoImage(image.convert('RGB'))
+
+
+class PlayButton:
+    """PLAY: a slanted bar drawn on a canvas, like the game's own menus. configure(text=,
+    state=) and pack() as a ttk button."""
+
+    def __init__(self, launcher, parent, command, width, height):
+        self.canvas = launcher.tk.Canvas(parent, width=width, height=height, bg=BG, highlightthickness=0, bd=0,
+                                         cursor='hand2')
+        self.command, self.text, self.state, self.hover = command, '', 'normal', False
+        self.width, self.height = width, height
+        self.canvas.bind('<Button-1>', lambda _e: self.state == 'normal' and self.command())
+        self.canvas.bind('<Enter>', lambda _e: self.set_hover(True))
+        self.canvas.bind('<Leave>', lambda _e: self.set_hover(False))
+        self.draw()
+
+    def set_hover(self, value):
+        self.hover = value
+        self.draw()
+
+    def configure(self, text=None, state=None):
+        if text is not None:
+            self.text = text
+        if state is not None:
+            self.state = str(state)
+        self.draw()
+
+    def pack(self, **options):
+        self.canvas.pack(**options)
+
+    def draw(self):
+        c, w, h = self.canvas, self.width, self.height
+        c.delete('all')
+        slant = h * 0.38
+        enabled = self.state == 'normal'
+        fill = (ACCENT_HI if self.hover else ACCENT) if enabled else '#22242c'
+        c.create_polygon(slant, 0, w, 0, w - slant, h, 0, h, fill=fill, outline='')
+        c.create_line(slant + 1, 0, 1, h, fill=NEON if enabled else LINE, width=3)
+        c.create_text(w / 2, h / 2 + 1, text=self.text, fill=TEXT if enabled else '#6c7080',
+                      font=heading_font(26, UI_FONT, every_language=True))
+
+
 class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
@@ -869,7 +978,7 @@ class Launcher:
         self.vars = {}
         self.process = self.job = None
         self.output = queue.Queue()
-        self.banner_source = self.banner_image = None
+        self.banner_key = self.banner_photo = None
         self.ui_calls = queue.Queue()  # work for the Tk thread from helper threads
         self.mod_order, self.mod_vars, self.patch_vars = [], {}, {}
         self.pending_update = None  # (version, url, page) once offered
@@ -967,7 +1076,9 @@ class Launcher:
         s.configure('TLabel', background=PANEL, foreground=TEXT)
         s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=(UI_FONT, 9))
         s.configure('Restart.TLabel', background=PANEL, foreground=ACCENT_HI, font=(UI_FONT, 8, 'bold'))
-        s.configure('Section.TLabel', background=PANEL, foreground=ACCENT_HI, font=heading_font(12))
+        s.configure('Section.TLabel', background=PANEL, foreground=TEXT, font=heading_font(19, UI_FONT))
+        s.configure('Slash.TLabel', background=PANEL, foreground=ACCENT, font=heading_font(19, UI_FONT))
+        s.configure('Tile.TLabel', background=PANEL, foreground=MUTED, font=heading_font(14, UI_FONT))
         s.configure('TCheckbutton', background=PANEL, foreground=TEXT, padding=(0, 3))
         s.map('TCheckbutton', background=[('active', PANEL)], foreground=[('disabled', MUTED)])
         s.configure('TRadiobutton', background=PANEL, foreground=TEXT, indicatorcolor=CARD)
@@ -1054,9 +1165,12 @@ class Launcher:
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 0))
 
     def section(self, parent, title, top=20):
+        """A section heading: a red slash, the title in the display face, a hairline under it."""
         r = self.next_row(parent)
-        self.ttk.Label(parent, text=heading_text(title.upper()), style='Section.TLabel').grid(
-            row=r, column=0, columnspan=2, sticky='w', pady=(top, 0))
+        cell = self.ttk.Frame(parent)
+        self.ttk.Label(cell, text='/', style='Slash.TLabel').pack(side='left', padx=(0, 8))
+        self.ttk.Label(cell, text=heading_text(title.upper()), style='Section.TLabel').pack(side='left')
+        cell.grid(row=r, column=0, columnspan=2, sticky='w', pady=(top, 0))
         self.tk.Frame(parent, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=2, sticky='we', pady=(2, 2))
 
     def folder(self, parent, key, title, prompt, hint=None, on_change=None):
@@ -1080,13 +1194,14 @@ class Launcher:
         """A settings page: a heading and content that scrolls vertically."""
         tk, ttk = self.tk, self.ttk
         outer = ttk.Frame(self.content)
-        head = ttk.Frame(outer, padding=(28, 22, 28, 6))
+        head = ttk.Frame(outer, padding=(32, 20, 32, 8))
         head.pack(fill='x')
-        ttk.Label(head, text=heading_text(title.upper()), background=PANEL, foreground=TEXT, font=heading_font(20)).pack(anchor='w')
+        ttk.Label(head, text=heading_text(title.upper()), background=PANEL, foreground=TEXT,
+                  font=heading_font(34, UI_FONT)).pack(anchor='w')
         ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w')
         canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
-        inner = ttk.Frame(canvas, padding=(28, 0, 28, 24))
+        inner = ttk.Frame(canvas, padding=(32, 0, 32, 24))
         inner.columnconfigure(1, weight=1)
         window = canvas.create_window(0, 0, window=inner, anchor='nw')
         inner.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
@@ -1101,47 +1216,58 @@ class Launcher:
     # ---- layout ------------------------------------------------------------------------------
     def build(self):
         tk, ttk = self.tk, self.ttk
-        side = tk.Frame(self.root, bg=BG, width=self.px(220))
-        side.pack(side='left', fill='y')
-        side.pack_propagate(False)
-        self.side_title = tk.Label(side, text=heading_text(APP_NAME.upper(), every_language=True), bg=BG, fg=TEXT,
-                                   font=heading_font(15, every_language=True),
-                                   wraplength=self.px(190), justify='left')
-        self.side_title.pack(anchor='w', padx=22, pady=(24, 2))
-        tk.Label(side, text=_('Native PC port') + f'  ·  v{VERSION}', bg=BG, fg=NEON,
-                 font=(UI_FONT, 9, 'bold')).pack(anchor='w', padx=22, pady=(0, 18))
-        tk.Frame(side, bg=ACCENT, height=2).pack(fill='x', padx=22, pady=(0, 14))
-        self.side = side
+        header = tk.Frame(self.root, bg=BG, height=self.px(86))
+        header.pack(fill='x', side='top')
+        header.pack_propagate(False)
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(side='left', padx=(self.px(28), self.px(36)))
+        tk.Label(brand, text='INFAMOUS', bg=BG, fg=TEXT, font=heading_font(32, UI_FONT, every_language=True),
+                 bd=0, pady=0).pack(anchor='w', pady=(self.px(10), 0))
+        tk.Label(brand, text=f'SECOND SON  /  PC  ·  v{VERSION}', bg=BG, fg=ACCENT_HI,
+                 font=heading_font(14, UI_FONT, every_language=True), bd=0, pady=0).pack(anchor='w')
         self.nav, self.current_page = {}, None
         titles = {'home': _('Home'), 'graphics': _('Graphics', 'Графика'), 'performance': _('Performance'),
                   'game': _('Game', 'Игра'), 'advanced': _('Advanced', 'Дополнительно')}
+        tabs = tk.Frame(header, bg=BG)
+        tabs.pack(side='left', fill='y')
         for name in PAGES:
-            item = tk.Label(side, text='    ' + heading_text(titles[name]), bg=BG, fg=TEXT, anchor='w',
-                            font=heading_font(11, UI_FONT),
-                            pady=10, cursor='hand2')
-            item.pack(fill='x')
-            item.bind('<Button-1>', lambda _e, n=name: self.show(n))
-            item.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg=HOVER))
-            item.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg=BG))
-            self.nav[name] = item
-        tk.Frame(side, bg=BG).pack(fill='both', expand=True)
+            column = tk.Frame(tabs, bg=BG)
+            column.pack(side='left', fill='y', padx=self.px(12))
+            label = tk.Label(column, text=heading_text(titles[name].upper()), bg=BG, fg=MUTED,
+                             font=heading_font(19, UI_FONT), cursor='hand2', bd=0)
+            label.pack(side='top', expand=True)
+            underline = tk.Frame(column, bg=BG, height=self.px(3))
+            underline.pack(side='bottom', fill='x', pady=(0, self.px(14)))
+            for widget in (column, label):
+                widget.bind('<Button-1>', lambda _e, n=name: self.show(n))
+                widget.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav[n][0].configure(fg=NEON))
+                widget.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav[n][0].configure(fg=MUTED))
+            self.nav[name] = (label, underline)
+        self.side_note = tk.Label(header, text=_("In the game: Insert or R3+L2\nopens the port's menu."),
+                                  bg=BG, fg=MUTED, font=(UI_FONT, 9), justify='right')
+        self.side_note.pack(side='right', padx=self.px(26))
+        # A two-colour neon line under the header: smoke red into neon cyan.
+        line = tk.Frame(self.root, bg=BG, height=2)
+        line.pack(fill='x')
+        tk.Frame(line, bg=ACCENT, height=2).place(relx=0, rely=0, relwidth=0.62, relheight=1)
+        tk.Frame(line, bg=NEON_PINK, height=2).place(relx=0.62, rely=0, relwidth=0.2, relheight=1)
+        tk.Frame(line, bg=NEON, height=2).place(relx=0.82, rely=0, relwidth=0.18, relheight=1)
+        # Notices (an available update) appear here, under the header.
+        self.notice = tk.Frame(self.root, bg=BG)
         self.update_box = None
-        self.side_note = tk.Label(side, text=_('In the game: Insert or R3+L2\nopens the port\'s menu.',
-                                               'В игре: Insert или R3+L2\nоткрывает меню порта.'),
-                                  bg=BG, fg=MUTED, font=(UI_FONT, 9), justify='left', wraplength=self.px(210))
-        self.side_note.pack(anchor='w', padx=22, pady=(0, 18))
 
         right = tk.Frame(self.root, bg=PANEL)
-        right.pack(side='left', fill='both', expand=True)
-        bar = tk.Frame(right, bg=BG, height=self.px(72))
+        right.pack(side='top', fill='both', expand=True)
+        bar = tk.Frame(right, bg=BG, height=self.px(78))
         bar.pack(fill='x', side='bottom')
         bar.pack_propagate(False)
         self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(UI_FONT, 10), anchor='w', justify='left')
-        self.status.pack(side='left', padx=24)
-        self.play_button = ttk.Button(bar, text=heading_text(_('PLAY', 'ИГРАТЬ')), style='Play.TButton', command=self.play)
-        self.play_button.pack(side='right', padx=(self.px(10), self.px(24)), pady=self.px(11))
+        self.status.pack(side='left', padx=self.px(28))
+        self.play_button = PlayButton(self, bar, self.play, self.px(230), self.px(54))
+        self.play_button.configure(text=heading_text(_('PLAY', 'ИГРАТЬ')))
+        self.play_button.pack(side='right', padx=(self.px(12), self.px(28)), pady=self.px(12))
         self.save_button = ttk.Button(bar, text=_('Save', 'Сохранить'), command=self.save, state='disabled')
-        self.save_button.pack(side='right', pady=self.px(11))
+        self.save_button.pack(side='right', pady=self.px(12))
         self.content = tk.Frame(right, bg=PANEL)
         self.content.pack(fill='both', expand=True)
 
@@ -1168,180 +1294,137 @@ class Launcher:
             page.pack_forget()
         self.pages[name].pack(fill='both', expand=True)
         self.current_page = name
-        for n, item in self.nav.items():
-            item.configure(bg=PANEL if n == name else BG, fg=ACCENT_HI if n == name else TEXT)
+        for n, (label, underline) in self.nav.items():
+            label.configure(fg=TEXT if n == name else MUTED)
+            underline.configure(bg=ACCENT if n == name else BG)
         for method in PAGE_REFRESH.get(name, ()):
             getattr(self, method)()
 
     def build_home(self):
         tk, ttk = self.tk, self.ttk
-        page = tk.Frame(self.content, bg=PANEL)
+        page = tk.Frame(self.content, bg=BG)
         self.pages['home'] = page
-        self.banner = tk.Canvas(page, height=self.px(330), bg=BG, highlightthickness=0, bd=0)
-        self.banner.pack(fill='x')
+        quick = tk.Frame(page, bg=PANEL)
+        quick.pack(fill='x', side='bottom')
+        inner = ttk.Frame(quick, padding=(32, 12, 32, 14))
+        inner.pack(fill='x')
+        items = ((_('Anti-aliasing'), 'anti_aliasing', 'app', ANTI_ALIASING),
+                 (_('Frame rate limit'), 'fps_limit', 'ini', FPS_LIMITS),
+                 (_('Draw distance'), 'draw_distance', 'app', DRAW_DISTANCE),
+                 (_('Display mode'), 'display_mode', 'ini', DISPLAY_MODES))
+        for index, (title, key, store, options) in enumerate(items):
+            cell = ttk.Frame(inner)
+            cell.grid(row=0, column=index, sticky='w', padx=(0, self.px(26)))
+            ttk.Label(cell, text=heading_text(title.upper()), style='Tile.TLabel').pack(anchor='w')
+            self.choice(cell, key, store, options, width=24 if index == 0 else 17).pack(anchor='w', pady=(2, 0))
+        self.banner_key = self.banner_photo = None
+        self.banner = tk.Canvas(page, bg=BG, highlightthickness=0, bd=0)
+        self.banner.pack(fill='both', expand=True)
         self.banner.bind('<Configure>', lambda _e: self.draw_banner())
         self.banner_button = ttk.Button(self.banner, text=_('Choose the game folder'),
                                         command=lambda: self.show('game'))
-        quick = ttk.Frame(page, padding=(28, 14, 28, 8))
-        quick.pack(fill='x')
-        ttk.Label(quick, text=heading_text(_('Quick settings', 'Основное').upper()), style='Section.TLabel').grid(
-            row=0, column=0, columnspan=4, sticky='w')
-        tk.Frame(quick, bg=LINE, height=1).grid(row=1, column=0, columnspan=4, sticky='we', pady=(2, 6))
-        items = ((_('Display mode'), 'display_mode', DISPLAY_MODES), (_('Frame rate limit'), 'fps_limit', FPS_LIMITS),
-                 (_('Render resolution'), 'render_resolution', RESOLUTION_CHOICES),
-                 (_('Engine frame rate'), 'engine_fps', ENGINE_FPS_CHOICES))
-        for index, (title, key, options) in enumerate(items):
-            r, c = 2 + index // 2, (index % 2) * 2
-            ttk.Label(quick, text=title).grid(row=r, column=c, sticky='w', pady=6, padx=(0, 12))
-            self.choice(quick, key, 'ini', options, width=18).grid(row=r, column=c + 1, sticky='w', padx=(0, 40))
 
     def draw_banner(self):
-        """The cover art of the selected dump (sce_sys/pic1.png) under the title."""
-        tk, c = self.tk, self.banner
+        """The home page: the dump's own art (sce_sys/pic1.png) behind the game's name."""
+        c = self.banner
         c.delete('all')
-        w, h, bar = max(c.winfo_width(), 400), int(c['height']), self.px(44)
+        w, h = max(c.winfo_width(), 400), max(c.winfo_height(), 200)
         folder = self.meta_dir()
         info = game_info(folder)
         art = Path(folder or '.') / 'sce_sys' / 'pic1.png'
-        if self.banner_source != art:
-            self.banner_source, self.banner_image, self.banner_size = art, None, None
-            try:
-                self.banner_image = tk.PhotoImage(file=str(art))
-            except (tk.TclError, OSError):
-                pass
-        if self.banner_image:
-            if self.banner_size != w:
-                self.banner_size, self.banner_scaled = w, self.scaled_art(art, w)
-            # The logo sits in the upper half of the cover: show that part.
-            c.create_image(w // 2, int(h * 0.62), image=self.banner_scaled)
-            # A solid strip under the art: the title id and version sit in it, not over the picture.
-            c.create_rectangle(0, h - bar, w, h, fill=PANEL, outline='')
-        else:
-            c.create_text(30, h - 74, text=heading_text(APP_NAME.upper(), every_language=True), anchor='w', fill=TEXT,
-                          font=heading_font(32, every_language=True))
+        key = (str(art), art.is_file(), w, h)
+        if self.banner_key != key:
+            self.banner_key, self.banner_photo = key, hero_image(art if art.is_file() else None, w, h)
+        if self.banner_photo:
+            c.create_image(0, 0, image=self.banner_photo, anchor='nw')
+        x, base = self.px(40), h - self.px(34)
+        title_face = heading_font(min(96, max(54, h // 4)), UI_FONT, every_language=True)
+        c.create_text(x, base, text='SECOND SON', anchor='sw', fill=ACCENT_HI,
+                      font=heading_font(min(46, max(28, h // 8)), UI_FONT, every_language=True))
+        c.create_text(x - 2, base - self.px(min(44, max(28, h // 8)) * 0.95), text='INFAMOUS', anchor='sw',
+                      fill=TEXT, font=title_face)
         if info:
             title_id = game_profile_of(folder)[0]
-            sub = _('{} · version {}', '{} · версия {}').format(title_id or '?', info[1])
-            c.create_text(33, h - bar // 2, text=sub, anchor='w', fill=ACCENT_HI, font=(UI_FONT, 11, 'bold'))
+            chip = f'  {title_id or "?"}  ·  ' + _('version {}', 'версия {}').format(info[1]) + '  '
+            item = c.create_text(x + self.px(4), self.px(28), text=chip, anchor='nw', fill=TEXT,
+                                 font=(UI_FONT, 10, 'bold'))
+            x0, y0, x1, y1 = c.bbox(item)
+            c.create_rectangle(x0 - 2, y0 - 4, x1 + 2, y1 + 4, fill=ACCENT, outline='')
+            c.tag_raise(item)
         else:
-            c.create_text(w // 2, h // 2 - 40, text=_('Choose your game folder to play.'),
+            c.create_text(x + self.px(4), self.px(34), text=_('Choose your game folder to play.'), anchor='nw',
                           fill=TEXT, font=(UI_FONT, 12))
-            c.create_window(w // 2, h // 2, window=self.banner_button)
-
-    def scaled_art(self, path, width):
-        """The cover art scaled to `width`: Pillow (smooth) or Tk's integer subsampling."""
-        try:
-            from PIL import Image, ImageTk
-            with Image.open(path) as image:
-                height = round(image.height * width / image.width)
-                return ImageTk.PhotoImage(image.convert('RGB').resize((width, height), Image.LANCZOS))
-        except (ImportError, OSError):
-            factor = max(1, round(self.banner_image.width() / max(width, 1)))
-            return self.banner_image.subsample(factor) if factor > 1 else self.banner_image
+            c.create_window(x + self.px(4), self.px(66), window=self.banner_button, anchor='nw')
 
     def build_graphics(self):
-        """Window and overlay controls; temporal upscaling stays commented out."""
+        """Window, anti-aliasing (the game's own, FSR 4 or DLSS) and the overlay."""
+        tk, ttk = self.tk, self.ttk
         f = self.scrolled_page('graphics', _('Graphics', 'Графика'), _('How the game appears on your screen.'))
         self.build_display(f)
-        # Temporal upscaling is parked until its image quality is validated.
-        # self.section(f, _('Experimental'))
-        # self.check(f, 'experimental_upscaler', 'app', _('Enable the upscaler (experimental)'),
-        #            _('Off (default): the game runs without temporal upscaling; FSR 3.1 and TAA need this switch on. '
-        #              'FSR 3.1 is not calibrated for this game yet: expect ghosting or flicker. The remaining options require this switch; '
-        #              'leave it off for normal gameplay.',
-        #              'Выкл. (по умолчанию): игра без временного апскейлинга; FSR 3.1 и TAA нужен этот переключатель. '
-        #              'FSR 3.1 ещё не откалиброван для этой игры: возможны гостинг и мерцание.'), restart=True)
-        # self.section(f, _('Upscaling', 'Апскейлинг'))
-        # self.row(f, _('Upscaler', 'Апскейлер'), self.choice(f, 'upscaler', 'ini', UPSCALERS))
-        # self.row(f, _('Quality preset', 'Пресет'), self.choice(f, 'preset', 'ini', PRESETS),
-        #          _('Render scale per axis: Quality renders at 1/1.5 of the output size.',
-        #            'Масштаб рендера по каждой оси: Quality рисует в 1/1.5 размера вывода.'))
-        # self.row(f, _('Output resolution', 'Разрешение вывода'), self.choice(f, 'output_res', 'ini', OUTPUTS),
-        #          _('What the upscaler produces; the HUD is drawn at this size too.',
-        #            'Что выдаёт апскейлер; интерфейс рисуется в этом же размере.'))
-        # self.row(f, _('Live resolution changes', 'Смена разрешения на лету'), self.choice(f, 'live_resolution', 'ini', LIVE),
-        #          _('Off: outputs other than 1080p are set by a patch at start (fastest; changing them in the '
-        #            'game restarts it). On: change output and preset in the game without a restart, at a cost.',
-        #            'Выкл.: разрешения кроме 1080p задаются патчем при запуске (быстрее). Вкл.: менять в игре '
-        #            'без перезапуска, но медленнее.'))
-        # self.check(f, 'object_motion', 'ini', _('Object motion vectors', 'Векторы движения объектов'),
-        #            _('Less ghosting on characters, cloth and weapons; costs about 10% FPS.',
-        #              'Меньше гостинга на персонажах и одежде; стоит около 10% FPS.'))
-
-    def build_display(self, f):
-        """Window and overlay: the top of the Graphics page."""
-        self.section(f, _('Window', 'Окно'), top=4)
-        self.row(f, _('Display mode'), self.choice(f, 'display_mode', 'ini', DISPLAY_MODES),
-                 _('Borderless covers the screen without changing the display mode.'))
-        self.check(f, 'vsync', 'ini', _('VSync'), _('Off allows tearing for the lowest latency.'))
-        self.check(f, 'hdr', 'app', _('Allow HDR output', 'Разрешить HDR'),
-                   _('When HDR is on in Windows and the display supports it.',
-                     'Если HDR включён в Windows и монитор его поддерживает.'))
+        self.section(f, _('Anti-aliasing'))
+        self.row(f, _('Anti-aliasing'), self.choice(f, 'anti_aliasing', 'app', ANTI_ALIASING, width=44),
+                 _("Replaces the game's own temporal anti-aliasing. FSR 4 (included) needs a Radeon RX 7000 or "
+                   "9000; DLSS needs an NVIDIA RTX card and NVIDIA's files (below). Without what they need the "
+                   "game keeps its own."), restart=True)
+        holder = ttk.Frame(f)
+        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
+        ttk.Button(holder, text=_('Open the DLSS folder'), command=self.open_dlss_folder).pack(side='left')
+        ttk.Button(holder, text=_('Download page (Streamline 2.14.16)'),
+                   command=lambda: open_url(STREAMLINE_PAGE)).pack(side='left', padx=6)
+        self.dlss_state = ttk.Label(holder, text='', style='Muted.TLabel')
+        self.dlss_state.pack(side='left', padx=10)
+        self.note(f, _('DLSS: from the Streamline SDK 2.14.16 zip, folder bin\\x64, copy {} into the DLSS folder.')
+                  .format(', '.join(DLSS_FILES)), top=6)
         self.section(f, _('Overlay'))
         self.check(f, 'show_fps', 'ini', _('Show performance overlay'),
                    _('Items, size and corner: in-game menu (Insert / R3+L2) > Overlay.'))
+        self.note(f, _('Screenshots: F12 (saved in the user\\screenshots folder).'), top=10)
+        self.refresh_dlss_state()
+
+    def refresh_dlss_state(self):
+        missing = dlss_missing()
+        self.dlss_state.configure(text=_('DLSS files: ready') if not missing else
+                                  _('DLSS files missing: {}').format(', '.join(missing)))
+
+    def open_dlss_folder(self):
+        folder = dlss_folder()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self.messagebox.showerror(APP_NAME, str(error))
+            return
+        self.open_path(folder)
+        self.refresh_dlss_state()
+
+    def build_display(self, f):
+        """Window: the top of the Graphics page."""
+        self.section(f, _('Window', 'Окно'), top=4)
+        self.row(f, _('Display mode'), self.choice(f, 'display_mode', 'ini', DISPLAY_MODES),
+                 _('Borderless covers the screen without changing the display mode.'))
+        self.check(f, 'vsync', 'ini', _('VSync'), _('Off allows tearing for the lowest latency.'), restart=True)
+        self.check(f, 'hdr', 'app', _('Allow HDR output', 'Разрешить HDR'),
+                   _('When HDR is on in Windows and the display supports it.',
+                     'Если HDR включён в Windows и монитор его поддерживает.'))
 
     def build_performance(self):
         f = self.scrolled_page('performance', _('Performance'), _('Frame rate and speed options.'))
         self.section(f, _('Frame rate', 'Частота кадров'), top=4)
         self.row(f, _('Frame rate limit'), self.choice(f, 'fps_limit', 'ini', FPS_LIMITS),
-                 _('The engine frame rate (below) is the highest it can go.'))
-        self.row(f, _('Frames queued'), self.choice(f, 'frames_queued', 'ini', FRAMES_QUEUED),
-                 _('1 is the lowest input latency; more can raise FPS when the graphics card is the limit.'))
-        self.row(f, _('Engine frame rate'), self.choice(f, 'engine_fps', 'ini', ENGINE_FPS_CHOICES),
-                 _('The highest frame rate the game itself runs at (a game patch).'), restart=True)
-        self.row(f, _('Render resolution'), self.choice(f, 'render_resolution', 'ini', RESOLUTION_CHOICES),
-                 _('The size the game draws at; higher is sharper and slower. A resolution patch replaces the '
-                   'texture fix and reserves the memory it needs.'), restart=True)
+                 _('The highest frame rate. The game keeps its speed at any frame rate; Unlimited runs as fast '
+                   'as the PC allows.'), restart=True)
         self.section(f, 'inFAMOUS')
+        self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
+                 _('How far buildings and details keep their full detail in the open city. Long and Very long '
+                   'show less pop-in than the PS4 and cost some FPS.'), restart=True)
         self.row(f, _('Effects'), self.choice(f, 'readbacks', 'app', READBACKS),
                  _('Smoke, sparks, neon and bullets are computed on the graphics card and read back by the '
                    'game. Full keeps all of them; Light and Off are faster but lose effects.'), restart=True)
-        self.check(f, 'compute_priority', 'app', _('Effects work goes ahead of drawing (faster)'),
-                   _('The effects the game waits for are handled before the rest of the frame. About 29 to 39 '
-                     'FPS in combat on an RX 9060 XT. Switch it off if the game freezes.'), restart=True)
-        self.check(f, 'ordered_readback', 'app', _('Effects readbacks off the GPU thread (test)'),
-                   _('The copies the game reads back no longer pause the thread that feeds the graphics card. '
-                     'Being tested: compare the FPS in combat, switch it off if the game freezes.'), restart=True)
-        self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
-                 _('How far buildings and details keep their full detail in the open city.'), restart=True)
-        self.section(f, _('Shaders'))
-        self.check(f, 'pipeline_binaries', 'app', _('Use pipeline binary cache (experimental)'),
-                   _('Saves the compiled Vulkan pipelines to load faster. Off by default: with an empty shader '
-                     'cache it froze AMD cards at the first start. Takes effect on the next launch.'))
-        self.check(f, 'background_warmup', 'app', _('Load shader cache in the background'),
-                   _('The game opens at once and the saved shaders load while you play; a small note in the '
-                     'corner shows the progress. Switch it off to wait on the loading screen instead.'))
-        self.check(f, 'async_shaders', 'ini', _('Compile new shaders in the background'),
-                   _('Fewer stutters in new areas: the game keeps running while new shaders compile. An object '
-                     'or effect may appear a moment later. Switch it off if something stays missing.'))
-        self.check(f, 'parallel_warmup', 'app', _('Fast shader cache loading (parallel)'),
-                   _('Loading screen only: builds the cached pipelines on several CPU threads.'))
-        self.section(f, _('GPU data'))
+        self.section(f, _('Graphics card'))
         gpus = list_gpus()
         cards = [('', ('Automatic',))] + [(row[0], (row[1],)) for row in gpus]
         self.row(f, _('Graphics card'), self.choice(f, 'gpu_id', 'app', cards),
                  _('The GPU the game runs on. Choose your dedicated card if the game uses the integrated one.'),
                  restart=True)
-        self.row(f, _('Stream buffer memory'), self.choice(f, 'stream_memory', 'app', STREAM_MEMORY),
-                 _('System RAM can improve FPS on NVIDIA laptops. Choose GPU memory to restore the previous '
-                   'behavior. Applies on the next game launch.'), restart=True)
-        self.check(f, 'stale_readback', 'ini', _('Game reads GPU data without waiting (big FPS gain)'),
-                   _('About 40 to 66 FPS in a heavy scene. Needs deferred GPU readbacks. Switch it off if lighting '
-                     'or objects look wrong.'), restart=True)
-        self.check(f, 'deferred_readback', 'ini', _('Deferred GPU readbacks'),
-                   _('Fewer waits for the GPU. Switch it off if textures or shadows look wrong.'), restart=True)
-        self.row(f, _('Two-stage GPU pipeline', 'Двухстадийный конвейер GPU'), self.choice(f, 'draw_pipe', 'app', DRAW_PIPE),
-                 _('20–30% faster; switch it off if the game is unstable.', 'Быстрее на 20–30%; при нестабильности выключите.'))
-        card = self.var('gpu_id', 'app')
-        box = self.choice(f, 'no_msaa', 'app', no_msaa_options(gpus, card.get()), width=46)
-        self.row(f, _('Game multisampling'), box, _(NO_MSAA_HINT), restart=True)
-
-        def relabel(*_args):  # Automatic names the card the game will run on
-            index = max(box.current(), 0)
-            box['values'] = [_(*text) for _value, text in no_msaa_options(gpus, card.get())]
-            box.current(index)
-        card.trace_add('write', relabel)
 
     def build_game(self):
         f = self.scrolled_page('game', _('Game', 'Игра'), _('Your game dump, saves and the game patches.'))
@@ -1638,11 +1721,6 @@ class Launcher:
         body.columnconfigure(1, weight=1)
         body_row = self.next_row(f)
         self.check(body, 'frame_stats', 'app', _('Frame statistics in the log (every 5 s)', 'Статистика кадров в журнале (раз в 5 с)'))
-        self.check(body, 'gpu_profile', 'app', _('GPU time per pass in the log', 'Профиль GPU в журнале'))
-        self.check(body, 'perf_diag', 'app', _('GPU wait and readback report in the log (every 5 s)'),
-                   _('Shows where the frame waits for the GPU and which reads cause it. For performance tests.'))
-        self.check(body, 'frame_capture_key', 'app', _('F11 captures a frame for analysis'),
-                   _('Records how the next frame is drawn into the captures folder.'))
         self.check(body, 'vk_validation', 'app', _('Vulkan validation layers (needs the Vulkan SDK; much slower)',
                                                    'Слои валидации Vulkan (нужен Vulkan SDK; сильно замедляет)'))
         shown = tk.BooleanVar(value=False)
@@ -1682,10 +1760,9 @@ class Launcher:
         info = game_info(folder)
         title = info[0] if info else APP_NAME
         self.root.title(f'{title} (PC)')
-        self.side_title.configure(text=heading_text(title.upper(), every_language=True))
         if self.current_page == 'game':
             self.refresh_game_patches()
-        self.banner_source = None
+        self.banner_key = None
         self.draw_banner()
         self.set_icon()
         self.refresh_status()
@@ -1700,19 +1777,14 @@ class Launcher:
                                                                      'Сначала выберите папку игры.'), fg=MUTED)
 
     def summary(self):
-        self.store_game_patches()
-        title_id, _profile = game_profile_of(self.meta_dir())
-        names = self.app.get('game_patches', {}).get(title_id) or []
-        resolution = dict((v, t[0]) for v, t in RESOLUTION_CHOICES).get(self.var('render_resolution', 'ini').get(), '?')
-        from patches import game_patchable, patch_status
-        if not game_patchable(self.meta_dir()):
-            return _('{} · 60 FPS engine · no patches for this game').format(resolution)
-        text = _('{} · {} FPS engine · {} patches').format(resolution, self.var('engine_fps', 'ini').get(), len(names))
-        # Which patches the game's eboot.bin had is known once the game has started (patches.py).
-        status = patch_status(DATA_DIR / 'out')
-        if status and status.get('skipped'):
-            text += ' · ' + _('{} not found in this eboot.bin at the last start (see Log)').format(len(status['skipped']))
-        return text
+        """The status line: what the next start uses."""
+        def label(options, value):
+            return next((_(*text) for v, text in options if v == value), value)
+        aa = label(ANTI_ALIASING, self.var('anti_aliasing', 'app').get())
+        limit = self.var('fps_limit', 'ini').get()
+        limit = _('no FPS limit') if limit == '0' else _('up to {} FPS').format(limit)
+        distance = label(DRAW_DISTANCE, self.var('draw_distance', 'app').get())
+        return _('{} · {} · draw distance: {}').format(aa, limit, distance.lower())
 
     def refresh_lists(self):
         if not hasattr(self, 'patches_frame'):
@@ -2150,18 +2222,17 @@ class Launcher:
             return
         tk, ttk = self.tk, self.ttk
         text = _('Version {} is available.', 'Доступна версия {}.').format(version)
-        box = tk.Frame(self.side, bg=CARD, highlightthickness=1, highlightbackground=ACCENT)
-        self.update_label = tk.Label(box, text=text, bg=CARD, fg=TEXT, font=(UI_FONT, 10, 'bold'),
-                                     wraplength=self.px(160), justify='left')
-        self.update_label.pack(anchor='w', padx=10, pady=(8, 6))
-        buttons = tk.Frame(box, bg=CARD)
-        buttons.pack(fill='x', padx=10, pady=(0, 10))
-        self.update_button = ttk.Button(buttons, text=_('Update', 'Обновить'),
+        box = tk.Frame(self.notice, bg=CARD, highlightthickness=0)
+        tk.Frame(box, bg=NEON, width=self.px(4)).pack(side='left', fill='y')
+        self.update_label = tk.Label(box, text=text, bg=CARD, fg=TEXT, font=(UI_FONT, 10, 'bold'), justify='left')
+        self.update_label.pack(side='left', padx=self.px(14), pady=self.px(8))
+        self.update_button = ttk.Button(box, text=_('Update', 'Обновить'),
                                         command=lambda: self.install_update(version, url, page))
-        self.update_button.pack(fill='x')
-        ttk.Button(buttons, text=_("What's new", 'Что нового'), command=lambda: open_url(page)).pack(
-            fill='x', pady=(4, 0))
-        box.pack(fill='x', padx=(22, 18), pady=(0, 14), before=self.side_note)
+        self.update_button.pack(side='right', padx=(0, self.px(14)), pady=self.px(6))
+        ttk.Button(box, text=_("What's new", 'Что нового'), command=lambda: open_url(page)).pack(
+            side='right', padx=(0, self.px(8)), pady=self.px(6))
+        box.pack(fill='x')
+        self.notice.pack(fill='x', after=self.notice.master.winfo_children()[1])
         self.update_box = box
         self.pending_update = (version, url, page)
         if not self.process:
@@ -2286,7 +2357,9 @@ class Launcher:
         self.messagebox.showinfo(APP_NAME, _('Shortcut created:', 'Ярлык создан:') + '\n' + '\n'.join(created))
 
     def add_to_steam(self):
-        """A non-Steam shortcut with the game's icon, capsules, hero and logo (scripts/steam_shortcut.py)."""
+        """A non-Steam shortcut with the game's icon, capsules, hero and logo (scripts/steam_shortcut.py).
+        Steam rewrites its shortcuts when it exits, so an open Steam is closed first (when the player
+        agrees) and opened again afterwards."""
         if not self.collect():
             return
         game = self.var('game_dir', 'app').get()
@@ -2294,26 +2367,45 @@ class Launcher:
             self.messagebox.showerror(APP_NAME, _('Choose the game folder with eboot.bin (CUSA00004).',
                                                   'Выберите папку игры с eboot.bin (CUSA00004).'))
             return
+        reopen = False
+        if steam_shortcut.steam_running():
+            if not self.messagebox.askyesno(APP_NAME, _('Steam is open. Close Steam, add the game and open Steam again?')):
+                return
+            reopen = True
         self.root.configure(cursor='watch')
-        self.root.update_idletasks()
-        try:
-            result = steam_shortcut.add_to_steam(game, steam_launch_command(), steam_icon(game))
-        except steam_shortcut.SteamError as error:
+        command, icon = steam_launch_command(), steam_icon(game)
+
+        def work():
+            try:
+                if reopen and not steam_shortcut.close_steam():
+                    raise steam_shortcut.SteamError('still_running')
+                result = steam_shortcut.add_to_steam(game, command, icon)
+            except Exception as error:  # reported in the window, never lost in a thread
+                outcome = error
+            else:
+                outcome = result
+            if reopen:
+                steam_shortcut.start_steam()
+            self.ui_calls.put(lambda: self.steam_done(outcome))
+        threading.Thread(target=work, daemon=True).start()
+
+    def steam_done(self, outcome):
+        self.root.configure(cursor=ARROW)
+        if isinstance(outcome, steam_shortcut.SteamError):
             text = {'running': _('Steam is open. Close it completely (Steam > Exit) and click again: Steam '
                                  'rewrites its shortcuts when it closes.'),
+                    'still_running': _('Steam did not close. Close it (Steam > Exit) and click again.'),
                     'no_steam': _('Steam was not found for this user.'),
                     'no_art': _('The game folder has no sce_sys/pic1.png for the pictures.')}
-            self.messagebox.showerror(APP_NAME, text.get(error.code, str(error)))
-        except (OSError, ValueError, ImportError) as error:
-            self.messagebox.showerror(APP_NAME, str(error))
+            self.messagebox.showerror(APP_NAME, text.get(outcome.code, str(outcome)))
+        elif isinstance(outcome, Exception):
+            self.messagebox.showerror(APP_NAME, f'{type(outcome).__name__}: {outcome}')
         else:
             text = (_('The shortcut "{}" was updated in Steam (accounts: {}), with its icon, capsules, background '
-                      'and logo. Open Steam to see it in the library.') if result['updated'] else
+                      'and logo. Open Steam to see it in the library.') if outcome['updated'] else
                     _('The shortcut "{}" was added to Steam (accounts: {}), with its icon, capsules, background '
                       'and logo. Open Steam to see it in the library.'))
-            self.messagebox.showinfo(APP_NAME, text.format(steam_shortcut.APP_NAME, result['accounts']))
-        finally:
-            self.root.configure(cursor=ARROW)
+            self.messagebox.showinfo(APP_NAME, text.format(steam_shortcut.APP_NAME, outcome['accounts']))
 
     def close(self):
         if not self.collect():
@@ -2495,7 +2587,10 @@ def main():
         root.configure(cursor=ARROW)
         for window in ('Toplevel', 'Dialog', 'TkFDialog', 'TkChooseDir'):  # dialogs: tk_messageBox, file pickers
             root.option_add(f'*{window}.cursor', ARROW)
-    pick_fonts(font.families(root))
+    families = font.families(root)
+    pick_fonts(families)
+    # Linux has no private font registration: the title face counts when it is installed.
+    FONT_LOADED = FONT_LOADED or HEADING_FAMILY in families
     Launcher(root, tk, ttk, filedialog, messagebox)
     root.mainloop()
 

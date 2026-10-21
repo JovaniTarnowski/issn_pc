@@ -90,6 +90,11 @@ add_subdirectory(shadps4/video_core/host_shaders)
 set(SHADER_INCLUDE ${HOST_SHADERS_INCLUDE})
 find_package(glslang CONFIG REQUIRED)
 
+# issn-axy: FSR 4 Native AA (ISSN_FSR4, issn_fsr4.cpp) through FireBurn/FSR-Vulkan (MIT).
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
 
@@ -154,7 +159,7 @@ if (NOT WIN32)
 endif()
 # glslang's own CMake package: SPIRV and the default resource limits are separate targets in
 # older releases only.
-target_link_libraries(issngpu PRIVATE glslang::glslang)
+target_link_libraries(issngpu PRIVATE glslang::glslang ffx-vulkan::fsr4-v07-vulkan)
 foreach(glslang_part glslang::SPIRV glslang::glslang-default-resource-limits)
     if (TARGET ${glslang_part})
         target_link_libraries(issngpu PRIVATE ${glslang_part})

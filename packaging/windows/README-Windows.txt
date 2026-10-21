@@ -1,35 +1,41 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.2.1
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.0
 ======================================================
 
-A test build for a few testers: the game plays from the start, with stutter (shaders compiled as
-they are first used), about 40-45 FPS in the open city and 35-40 FPS in combat on an RX 9060 XT,
-and some flickering effects. Please report how far you get and what goes wrong (see Reporting
-problems).
+A test build: the game plays from the start, at about 90-105 FPS standing in the open city on a
+Ryzen 7 3700X + RX 9060 XT once its shaders are compiled. The first time each place or effect
+appears its shaders compile and the game stutters; that goes away as the cache fills. Please report
+how far you get and what goes wrong (see DLSS (optional, NVIDIA RTX)
+NVIDIA's files are not included (licence). Download Streamline SDK 2.14.16 from
+https://github.com/NVIDIA-RTX/Streamline/releases (exactly that version) and copy these five files
+from its bin\x64 folder (not development) into bin\dlss next to issn-probe.exe (launcher:
+Graphics > Open the DLSS folder): sl.interposer.dll, sl.common.dll, sl.dlss.dll, sl.pcl.dll,
+nvngx_dlss.dll. Then choose DLSS in Graphics > Anti-aliasing. Untested by us (no NVIDIA card):
+please report how it goes. Without the files the game keeps its own anti-aliasing.
 
-What's new in 0.2.0
-- Faster: the effects the game waits for (smoke, sparks, neon, bullets) are handled before the
-  rest of the frame (combat about 29 -> 39 FPS on an RX 9060 XT). Launcher: Performance >
-  inFAMOUS > "Effects work goes ahead of drawing"; switch it off if the game freezes.
-- New launcher look, with Effects (Full, Light, Off) and Draw distance in Performance > inFAMOUS.
-- "Save a bug report" (Advanced page): a zip on the desktop with the last log and your settings.
-- Game language: Portuguese (Brazil) and the other languages of the game; Automatic (default)
-  follows the launcher's language.
-- Controls: "Controller without touchpad" (Automatic, On, Off).
-- The launcher checks github.com/Liondarkz/issn_pc-releases for updates (from 0.2.1).
-- Faster in the open city (about 36 -> 39-41 FPS standing still on an RX 9060 XT): the thread
-  that feeds the graphics card no longer frees memory nor waits on a lock for every draw, and
-  the game's main thread no longer allocates several MB each frame.
-- Fixed: on AMD cards the first start with an empty shader cache could stop on a black window
-  (pipeline binary cache, now off by default; Performance > Shaders turns it back on).
-- The first start after updating compiles the shaders again (more stutter for a while).
+Reporting problems).
+
+What's new in 0.3.0
+- New graphics core: axylpup's shadPS4 build for this game (github.com/axylpup/shadPS4, release
+  1.0.2), about 2.5x the frame rate of 0.2 (city, standing: 38 -> 90-105 FPS on the tester's PC).
+- Anti-aliasing (launcher: Graphics > Anti-aliasing): the game's own, FSR 4 Native AA (included;
+  Radeon RX 7000 / 9000) or DLSS (NVIDIA RTX; NVIDIA's files are not included, the launcher shows
+  where they go and where to download them).
+- Frame rate limit and VSync from the launcher and the in-game menu (applied on restart);
+  Unlimited by default, the game keeps its speed at any frame rate.
+- Draw distance back to the game's own, with Long and Very long for less pop-in.
+- F12 saves a screenshot (user\screenshots); a loading screen while the shader cache loads.
+- New launcher: inFAMOUS look, the dump's art on the home page; "Add to Steam" closes and reopens
+  Steam by itself and makes inFAMOUS pictures.
 
 No game files are included. You need your own dump of inFAMOUS Second Son, made from your own
 copy of the game on your own PS4: CUSA00004 (Europe) or CUSA00223, base game version 01.00, as
 a folder that contains eboot.bin, sce_module and sce_sys. How to dump it: docs/issn/DUMP.md.
 
 Built on the God of War III Remastered port (gow3_pc, by Felipe Prado), which comes from
-bloodborne_pc (deadinside28, Supermedo). Graphics: the shadPS4 video core, with the inFAMOUS
-Second Son fixes of the shadPS4-AYOUB1080p build (Ayoub).
+bloodborne_pc (deadinside28, Supermedo). Graphics: axylpup's shadPS4 build for inFAMOUS Second Son
+(github.com/axylpup/shadPS4), from the shadPS4 video core, with earlier work by Ayoub
+(shadPS4-AYOUB1080p) and HayatoG (iss_pc). FSR 4: AMD FidelityFX (MIT). Launcher title face: Bebas
+Neue (SIL Open Font License).
 
 Requirements
 - Windows 10 (1903 or newer) or Windows 11, 64-bit.
@@ -52,7 +58,8 @@ Controller
   - Touchpad swipe (lift, push): hold Select/Back and push the right stick that way.
   - Two fingers on the touchpad (lifting the tree): hold Select/Back + RB (R1).
   - Touchpad click: Select/Back.
-- Text and voices are in English.
+- Text and voices: launcher > Game > Game language (Automatic follows the launcher: Portuguese
+  gives the Brazilian dub on the US release).
 
 Data
 - Saves, shader cache and the log: user\ next to inFAMOUS Second Son.exe.

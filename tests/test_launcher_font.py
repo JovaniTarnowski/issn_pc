@@ -82,11 +82,11 @@ class LatinHeadingsTest(unittest.TestCase):
             launcher.LANG = lang
             self.assertEqual(launcher.heading_font(12), ('Georgia', 12), lang)
 
-    def test_headings_lose_their_accents_in_the_loaded_font(self):
+    def test_headings_keep_their_accents_in_the_loaded_font(self):
+        # Bebas Neue has the accents of every Latin-script language the launcher speaks.
         launcher.LANG = 'pt'
-        self.assertEqual(launcher.heading_text('GRÁFICOS'), 'GRAFICOS')
-        self.assertEqual(launcher.heading_text('Avançado'), 'Avancado')
-        self.assertEqual(launcher.heading_text('Straße · Œuvre'), 'Strasse · OEuvre')
+        self.assertEqual(launcher.heading_text('GRÁFICOS'), 'GRÁFICOS')
+        self.assertEqual(launcher.heading_text('Avançado'), 'Avançado')
 
     def test_headings_keep_their_text_outside_the_font(self):
         launcher.LANG = 'ru'
@@ -100,7 +100,7 @@ class LatinHeadingsTest(unittest.TestCase):
         launcher.LANG = 'ru'
         for name in ('ГЕРОЙ ВОЙНЫ · ЁЖ', 'ゴッド・オブ・ウォーIII', '갓 오브 워 III'):
             self.assertEqual(launcher.heading_text(name, every_language=True), name)
-        self.assertEqual(launcher.heading_text('GRÁFICOS', every_language=True), 'GRAFICOS')
+        self.assertEqual(launcher.heading_text('GRÁFICOS', every_language=True), 'GRÁFICOS')
 
 
 if __name__ == '__main__':

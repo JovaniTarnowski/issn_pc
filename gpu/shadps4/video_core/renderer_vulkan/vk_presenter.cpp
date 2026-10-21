@@ -19,6 +19,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
 #include "issn_overlay.h"
+#include "issn_settings.h"
 #include "issn_png.h" // issn-axy: the port's menu / FPS counter instead of shadPS4's ImGui layers
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -1127,6 +1128,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         // issn-axy: no ImGui dock window - the game frame is blitted (letterboxed) straight into
         // the swapchain image, then the port's menu / FPS counter is drawn over it.
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
+        {
+            auto& settings = IssnSettings::Get(); // the in-game menu's Image > Information
+            settings.image_width = s32(frame->width);
+            settings.image_height = s32(frame->height);
+            settings.window_width = s32(extent.width);
+            settings.window_height = s32(extent.height);
+        }
         const vk::ImageSubresourceRange color_range{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .baseMipLevel = 0,

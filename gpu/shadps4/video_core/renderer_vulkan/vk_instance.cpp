@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/issn_fsr4.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -374,6 +375,17 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    // issn-axy: ISSN_FSR4 (issn_fsr4.h) - the v07 INT8 model needs linear compute derivatives.
+    bool fsr4_derivatives = false;
+    if (Fsr4Aa::Wanted()) {
+        const auto derivatives =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>()
+                .get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+        fsr4_derivatives = derivatives.computeDerivativeGroupLinear &&
+                           add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (const char* fault = std::getenv("SHADPS4_DEVICE_FAULT"); fault && fault[0] == '1') {
         device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -614,6 +626,7 @@ bool Instance::CreateDevice() {
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = Fsr4Aa::Wanted() && vk13_features.shaderIntegerDotProduct,
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -761,6 +774,19 @@ bool Instance::CreateDevice() {
         fault_features.pNext = const_cast<void*>(device_ci.pNext);
         device_ci.pNext = &fault_features;
     }
+    // issn-axy: ISSN_FSR4, the same splice.
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivative_features = {
+        .computeDerivativeGroupLinear = true,
+    };
+    if (fsr4_derivatives) {
+        auto& device_ci = device_chain.get<vk::DeviceCreateInfo>();
+        derivative_features.pNext = const_cast<void*>(device_ci.pNext);
+        device_ci.pNext = &derivative_features;
+    }
+    const bool fsr4_ok = fsr4_derivatives && vk12_features.shaderFloat16 &&
+                         vk12_features.shaderInt8 && features.shaderInt16 &&
+                         vk13_features.shaderIntegerDotProduct &&
+                         features.shaderStorageImageExtendedFormats;
     // SHADPS4_ADDR_BIND_REPORT: the same splice.
     vk::PhysicalDeviceAddressBindingReportFeaturesEXT bind_report_features = {
         .reportAddressBinding = true,
@@ -872,6 +898,15 @@ bool Instance::CreateDevice() {
     present_queue = device->getQueue(queue_family_index, 0);
     if (dlss_device || Dlss::Mode() == 2) {
         Dlss::DeviceCreated(*instance, physical_device, *device, queue_family_index, 0);
+    }
+    if (Dlss::Mode() == 3) {
+        // ISSN_FSR4: the T2x resolve is replaced once the device can run the model.
+        Fsr4Aa::SetDeviceSupported(fsr4_ok);
+        Dlss::g_ready.store(fsr4_ok, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "FSR 4: {}", fsr4_ok ? "device ready (Native AA in place of the "
+                                                       "game's T2x)"
+                                                     : "the GPU lacks INT8 dot products / compute "
+                                                       "derivatives - the game's AA stays");
     }
     if (dlss_device && Dlss::g_ready.load(std::memory_order_relaxed)) {
         Dlss5::DeviceCreated(*instance, physical_device, *device);
