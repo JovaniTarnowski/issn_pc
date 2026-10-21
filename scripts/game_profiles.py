@@ -247,6 +247,10 @@ for _title in INFAMOUS_SECOND_SON:
     PROFILES[_title].update(AXY_RELEASE_FLAGS)
     # axylpup's per-game config (custom_configs/CUSA00004.json): direct memory access on.
     PROFILES[_title]['ISSN_DIRECT_MEMORY_ACCESS'] = '1'
+    # ... and no readback of linear images (run.py's default, from God of War III): with it the
+    # GPU command thread spent half its time downloading render targets behind a full GPU wait
+    # (tester, city idle: 55-60 FPS, back never idle).
+    PROFILES[_title]['ISSN_READBACK_LINEAR'] = '0'
 PROFILES['CUSA00004']['ISSN_WATCHDOG_PEEK'] = '0x11c0380,0x4ec7310'
 # The US release has the Brazilian Portuguese dub and text (lang_brazilian_*): the tester's
 # choice. ISSN_LANGUAGE=1 gives English.
