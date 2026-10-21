@@ -67,14 +67,6 @@ std::string g_game_serial;
 namespace Common {
 extern const char g_scm_desc[];
 const char g_scm_desc[] = "issn_pc (axylpup second-son 2212a345)";
-bool FlushProcessWriteBuffersAll() {
-#ifdef _WIN32
-    FlushProcessWriteBuffers();
-    return true;
-#else
-    return false;
-#endif
-}
 } // namespace Common
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
