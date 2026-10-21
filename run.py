@@ -256,11 +256,9 @@ def main():
         except (ImportError, OSError):
             pass
         # The temporal upscalers and motion vectors are not calibrated for this game yet: they stay
-        # off unless the launcher's experimental switch is on (then issn.ini decides); linear
-        # image readbacks fix its corrupted textures.
+        # off unless the launcher's experimental switch is on (then issn.ini decides).
         if env.get('ISSN_EXPERIMENTAL_UPSCALER') != '1':
             env.setdefault('ISSN_UPSCALER', 'none')
-        env.setdefault('ISSN_READBACK_LINEAR', '1')
         if profile:
             names = selected_patches(profile[1], profile[2], env.get('ISSN_PATCHES', ''), env.get('ISSN_PATCHES_ONLY') == '1')
             # issn.ini decides the resolution and frame rate patches (in-game menu, launcher); their
@@ -284,9 +282,7 @@ def main():
                 if value and key not in env:
                     env[key] = str(value)
                     derived.append(key)
-        if 'ISSN_VBLANK_HZ' not in env:
-            env['ISSN_VBLANK_HZ'] = '60'
-            derived.append('ISSN_VBLANK_HZ')
+        # issn-axy: without ISSN_VBLANK_HZ the GPU library takes the frame rate limit from issn.ini.
         # Without the frame rate patch the engine steps 1/60 s per frame: the present thread must
         # not flip faster (issn_graphics.h PresentLimit), or the game speeds up.
         env['ISSN_ENGINE_FPS'] = str(engine_fps)

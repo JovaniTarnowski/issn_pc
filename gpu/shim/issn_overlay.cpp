@@ -26,6 +26,7 @@ extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture (save pictures)
 #include "imgui_impl_vulkan.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -765,8 +766,7 @@ void LoadingScreen() {
     ImGui::SetWindowFontScale(1.0f);
     if (total) {
         char count[64];
-        std::snprintf(count, sizeof(count), "%u / %u (%u%%)", done, total,
-                      u32(u64(done) * 100 / total));
+        std::snprintf(count, sizeof(count), "%u%%", u32(u64(done) * 100 / total));
         ImGui::ProgressBar(float(done) / float(total), ImVec2(-1.0f, 0.0f), count);
     }
     ImGui::TextDisabled("The first start after an update takes longer.");
@@ -975,6 +975,11 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
+        if (down && !event.key.repeat && event.key.key == SDLK_F12) {
+            // issn-axy: screenshot of the game picture (user/screenshots, PNG).
+            VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+            return true;
+        }
         if (down && !event.key.repeat &&
             (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);

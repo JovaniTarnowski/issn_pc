@@ -18,7 +18,8 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
-#include "issn_overlay.h" // issn-axy: the port's menu / FPS counter instead of shadPS4's ImGui layers
+#include "issn_overlay.h"
+#include "issn_png.h" // issn-axy: the port's menu / FPS counter instead of shadPS4's ImGui layers
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
@@ -406,13 +407,16 @@ static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vect
 
 static bool WritePng(const std::filesystem::path& path, const std::span<const u8> rgba,
                      const u32 width, const u32 height) {
-    // issn-axy: the port links no libpng; screenshots are not written.
-    (void)path;
-    (void)rgba;
-    (void)width;
-    (void)height;
-    LOG_WARNING(Render_Vulkan, "Screenshots are not supported by the port");
-    return false;
+    // issn-axy: stb_image_write instead of libpng (the port links no libpng).
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const auto data = IssnEncodePng(rgba.data(), static_cast<int>(width), static_cast<int>(height));
+    if (data.empty()) {
+        return false;
+    }
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return out.good();
 }
 
 static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readbacks) {
@@ -502,6 +506,9 @@ void Presenter::DrawBootScreen(std::string_view headline, std::string_view detai
     (void)headline;
     (void)detail;
     (void)one_time;
+    // The rasterizer (and its warm-up) is built before the presenter's body runs: the menu's
+    // ImGui context comes up here on the first boot frame.
+    IssnOverlay::Init(instance, swapchain.GetSurfaceFormat().format, swapchain.GetImageCount());
     IssnOverlay::SetLoading(true, static_cast<u32>(std::clamp(fraction, 0.0f, 1.0f) * 1000.0f), 1000);
 
     auto& scheduler = present_scheduler;
@@ -514,17 +521,33 @@ void Presenter::DrawBootScreen(std::string_view headline, std::string_view detai
         .baseArrayLayer = 0,
         .layerCount = VK_REMAINING_ARRAY_LAYERS,
     };
-    const vk::ImageMemoryBarrier to_attachment{
+    // issn-axy: a black picture under the loading screen (the overlay loads, never clears).
+    const vk::ImageMemoryBarrier to_transfer{
         .srcAccessMask = vk::AccessFlagBits::eNone,
-        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swapchain.Image(),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+                           vk::DependencyFlagBits::eByRegion, {}, {}, to_transfer);
+    const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+    cmdbuf.clearColorImage(swapchain.Image(), vk::ImageLayout::eTransferDstOptimal, black, range);
+    const vk::ImageMemoryBarrier to_attachment{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead |
+                         vk::AccessFlagBits::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
         .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = swapchain.Image(),
         .subresourceRange = range,
     };
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                            vk::PipelineStageFlagBits::eColorAttachmentOutput,
                            vk::DependencyFlagBits::eByRegion, {}, {}, to_attachment);
     IssnOverlay::Render(cmdbuf, swapchain.ImageView(), swapchain.GetExtent());
@@ -600,6 +623,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     IssnOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
+    IssnOverlay::SetLoading(false, 0, 0); // the warm-up's boot screen (if any) is over
 }
 
 Presenter::~Presenter() {

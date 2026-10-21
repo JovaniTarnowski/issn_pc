@@ -13,8 +13,9 @@ INFAMOUS_SECOND_SON = ('CUSA00004', 'CUSA00223')
 
 # issn-axy: the GPU core of axylpup's inFAMOUS Second Son build (github.com/axylpup/shadPS4,
 # second-son 2212a345 = release v1.0.2), with the switches of its release (shadps4-flags.txt).
-# Left out: what lives outside the vendored core (DLSS, mouse aim, button-icon textures, the pad,
-# save dialog, video decoder and kernel mutex parts, its shader-cache name, its boot screen).
+# Left out: what lives outside the vendored core (mouse aim, button-icon textures, the pad, save
+# dialog, video decoder and kernel mutex parts, its shader-cache name); DLSS is the launcher's
+# switch (NVIDIA only). The boot screen is the port's loading screen (presenter).
 AXY_RELEASE_FLAGS = {
     'SHADPS4_A2': '1',
     'SHADPS4_A2_INDIRECT': '1',
@@ -32,6 +33,7 @@ AXY_RELEASE_FLAGS = {
     'SHADPS4_ASYNC_SUBMIT': '1',
     'SHADPS4_ASYNC_UPLOAD_RECORD': '1',
     'SHADPS4_BACK_CLEAN': '1',
+    'SHADPS4_BOOT_SCREEN': '1',
     'SHADPS4_BIG_GROW': '1',
     'SHADPS4_BUFFER_RANGES_LOCK': '2',
     'SHADPS4_BUFFER_SAMPLE': '0',
@@ -190,50 +192,12 @@ AXY_RELEASE_FLAGS = {
 PROFILES = {
     title: {
         # Precise GPU readbacks: the game reads GPU particle results back (the smoke to drain,
-        # drones); without them those effects are missing. The deferred and eager copies keep
-        # the waits short (HayatoG's iss_pc defaults; his eager read-ahead made smoke flicker).
+        # drones); without them those effects are missing (axylpup's config: readbacks_mode 2).
         'ISSN_READBACKS': '2',
-        # Buffer-store barriers in uniform loops of workgroups wider than a GCN wave (AYOUB1080p).
-        'ISSN_WAVE_MEMORY_BARRIERS': '1',
-        'ISSN_DEFERRED_READBACK': '1',
-        # The game's memcpy/memset into GPU-modified memory without a fault or GPU wait (iss_pc).
-        'ISSN_WRITE_MERGE': '1',
-        # Eager read-ahead: the GPU results the game reads back are copied at each fence. Halved
-        # the guest's readback waits in a four-enemy fight; flicker only on the boot loading
-        # screen on the tester's RX 9060 XT (HayatoG turned it off for smoke flicker).
-        'ISSN_EAGER_READBACK': '1',
-        # The compute queues the main thread waits on (~30 fences a frame): register writes and
-        # dispatches no longer drain the draw pipe, and the graphics stream steps aside every 8
-        # packets while compute work is queued (ISSN_LATENCY: 4.7 ms per fence before). Combat
-        # median 29 -> 33 FPS (every 32 packets), 39 (every 8) on the tester's RX 9060 XT, no
-        # effect lost.
-        'ISSN_COMPUTE_PIPELINE': '1',
-        'ISSN_COMPUTE_PRIORITY': '1',
-        # Saving pipeline binaries (VK_KHR_pipeline_binary) for pipelines compiled into an empty
-        # shader cache crashed AMD's Windows driver (amdvlk64.dll) at the first boot after the
-        # cache was rebuilt (tester, RX 9060 XT); loading saved ones worked. Off until found.
-        'ISSN_PIPELINE_BINARIES': '0',
-        # Smaller batches reach the GPU sooner: what the game reads back waits less for it.
-        # Combat (tester, RX 9060 XT): 1024 (default) median 30.6 / mean 29.1 FPS, 256 31.8 /
-        # 32.4; compute fence 3.8 -> 3.1 ms, graphics fence 16.4 -> 12.3 ms.
-        'ISSN_SUBMIT_DRAWS': '256',
-        # The GPU command thread no longer frees the draw-preparation submissions (~18% of it) nor
-        # takes the memory table lock for each constant copy (~7%): standing in the city its idle
-        # time went 12% -> 22%, 36 -> 38.9 FPS and steadier (tester, RX 9060 XT).
-        'ISSN_ASYNC_FREE': '1',
-        'ISSN_LOCKFREE_READ': '1',
-        # Draw-preparation submissions reused instead of allocated and zeroed on the game's main
-        # thread each frame: standing in the city 37.0 -> 38.4 FPS (41 at times).
-        'ISSN_RECYCLE_PREP': '1',
         # Draw distance (HayatoG's recommended setup, 1.07 only: src/view_hook.h): a shorter LOD
-        # distance means far fewer draws in the open city, the bottleneck here.
+        # distance means fewer draws in the open city (launcher: Draw distance).
         'ISSN_LOD_SCALE': '0.6',
         'ISSN_REGION_FADE': '0.8',
-        # AMD: maximal reconvergence is suspected of keeping the game from starting (RX 7600).
-        'ISSN_BP06': '0',
-        # ISSN_FULL_BARRIERS=1 is no longer needed: the black 64x64 tiles stay away without it
-        # since the vertex/index/indirect buffer barriers (BP10, HayatoG's core); off, the FPS
-        # roughly doubles in the city (tester, RX 9060 XT).
         # The game reads rdtsc itself and scales it by sceKernelGetTscFrequency: the host's TSC
         # and frequency, or it runs several times too fast (runtime_kernel.c).
         'ISSN_TSC': 'host',

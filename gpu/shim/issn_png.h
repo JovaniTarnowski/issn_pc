@@ -18,4 +18,11 @@ bool DecodeRgba(const unsigned char* data, size_t size, Image& out);
 /// Reads the file and decodes it; false when it is missing or bad.
 bool LoadRgba(const char* path, Image& out);
 
+/// issn-axy: RGBA8 rows (top to bottom) as a PNG file's bytes (stb_image_write); empty on failure.
+std::vector<unsigned char> EncodeRgba(const unsigned char* rgba, int width, int height);
+
 } // namespace IssnPng
+
+inline std::vector<unsigned char> IssnEncodePng(const unsigned char* rgba, int width, int height) {
+    return IssnPng::EncodeRgba(rgba, width, height);
+}

@@ -16,13 +16,16 @@ def game(root, title):
 
 
 class GameProfileTests(unittest.TestCase):
-    def test_second_son_gets_wave_barriers(self):
+    def test_second_son_gets_axylpup_core_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             for title in ('CUSA00004', 'CUSA00223'):
                 found, env = game_profiles.environment(game(tmp, title), {})
                 self.assertEqual(found, title)
                 self.assertEqual(env['ISSN_READBACKS'], '2')
-                self.assertEqual(env['ISSN_COMPUTE_PRIORITY'], '1')
+                # axylpup's release switches and per-game config (gpu/VENDOR.txt).
+                self.assertEqual(env['SHADPS4_CP_SPLIT'], '2')
+                self.assertEqual(env['ISSN_READBACK_LINEAR'], '0')
+                self.assertNotIn('SHADPS4_DLSS', env)
                 # The fence addresses are the EU 01.00 eboot's.
                 self.assertEqual('ISSN_WATCHDOG_PEEK' in env, title == 'CUSA00004')
 

@@ -277,6 +277,13 @@ std::condition_variable g_window_cv;
 bool g_window_ready;
 } // namespace
 
+bool IssnVsync() {
+    return IssnSettings::Get().vsync.load();
+}
+int IssnFpsLimit() {
+    return IssnSettings::Get().fps_limit.load();
+}
+
 u32 IssnDisplayRefreshHz() {
     static const u32 hz = [] {
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
@@ -450,10 +457,18 @@ void TriggerCapture() {}
 void OnFrameBoundary() {}
 void SetOutputDir(const std::filesystem::path&, const std::string&) {}
 bool IsRenderDocLoaded() { return false; }
-void RequestScreenshot(ScreenshotRequest) {}
-u32 ConsumeGameOnlyScreenshotRequests() { return 0; }
-u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
-ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
+// issn-axy: F12 (in-game menu's key handler) asks for a game-only screenshot; the presenter
+// writes it as PNG into user/screenshots.
+static std::atomic<u32> g_shots_game{0}, g_shots_overlay{0};
+void RequestScreenshot(ScreenshotRequest request) {
+    if (request == ScreenshotRequest::GameOnly) g_shots_game.fetch_add(1);
+    else if (request == ScreenshotRequest::WithOverlays) g_shots_overlay.fetch_add(1);
+}
+u32 ConsumeGameOnlyScreenshotRequests() { return g_shots_game.exchange(0); }
+u32 ConsumeWithOverlaysScreenshotRequests() { return g_shots_overlay.exchange(0); }
+ScreenshotRequests ConsumeScreenshotRequests() {
+    return {ConsumeGameOnlyScreenshotRequests(), ConsumeWithOverlaysScreenshotRequests()};
+}
 } // namespace VideoCore
 
 extern "C" int issngpu_overlay_captures_input(void) {

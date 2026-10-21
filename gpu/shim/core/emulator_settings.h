@@ -7,6 +7,8 @@
 #include "common/types.h"
 
 u32 IssnDisplayRefreshHz(); // issngpu.cpp: primary display refresh rate, 60 when unknown
+bool IssnVsync();           // issngpu.cpp: issn.ini vsync
+int IssnFpsLimit();         // issngpu.cpp: issn.ini fps_limit (0 = unlimited)
 
 enum GpuReadbacksMode : int { Disabled, Relaxed, Precise };
 
@@ -24,28 +26,26 @@ public:
     s32 GetGpuId() { static const auto value = s32(Number("ISSN_GPU_ID", -1)); return value; }
     u32 GetInternalScreenWidth() { static const auto value = u32(Number("ISSN_INTERNAL_WIDTH", 1920)); return value; }
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("ISSN_INTERNAL_HEIGHT", 1080)); return value; }
-    std::string GetPresentMode() { const char* v = std::getenv("ISSN_PRESENT_MODE"); return v ? v : "Mailbox"; }
+    // issn-axy: ISSN_PRESENT_MODE wins; else the in-game menu's VSync (issn.ini, read at start):
+    // on = Fifo (the display's rate), off = Immediate (Mailbox is missing on AMD's Windows driver,
+    // and the core falls back from it to Fifo).
+    std::string GetPresentMode() {
+        if (const char* v = std::getenv("ISSN_PRESENT_MODE"); v && *v) return v;
+        return IssnVsync() ? "Fifo" : "Immediate";
+    }
     // port: Relaxed by default: without readbacks FaceGen reads stale GPU-written vertices
     // (vertex explosions); in the test scene it costs no measurable frame rate.
     u32 GetReadbacksMode() { static const auto value = u32(Number("ISSN_READBACKS", GpuReadbacksMode::Relaxed)); return value; }
-    // port: ISSN_VBLANK_HZ=0 (uncapped presets): vblank runs at 480 Hz so a finished frame is
-    // shown within ~2 ms instead of waiting for the next display-rate vblank (below the display
-    // rate frames alternated 10/20 ms at 100 Hz: judder), and GetFrameLimit() caps the rate at
-    // the display refresh, at most 120 (above ~120 FPS movement timing breaks: running slows).
-    // An explicit ISSN_VBLANK_HZ is used as given, without a limit (measurements).
+    // issn-axy: the guest flips at most once per vblank, so the vblank rate is the frame rate cap.
+    // ISSN_VBLANK_HZ (> 0) wins; else the menu's frame rate limit (issn.ini fps_limit: 30, 60, 120,
+    // 240; 0 = unlimited, 240 Hz as in axylpup's build). Second Son steps its simulation by the
+    // frame time, so it keeps its speed above 60 (tester: 100 FPS in the city).
     u32 GetVblankFrequency() {
         static const u32 value = [] {
-            const long hz = Number("ISSN_VBLANK_HZ", 60);
-            return hz > 0 ? u32(hz) : 480u;
-        }();
-        return value;
-    }
-    /// Frames per second the present thread lets through; 0 = no limit. ISSN_FPS_LIMIT overrides.
-    u32 GetFrameLimit() {
-        static const u32 value = [] {
-            const long limit = Number("ISSN_FPS_LIMIT", -1);
-            if (limit >= 0) return u32(limit);
-            return Number("ISSN_VBLANK_HZ", 60) > 0 ? 0u : std::min<u32>(IssnDisplayRefreshHz(), 120);
+            const long hz = Number("ISSN_VBLANK_HZ", 0);
+            if (hz > 0) return u32(std::max<long>(hz, 30));
+            const int limit = IssnFpsLimit();
+            return limit > 0 ? u32(std::max(limit, 30)) : 240u;
         }();
         return value;
     }
