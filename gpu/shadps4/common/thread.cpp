@@ -15,6 +15,7 @@
 
 
 #include "common/error.h"
+#include "issn_sampler.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "ntapi.h"
@@ -183,6 +184,7 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void SetCurrentThreadName(const char* name) {
     // port: guest thread names are kept by the C runtime.
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    IssnSampler::RegisterThisThread(name); // issn-axy: ISSN_SAMPLE=1 samples every named host thread
 }
 
 void SetThreadName(void* thread, const char* name) {

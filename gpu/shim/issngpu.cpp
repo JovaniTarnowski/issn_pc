@@ -335,6 +335,9 @@ extern "C" int issngpu_init(const IssnGpuConfig* config) {
     if (config->user_dir) setenv("ISSN_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    // issn-axy: axylpup's fault / frame report (FaultRate lines every 15 s at ISSN_GPU_LOG=info,
+    // and user/log/fault_rate_*.csv).
+    Common::FaultMonitor::Start();
     MemoryPatcher::g_eboot_address = static_cast<uintptr_t>(config->eboot_base);
     // The game-specific paths of the new core key on the EU serial; the US eboot's code is the
     // same (axylpup's seed stamp: one code hash for CUSA00004 and CUSA00223).
