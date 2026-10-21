@@ -2,17 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
-#include "video_core/host_shaders/color_to_ms_depth_fallback_frag.h"
 #include "video_core/host_shaders/color_to_ms_depth_frag.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/ms_image_blit_frag.h"
-#include "video_core/host_shaders/ms_image_blit_msaa_frag.h"
 
 namespace VideoCore {
 
@@ -97,16 +94,18 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     state.height = height;
     state.num_layers = 1;
     state.depth_stencil_attachment.image_view = depth_view;
-    state.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
+    state.depth_stencil_attachment.image_layout =
+        Vulkan::GuestLayout(vk::ImageLayout::eDepthAttachmentOptimal);
     state.depth_stencil_attachment.has_depth = true;
     state.depth_stencil_attachment.depth_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = color_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = Vulkan::GuestLayout(vk::ImageLayout::eShaderReadOnlyOptimal),
     };
     const vk::WriteDescriptorSet texture_write = {
         .dstSet = VK_NULL_HANDLE,
@@ -126,6 +125,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         it = --color_to_ms_depth_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    Vulkan::GraphicsBindTracker::Invalidate();
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -199,15 +199,17 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.num_layers = 1;
     state.num_color_attachments = 1;
     state.color_attachments[0].image_view = dst_view;
-    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    state.color_attachments[0].image_layout =
+        Vulkan::GuestLayout(vk::ImageLayout::eColorAttachmentOptimal);
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
         .imageView = src_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .imageLayout = Vulkan::GuestLayout(vk::ImageLayout::eShaderReadOnlyOptimal),
     };
     const vk::WriteDescriptorSet texture_write = {
         .dstSet = VK_NULL_HANDLE,
@@ -227,6 +229,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         it = --ms_image_copy_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    Vulkan::GraphicsBindTracker::Invalidate();
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -252,13 +255,14 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
 
 void BlitHelper::CreateShaders() {
     const auto device = instance.GetDevice();
-    fs_tri_vertex = Vulkan::CompileSPV(FS_TRI_VERT, device);
-    // port: ISSN_LIGHTING_TEST=msdepth selects the sample-fallback variant.
-    color_to_ms_depth_frag = Vulkan::LightingTest::Current().msdepth
-                                 ? Vulkan::CompileSPV(COLOR_TO_MS_DEPTH_FALLBACK_FRAG, device)
-                                 : Vulkan::CompileSPV(COLOR_TO_MS_DEPTH_FRAG, device);
-    src_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_MSAA_FRAG, device);
-    src_non_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_FRAG, device);
+    fs_tri_vertex =
+        Vulkan::Compile(HostShaders::FS_TRI_VERT, vk::ShaderStageFlagBits::eVertex, device);
+    color_to_ms_depth_frag = Vulkan::Compile(HostShaders::COLOR_TO_MS_DEPTH_FRAG,
+                                             vk::ShaderStageFlagBits::eFragment, device);
+    src_msaa_copy_frag = Vulkan::Compile(HostShaders::MS_IMAGE_BLIT_FRAG,
+                                         vk::ShaderStageFlagBits::eFragment, device, {"SRC_MSAA"});
+    src_non_msaa_copy_frag = Vulkan::Compile(HostShaders::MS_IMAGE_BLIT_FRAG,
+                                             vk::ShaderStageFlagBits::eFragment, device);
 }
 
 void BlitHelper::CreatePipelineLayouts() {

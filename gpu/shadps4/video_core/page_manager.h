@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
+#include <vector>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -13,10 +15,11 @@ namespace Vulkan {
 class Rasterizer;
 }
 
-namespace VideoCore {
+namespace Core {
+enum class MemoryPermission : u32;
+}
 
-struct UffdImpl;
-struct SignalImpl;
+namespace VideoCore {
 
 class PageManager {
     // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
@@ -38,13 +41,34 @@ public:
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
 
+    /// A CPU protection change the page manager does not own (guest mprotect, file-map
+    /// protects). Serialized with its own protects when SHADPS4_PAGE_OS_SHADOW is on.
+    void ExternalProtect(VAddr address, u64 size, Core::MemoryPermission perms) const;
+
     /// Updates watches in the pages touching the specified region.
-    template <bool track, bool is_read = false>
+    template <bool track>
     void UpdatePageWatchers(VAddr addr, u64 size) const;
 
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
+
+    /// Deferred write protection (SHADPS4_DEFERRED_PROTECT). While a sink is installed on the
+    /// calling thread, write-protect requests update watcher counts as usual but append the
+    /// affected ranges to the sink instead of calling the OS. ReconcileProtection later applies
+    /// each range's *current* watcher state under the same range locks every other protection
+    /// change takes, so it is order-independent with concurrent fault-handler unprotects.
+    struct ProtectRange {
+        VAddr addr;
+        u64 size;
+    };
+    static void SetDeferredProtectSink(std::vector<ProtectRange>* sink);
+    void ReconcileProtection(std::span<const ProtectRange> ranges) const;
+
+    /// SHADPS4_LEAN worker pre-check: true if any page of [addr, addr + size) is read-protected
+    /// (a read watcher). Lock-free, racy byte reads: a page protected right after this returns
+    /// faults, and the worker's fallback counts that.
+    [[nodiscard]] bool AnyReadProtected(VAddr addr, u64 size) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
@@ -57,8 +81,6 @@ public:
     }
 
 private:
-    friend struct UffdImpl;
-    friend struct SignalImpl;
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

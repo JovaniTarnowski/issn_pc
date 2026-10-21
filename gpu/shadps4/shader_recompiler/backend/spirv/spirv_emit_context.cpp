@@ -4,14 +4,13 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/native_emit.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
-#include "shader_recompiler/ir/attribute.h"
-#include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
-#include <spirv/unified1/spirv.hpp11>
 
 #include <numbers>
 #include <string_view>
@@ -19,21 +18,21 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 
-std::string_view StageName(HwStage stage) {
+std::string_view StageName(Stage stage) {
     switch (stage) {
-    case HwStage::Vertex:
+    case Stage::Vertex:
         return "vs";
-    case HwStage::Local:
+    case Stage::Local:
         return "ls";
-    case HwStage::Export:
+    case Stage::Export:
         return "es";
-    case HwStage::Hull:
+    case Stage::Hull:
         return "hs";
-    case HwStage::Geometry:
+    case Stage::Geometry:
         return "gs";
-    case HwStage::Fragment:
+    case Stage::Fragment:
         return "fs";
-    case HwStage::Compute:
+    case Stage::Compute:
         return "cs";
     }
     UNREACHABLE_MSG("Invalid hw stage {}", u32(stage));
@@ -61,7 +60,7 @@ static constexpr u32 NumVertices(AmdGpu::PrimitiveType type) {
 
 template <typename... Args>
 void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... args) {
-    ctx.Name(object, fmt::format(fmt::runtime(format_str), StageName(ctx.hw_stage),
+    ctx.Name(object, fmt::format(fmt::runtime(format_str), StageName(ctx.stage),
                                  std::forward<Args>(args)...)
                          .c_str());
 }
@@ -71,8 +70,23 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
-      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || VertexMotion()) {
+      profile{profile_}, stage{info.stage}, l_stage{info.l_stage}, binding{binding_} {
+    native = Shader::t_native_emit.active &&
+             (info.l_stage == LogicalStage::Vertex ||
+              (Shader::t_native_emit.colour && info.l_stage == LogicalStage::Fragment));
+    native_colour = native && Shader::t_native_emit.colour;
+    native_pull = native && Shader::t_native_emit.pull && info.l_stage == LogicalStage::Vertex;
+    native_ring = native && Shader::t_native_emit.ring;
+    native_bindless = native_colour && Shader::t_native_emit.bindless &&
+                      (info.l_stage == LogicalStage::Fragment ||
+                       (info.l_stage == LogicalStage::Vertex && Shader::t_native_emit.bindless_vs));
+    bindless_smp_base =
+        info.l_stage == LogicalStage::Vertex ? Shader::t_native_emit.vs_smp_base : 0u; // q3
+    native_pt = native_ring && Shader::t_native_emit.pt;
+    native_pt_compare = native_pt && Shader::t_native_emit.pt_compare;
+    native_seg = native_pt && Shader::t_native_emit.seg;
+    native_seg_compare = native_seg && Shader::t_native_emit.seg_compare;
+    if (info.uses_dma || native_pt) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -92,7 +106,7 @@ EmitContext::~EmitContext() = default;
 
 Id EmitContext::Def(const IR::Value& value) {
     if (!value.IsImmediate()) {
-        return value.Inst()->Definition<Id>();
+        return value.InstRecursive()->Definition<Id>();
     }
     switch (value.Type()) {
     case IR::Type::Void:
@@ -172,8 +186,11 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_fp64) {
         frexp_result_f64 = Name(TypeStruct(F64[1], S32[1]), "frexp_result_f64");
     }
-    if (info.uses_dma) {
+    if (info.uses_dma || native_pt) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
+    }
+    if (native_pt) {
+        physical_pointer_type_u64 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U64);
     }
 }
 
@@ -233,7 +250,47 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
-    if (!profile.needs_buffer_offsets) {
+    if (native) {
+        Id draw;
+        if (l_stage == LogicalStage::Fragment) {
+            draw = OpLoad(U32[1], native_draw_in);
+        } else {
+            draw = OpLoad(U32[1], draw_index);
+            if (native_colour) {
+                OpStore(native_draw_out, draw);
+            }
+        }
+        if (native_seg) {
+            // SHADPS4_NATIVE_SEG: the record by pointer; the SSBO index below only for =2.
+            NativeSegRecordPointer(draw);
+        }
+        if (native_ring && (!native_seg || native_seg_compare)) {
+            // SHADPS4_NATIVE_GPU_DIRECT: entry (first + draw) & mask of the records buffer.
+            draw = OpBitwiseAnd(U32[1],
+                                OpIAdd(U32[1], NativeTableLoad(Shader::NativeTableFirst), draw),
+                                NativeTableLoad(Shader::NativeTableMask));
+        }
+        native_rec_base = OpIMul(U32[1], draw, ConstU32(Shader::NativeRecordDwords));
+        Name(native_rec_base, "native_rec_base");
+        native_draw = draw;
+        if (native_pull && Shader::t_native_emit.compare) {
+            const Id vindex{OpLoad(U32[1], vertex_index)};
+            for (u32 loc = 0; loc < IR::NumParams; ++loc) {
+                if (Shader::t_native_emit.attrs[loc].valid) {
+                    NativeCompareAttribute(loc, vindex, draw);
+                }
+            }
+        } else if (native_pull) {
+            const Id vindex{OpLoad(U32[1], vertex_index)};
+            for (u32 loc = 0; loc < IR::NumParams; ++loc) {
+                if (Shader::t_native_emit.attrs[loc].valid &&
+                    !((Shader::t_native_emit.keep_inputs >> loc) & 1)) {
+                    native_attr_value[loc] = NativePullAttribute(loc, vindex);
+                }
+            }
+        }
+    }
+    if (!profile.needs_buffer_offsets && !native) {
         return;
     }
     for (u32 i = 0; i < buffers.size(); i++) {
@@ -244,14 +301,40 @@ void EmitContext::DefineBufferProperties() {
             continue;
         }
 
-        const u32 half = PushData::BufOffsetIndex + (binding >> 4);
-        const u32 comp = (binding & 0xf) >> 2;
-        const u32 offset = (binding & 0x3) << 3;
-        const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
-                                   push_data_block, ConstU32(half), ConstU32(comp))};
-        const Id value{OpLoad(U32[1], ptr)};
-
-        const Id buf_offset{OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U))};
+        Id buf_offset;
+        if (native) {
+            // The full byte offset of this draw's binding inside the bound VkBuffer.
+            const Id rec_word{NativeRecordLoad(Shader::NativeRecordOffOffset + binding)};
+            buf_offset = rec_word;
+            native_size_bytes[i] = NativeRecordLoad(Shader::NativeRecordSizeOffset + binding);
+            if (native_ring) {
+                // The record holds the guest address (low 32 bits); the table the buffer's base.
+                buf_offset = OpISub(U32[1], buf_offset,
+                                    NativeTableLoad(Shader::NativeTableBase + binding));
+                // Coverage (sec. 11): an inherited binding's size comes from the table.
+                const Id word{NativeTableLoad(Shader::NativeTableInhSlots + binding / 32)};
+                const Id bit{OpBitwiseAnd(
+                    U32[1], OpShiftRightLogical(U32[1], word, ConstU32(binding % 32)),
+                    ConstU32(1u))};
+                const Id inherited{OpINotEqual(U1[1], bit, u32_zero_value)};
+                native_size_bytes[i] =
+                    OpSelect(U32[1], inherited,
+                             NativeTableLoad(Shader::NativeTableSize + binding),
+                             native_size_bytes[i]);
+                if (native_pt) {
+                    NativePtTranslate(i, binding, rec_word, inherited);
+                }
+            }
+            native_size_dw[i] = OpShiftRightLogical(U32[1], native_size_bytes[i], ConstU32(2U));
+        } else {
+            const u32 half = PushData::BufOffsetIndex + (binding >> 4);
+            const u32 comp = (binding & 0xf) >> 2;
+            const u32 offset = (binding & 0x3) << 3;
+            const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                       push_data_block, ConstU32(half), ConstU32(comp))};
+            const Id value{OpLoad(U32[1], ptr)};
+            buf_offset = OpBitFieldUExtract(U32[1], value, ConstU32(offset), ConstU32(8U));
+        }
         Name(buf_offset, fmt::format("buf{}_off", binding));
         buffer.Offset(PointerSize::B8) = buf_offset;
 
@@ -277,8 +360,8 @@ void EmitContext::DefineAmdPerVertexAttribs() {
     if (!profile.supports_amd_shader_explicit_vertex_parameter) {
         return;
     }
-    for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
-        const auto& input = runtime_info.hw.fs.inputs[i];
+    for (s32 i = 0; i < runtime_info.fs_info.num_inputs; i++) {
+        const auto& input = runtime_info.fs_info.inputs[i];
         if (input.IsDefault() || info.fs_interpolation[i].primary != Qualifier::PerVertex) {
             continue;
         }
@@ -312,27 +395,16 @@ void EmitContext::DefineInputs() {
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
-        if (sw_stage != SwStage::Vertex) {
-            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
-        }
+        Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
     }
-    if (info.loads.GetAny(IR::Attribute::SubgroupLtMask)) {
-        subgroup_lt_mask =
-            DefineVariable(U32[4], spv::BuiltIn::SubgroupLtMask, spv::StorageClass::Input);
-        Decorate(subgroup_lt_mask, spv::Decoration::Flat);
-    }
-    switch (sw_stage) {
-    case SwStage::Vertex: {
+    switch (l_stage) {
+    case LogicalStage::Vertex: {
         vertex_index = DefineVariable(U32[1], spv::BuiltIn::VertexIndex, spv::StorageClass::Input);
+        base_vertex = DefineVariable(U32[1], spv::BuiltIn::BaseVertex, spv::StorageClass::Input);
+        if (native) {
+            draw_index = DefineVariable(U32[1], spv::BuiltIn::DrawIndex, spv::StorageClass::Input);
+        }
         instance_id = DefineVariable(U32[1], spv::BuiltIn::InstanceIndex, spv::StorageClass::Input);
-        if (info.loads.Get(IR::Attribute::BaseVertex)) {
-            base_vertex =
-                DefineVariable(U32[1], spv::BuiltIn::BaseVertex, spv::StorageClass::Input);
-        }
-        if (info.loads.Get(IR::Attribute::BaseInstance)) {
-            base_instance =
-                DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
-        }
 
         const auto fetch_shader = Gcn::ParseFetchShader(info);
         if (!fetch_shader) {
@@ -341,6 +413,14 @@ void EmitContext::DefineInputs() {
         for (const auto& attrib : fetch_shader->attributes) {
             ASSERT(attrib.semantic < IR::NumParams);
             const auto sharp = attrib.GetSharp(info);
+            if (native_pull && !((Shader::t_native_emit.keep_inputs >> attrib.semantic) & 1)) {
+                // SHADPS4_NATIVE_COLOUR: no vertex input; NativePullAttribute loads it.
+                ASSERT_MSG(Shader::t_native_emit.attrs[attrib.semantic].valid,
+                           "native pull: attribute {} has no format", attrib.semantic);
+                input_params[attrib.semantic] =
+                    GetAttributeInfo(sharp.GetNumberFmt(), Id{}, 4, false);
+                continue;
+            }
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, attrib.semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
@@ -352,10 +432,13 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::Fragment: {
-        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
-            (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
-             !profile.supports_amd_shader_explicit_vertex_parameter)) {
+    case LogicalStage::Fragment: {
+        if (native_colour) {
+            native_draw_in = DefineInput(U32[1], Shader::t_native_emit.draw_location);
+            Decorate(native_draw_in, spv::Decoration::Flat);
+            Name(native_draw_in, "native_draw_in");
+        }
+        if (info.loads.GetAny(IR::Attribute::FragCoord)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
         }
         if (info.loads.Get(IR::Attribute::IsFrontFace)) {
@@ -370,29 +453,12 @@ void EmitContext::DefineInputs() {
             sample_index = DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
             Decorate(sample_index, spv::Decoration::Flat);
         }
-        if (info.loads.Get(IR::Attribute::IsHelperInvocation)) {
-            helper_invocation =
-                DefineVariable(U1[1], spv::BuiltIn::HelperInvocation, spv::StorageClass::Input);
-        }
-        if (info.loads.Get(IR::Attribute::SampleMask)) {
-            sample_mask_in = DefineVariable(TypeArray(U32[1], u32_one_value),
-                                            spv::BuiltIn::SampleMask, spv::StorageClass::Input);
-        }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmooth)) {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth = DefineVariable(F32[2], spv::BuiltIn::BaryCoordSmoothAMD,
                                                    spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
-                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
-            }
-        }
-        if (info.loads.GetAny(IR::Attribute::BaryCoordPullModel)) {
-            if (profile.supports_amd_shader_explicit_vertex_parameter) {
-                bary_coord_pull_model = DefineVariable(F32[3], spv::BuiltIn::BaryCoordPullModelAMD,
-                                                       spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
+            } else if (profile.supports_fragment_shader_barycentric) {
+                bary_coord_smooth =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
             }
         }
@@ -400,9 +466,10 @@ void EmitContext::DefineInputs() {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_centroid = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothCentroidAMD, spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
+            } else if (profile.supports_fragment_shader_barycentric) {
+                bary_coord_smooth_centroid =
                     DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                // Decorate(bary_coord_smooth_centroid, spv::Decoration::Centroid);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
@@ -410,16 +477,9 @@ void EmitContext::DefineInputs() {
                 bary_coord_smooth_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
-                if (!ValidId(bary_coord)) {
-                    bary_coord = DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR,
-                                                spv::StorageClass::Input);
-                }
-                // we would need sample_index to interpolate the bary_coord later
-                if (!ValidId(sample_index)) {
-                    sample_index =
-                        DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
-                    Decorate(sample_index, spv::Decoration::Flat);
-                }
+                bary_coord_smooth_sample =
+                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                // Decorate(bary_coord_smooth_sample, spv::Decoration::Sample);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPersp)) {
@@ -442,12 +502,13 @@ void EmitContext::DefineInputs() {
             }
         }
 
-        const bool has_clip_distance_inputs = runtime_info.hw.fs.clip_distance_emulation;
+        const bool has_clip_distance_inputs = runtime_info.fs_info.clip_distance_emulation;
         // Clip distances attribute vector is the last in inputs array
-        const auto num_inputs = runtime_info.hw.fs.num_inputs - (has_clip_distance_inputs ? 1 : 0);
+        const auto num_inputs =
+            runtime_info.fs_info.num_inputs - (has_clip_distance_inputs ? 1 : 0);
 
         for (s32 i = 0; i < num_inputs; i++) {
-            const auto& input = runtime_info.hw.fs.inputs[i];
+            const auto& input = runtime_info.fs_info.inputs[i];
             if (input.IsDefault()) {
                 continue;
             }
@@ -488,7 +549,7 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::Compute:
+    case LogicalStage::Compute:
         if (info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
             info.loads.GetAny(IR::Attribute::WorkgroupId)) {
             workgroup_id =
@@ -502,12 +563,8 @@ void EmitContext::DefineInputs() {
             local_invocation_id =
                 DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId, spv::StorageClass::Input);
         }
-        if (info.loads.Get(IR::Attribute::LocalInvocationIndex)) {
-            local_invocation_index = DefineVariable(U32[1], spv::BuiltIn::LocalInvocationIndex,
-                                                    spv::StorageClass::Input);
-        }
         break;
-    case SwStage::Geometry: {
+    case LogicalStage::Geometry: {
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
         const auto gl_per_vertex =
             Name(TypeStruct(F32[4], F32[1], TypeArray(F32[1], ConstU32(1u))), "gl_PerVertex");
@@ -521,12 +578,12 @@ void EmitContext::DefineInputs() {
         MemberDecorate(gl_per_vertex, 2, spv::Decoration::BuiltIn,
                        static_cast<u32>(spv::BuiltIn::ClipDistance));
         Decorate(gl_per_vertex, spv::Decoration::Block);
-        const auto num_verts_in = NumVertices(runtime_info.hw.gs.in_primitive);
+        const auto num_verts_in = NumVertices(runtime_info.gs_info.in_primitive);
         const auto vertices_in = TypeArray(gl_per_vertex, ConstU32(num_verts_in));
         gl_in = Name(DefineVar(vertices_in, spv::StorageClass::Input), "gl_in");
         interfaces.push_back(gl_in);
 
-        const auto num_params = runtime_info.hw.gs.in_vertex_data_size / 4 - 1u;
+        const auto num_params = runtime_info.gs_info.in_vertex_data_size / 4 - 1u;
         for (int param_id = 0; param_id < num_params; ++param_id) {
             const Id type{TypeArray(F32[4], ConstU32(num_verts_in))};
             const Id id{DefineInput(type, param_id)};
@@ -536,14 +593,14 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::TessellationControl: {
+    case LogicalStage::TessellationControl: {
         invocation_id =
             DefineVariable(U32[1], spv::BuiltIn::InvocationId, spv::StorageClass::Input);
         patch_vertices =
             DefineVariable(U32[1], spv::BuiltIn::PatchVertices, spv::StorageClass::Input);
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
 
-        const u32 num_attrs = Common::AlignUp(runtime_info.sw.tcs.ls_stride, 16) >> 4;
+        const u32 num_attrs = Common::AlignUp(runtime_info.hs_info.ls_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
             // The input vertex count isn't statically known, so make length 32 (what
@@ -554,11 +611,12 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case SwStage::TessellationEval: {
+    case LogicalStage::TessellationEval: {
         tess_coord = DefineInput(F32[3], std::nullopt, spv::BuiltIn::TessCoord);
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
 
-        const u32 num_attrs = Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
+        const u32 num_attrs =
+            Common::AlignUp(runtime_info.hs_es_vs_info.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
             // The input vertex count isn't statically known, so make length 32 (what
@@ -589,8 +647,8 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
-    const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
-                                               hw_stage == HwStage::Vertex &&
+    const bool needs_clip_distance_emulation = l_stage == LogicalStage::Vertex &&
+                                               stage == Stage::Vertex &&
                                                profile.needs_clip_distance_emulation;
     const auto has_clip_distance_outputs = info.stores.GetAny(IR::Attribute::ClipDistance);
     if (has_clip_distance_outputs && !needs_clip_distance_emulation) {
@@ -619,11 +677,11 @@ void EmitContext::DefineVertexBlock() {
 }
 
 void EmitContext::DefineOutputs() {
-    switch (sw_stage) {
-    case SwStage::Vertex: {
+    switch (l_stage) {
+    case LogicalStage::Vertex: {
         DefineVertexBlock();
-        if (hw_stage == Shader::HwStage::Local) {
-            const u32 num_attrs = Common::AlignUp(runtime_info.hw.ls.ls_stride, 16) >> 4;
+        if (stage == Shader::Stage::Local) {
+            const u32 num_attrs = Common::AlignUp(runtime_info.ls_info.ls_stride, 16) >> 4;
             if (num_attrs > 0) {
                 const Id type{TypeArray(F32[4], ConstU32(num_attrs))};
                 output_attr_array = DefineOutput(type, 0);
@@ -631,7 +689,7 @@ void EmitContext::DefineOutputs() {
             }
         } else {
             const bool needs_clip_distance_emulation =
-                hw_stage == HwStage::Vertex && profile.needs_clip_distance_emulation &&
+                stage == Stage::Vertex && profile.needs_clip_distance_emulation &&
                 info.stores.GetAny(IR::Attribute::ClipDistance);
             u32 num_attrs = 0u;
             for (u32 i = 0; i < IR::NumParams; i++) {
@@ -648,11 +706,10 @@ void EmitContext::DefineOutputs() {
                 ++num_attrs;
             }
 
-            if (VertexMotion()) {
-                motion_out_cur = DefineOutput(F32[4], MotionVectors::CurrentLocation);
-                motion_out_prev = DefineOutput(F32[4], MotionVectors::PreviousLocation);
-                Name(motion_out_cur, "motion_cur");
-                Name(motion_out_prev, "motion_prev");
+            if (native_colour) {
+                native_draw_out = DefineOutput(U32[1], Shader::t_native_emit.draw_location);
+                Decorate(native_draw_out, spv::Decoration::Flat);
+                Name(native_draw_out, "native_draw_out");
             }
             if (needs_clip_distance_emulation) {
                 clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
@@ -663,7 +720,7 @@ void EmitContext::DefineOutputs() {
         }
         break;
     }
-    case SwStage::TessellationControl: {
+    case LogicalStage::TessellationControl: {
         if (info.stores_tess_level_outer) {
             const Id type{TypeArray(F32[1], ConstU32(4U))};
             output_tess_level_outer =
@@ -677,13 +734,14 @@ void EmitContext::DefineOutputs() {
             Decorate(output_tess_level_inner, spv::Decoration::Patch);
         }
 
-        const u32 num_attrs = Common::AlignUp(runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
+        const u32 num_attrs =
+            Common::AlignUp(runtime_info.hs_es_vs_info.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
             // The input vertex count isn't statically known, so make length 32 (what
             // glslang does)
-            const Id patch_array_type{
-                TypeArray(per_vertex_type, ConstU32(runtime_info.sw.tcs.NumOutputControlPoints()))};
+            const Id patch_array_type{TypeArray(
+                per_vertex_type, ConstU32(runtime_info.hs_info.NumOutputControlPoints()))};
             output_attr_array = DefineOutput(patch_array_type, 0);
             Name(output_attr_array, "out_attrs");
         }
@@ -700,7 +758,7 @@ void EmitContext::DefineOutputs() {
         }
         break;
     }
-    case SwStage::TessellationEval: {
+    case LogicalStage::TessellationEval: {
         DefineVertexBlock();
         for (u32 i = 0; i < IR::NumParams; i++) {
             const IR::Attribute param{IR::Attribute::Param0 + i};
@@ -715,7 +773,7 @@ void EmitContext::DefineOutputs() {
         }
         break;
     }
-    case SwStage::Fragment: {
+    case LogicalStage::Fragment: {
         if (info.stores.Get(IR::Attribute::Depth)) {
             frag_depth = DefineVariable(F32[1], spv::BuiltIn::FragDepth, spv::StorageClass::Output);
         }
@@ -734,10 +792,10 @@ void EmitContext::DefineOutputs() {
                 continue;
             }
             const u32 num_components = info.stores.NumComponents(mrt);
-            const AmdGpu::NumberFormat num_format{runtime_info.hw.fs.color_buffers[i].num_format};
+            const AmdGpu::NumberFormat num_format{runtime_info.fs_info.color_buffers[i].num_format};
             const Id type{GetAttributeType(*this, num_format)[num_components]};
             Id id;
-            if (runtime_info.hw.fs.dual_source_blending) {
+            if (runtime_info.fs_info.dual_source_blending) {
                 id = DefineOutput(type, 0);
                 Decorate(id, spv::Decoration::Index, i);
             } else {
@@ -747,20 +805,14 @@ void EmitContext::DefineOutputs() {
             frag_outputs[i] = GetAttributeInfo(num_format, id, num_components, true);
             ++num_render_targets;
         }
-        if (FragmentMotion() && !Sirit::ValidId(frag_outputs[MotionVectors::Output].id)) {
-            motion_frag_out = DefineOutput(F32[4], MotionVectors::Output);
-            motion_in_cur = DefineInput(F32[4], MotionVectors::CurrentLocation);
-            motion_in_prev = DefineInput(F32[4], MotionVectors::PreviousLocation);
-            Name(motion_frag_out, "motion_vector");
-        }
         // Dual source blending allows at most 2 render targets, one for each source.
         // Fewer targets are allowed but the missing blending source values will be
         // undefined.
-        ASSERT_MSG(!runtime_info.hw.fs.dual_source_blending || num_render_targets <= 2,
+        ASSERT_MSG(!runtime_info.fs_info.dual_source_blending || num_render_targets <= 2,
                    "Dual source blending enabled, there must be at most two MRT exports");
         break;
     }
-    case SwStage::Geometry: {
+    case LogicalStage::Geometry: {
         DefineVertexBlock();
         for (u32 attr_id = 0; attr_id < info.gs_copy_data.num_attrs; attr_id++) {
             const Id id{DefineOutput(F32[4], attr_id)};
@@ -769,7 +821,7 @@ void EmitContext::DefineOutputs() {
         }
         break;
     }
-    case SwStage::Compute:
+    case LogicalStage::Compute:
         break;
     default:
         UNREACHABLE();
@@ -779,7 +831,7 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4],
-                                         U32[4], U32[4], U32[4], U32[2], U32[1], U32[1]),
+                                         U32[4], U32[4], U32[4], U32[2]),
                               "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -804,19 +856,17 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 80U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 96U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 112U);
-    MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
-    MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 120U);
-    MemberName(struct_type, PushData::SceneSizeIndex, "scene_size");
-    MemberDecorate(struct_type, PushData::SceneSizeIndex, spv::Decoration::Offset, 124U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
 }
 
-EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_coherent, u32 elem_shift,
-                                                 BufferType buffer_type, Id data_type) {
+EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_written, u32 elem_shift,
+                                                 BufferType buffer_type, Id data_type, bool is_coherent) {
     // Define array type.
-    const Id record_array_type{TypeRuntimeArray(data_type)};
+    const Id max_num_items = ConstU32(u32(profile.max_ubo_size) >> elem_shift);
+    const Id record_array_type{is_storage ? TypeRuntimeArray(data_type)
+                                          : TypeArray(data_type, max_num_items)};
     // Define block struct type. Don't perform decorations twice on the same Id.
     const Id struct_type{TypeStruct(record_array_type)};
     if (std::ranges::find(buf_type_ids, record_array_type.value, &Id::value) ==
@@ -828,17 +878,18 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
         buf_type_ids.push_back(record_array_type);
     }
     // Define buffer binding interface.
-    constexpr auto storage_class = spv::StorageClass::StorageBuffer;
+    const auto storage_class =
+        is_storage ? spv::StorageClass::StorageBuffer : spv::StorageClass::Uniform;
     const Id struct_pointer_type{TypePointer(storage_class, struct_type)};
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
     Decorate(id, spv::Decoration::Binding, binding.unified);
     Decorate(id, spv::Decoration::DescriptorSet, 0U);
-    if (!is_written) {
+    if (is_storage && !is_written) {
         Decorate(id, spv::Decoration::NonWritable);
-    } else if (is_coherent) {
-        // The guest V# MTYPE marks this buffer as shared between invocations;
-        // Coherent forbids caching its accesses in registers across barriers.
+    } else if (is_storage && is_coherent) {
+        // Port of upstream #4896: the guest V# MTYPE marks this buffer as shared between
+        // invocations; Coherent forbids caching its accesses across barriers.
         Decorate(id, spv::Decoration::Coherent);
     }
     switch (buffer_type) {
@@ -861,7 +912,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
         Name(id, "ssbo_shmem");
         break;
     default:
-        Name(id, fmt::format("ssbo_{}", binding.buffer));
+        Name(id, fmt::format("{}_{}", is_storage ? "ssbo" : "ubo", binding.buffer));
         break;
     }
     interfaces.push_back(id);
@@ -871,10 +922,10 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
-        // MTYPE class 3 marks guest buffers shared between invocations; shared
-        // memory lowered to a storage buffer needs the same guarantee.
-        const bool is_coherent =
-            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+        const bool is_storage = desc.IsStorage(buf_sharp);
+        // SHADPS4_SPIRV_COHERENT=1 (default off, disables the pipeline cache for the run).
+        const bool is_coherent = Shader::SpirvCoherentEnabled() &&
+                                 (desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3);
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
@@ -889,26 +940,703 @@ void EmitContext::DefineBuffers() {
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
-                DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
+                DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64,
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U32)) {
             spv_buffer.Alias(PointerType::U32) =
-                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1],
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
-                DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, F32[1]);
+                DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1],
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
-                DefineBuffer(desc.is_written, is_coherent, 1, desc.buffer_type, U16);
+                DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16,
+                             is_coherent);
         }
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
-                DefineBuffer(desc.is_written, is_coherent, 0, desc.buffer_type, U8);
+                DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8,
+                             is_coherent);
         }
         ++binding.unified;
     }
+    if (native) {
+        // The records SSBO sits after every binding of every stage (records_binding = the base
+        // pipeline's binding count); binding.unified is not advanced for it.
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        const Id struct_type{TypeStruct(array_type)};
+        if (std::ranges::find(buf_type_ids, array_type.value, &Id::value) == buf_type_ids.end()) {
+            Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+            Decorate(struct_type, spv::Decoration::Block);
+            MemberName(struct_type, 0, "data");
+            MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+            buf_type_ids.push_back(array_type);
+        }
+        const Id struct_pointer_type{TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
+        native_records_ptr = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+        native_records = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+        Decorate(native_records, spv::Decoration::Binding, Shader::t_native_emit.records_binding);
+        Decorate(native_records, spv::Decoration::DescriptorSet, 0U);
+        Decorate(native_records, spv::Decoration::NonWritable);
+        Name(native_records, "native_records");
+        interfaces.push_back(native_records);
+        if (native_pull) {
+            native_vbuf = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_vbuf, spv::Decoration::Binding, Shader::t_native_emit.vertex_binding);
+            Decorate(native_vbuf, spv::Decoration::DescriptorSet, 0U);
+            Decorate(native_vbuf, spv::Decoration::NonWritable);
+            Name(native_vbuf, "native_vbuf");
+            interfaces.push_back(native_vbuf);
+            if (Shader::t_native_emit.vbuf2) {
+                // q53: the second vertex SSBO (same block type).
+                native_vbuf2 = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+                Decorate(native_vbuf2, spv::Decoration::Binding, Shader::t_native_emit.vertex2_binding);
+                Decorate(native_vbuf2, spv::Decoration::DescriptorSet, 0U);
+                Decorate(native_vbuf2, spv::Decoration::NonWritable);
+                Name(native_vbuf2, "native_vbuf2");
+                interfaces.push_back(native_vbuf2);
+            }
+        }
+        if (native_ring) {
+            native_table = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_table, spv::Decoration::Binding, Shader::t_native_emit.table_binding);
+            Decorate(native_table, spv::Decoration::DescriptorSet, 0U);
+            Decorate(native_table, spv::Decoration::NonWritable);
+            Name(native_table, "native_table");
+            interfaces.push_back(native_table);
+        }
+        if (native_pull && Shader::t_native_emit.compare) {
+            native_dbg = AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_dbg, spv::Decoration::Binding, Shader::t_native_emit.debug_binding);
+            Decorate(native_dbg, spv::Decoration::DescriptorSet, 0U);
+            Name(native_dbg, "native_dbg");
+            interfaces.push_back(native_dbg);
+        }
+        // SHADPS4_NATIVE_PT: the page table itself is read by pointer (NativePtTranslate), no
+        // binding; =2 the compare SSBO.
+        if (native_pt_compare) {
+            native_pt_dbg =
+                AddGlobalVariable(struct_pointer_type, spv::StorageClass::StorageBuffer);
+            Decorate(native_pt_dbg, spv::Decoration::Binding,
+                     Shader::t_native_emit.pt_debug_binding);
+            Decorate(native_pt_dbg, spv::Decoration::DescriptorSet, 0U);
+            Name(native_pt_dbg, "native_pt_dbg");
+            interfaces.push_back(native_pt_dbg);
+        }
+    }
+}
+
+void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited) {
+    // SHADPS4_NATIVE_PT (sec. 18): this draw's full guest address of the binding - the record's
+    // offset word (ring: the job thread's guest address, low 32 bits) and hi byte, an inherited
+    // slot's from the table - through the buffer cache's page table (a u64 device address per
+    // 16 KB guest page, 0 = not cached) to the device address the binding's loads start at. A
+    // miss maps to the table's fallback (the page table buffer itself: always mapped memory, so
+    // no pointer ever leaves mapped memory) and every load of the binding then reads 0. The hi
+    // byte bounds the address below 2^40, so the page index never leaves the table.
+    const auto hi_byte = [&](Id word) {
+        return OpBitFieldUExtract(U32[1], word, ConstU32((binding % 4) * 8), ConstU32(8u));
+    };
+    const Id lo{OpSelect(U32[1], inherited, NativeTableLoad(Shader::NativeTablePtLo + binding),
+                         record_word)};
+    const Id hi{OpSelect(U32[1], inherited,
+                         hi_byte(NativeTableLoad(Shader::NativeTablePtHi + binding / 4)),
+                         hi_byte(NativeRecordLoad(Shader::NativeRecordHiOffset + binding / 4)))};
+    const auto u64_of = [&](Id lo32, Id hi32) {
+        return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                           OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+    };
+    const Id guest{u64_of(lo, hi)};
+    Name(guest, fmt::format("buf{}_guest", binding));
+    // The table's fallback pair is the page table buffer's own device address: the entry is
+    // read by pointer at fallback + page * 8 (no set-0 binding for the page table).
+    const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
+                             NativeTableLoad(Shader::NativeTablePtFallback + 1))};
+    const Id page{OpShiftRightLogical(U64, guest,
+                                      ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id entry_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, page, ConstU32(3u)))};
+    const Id entry{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, entry_addr),
+                          spv::MemoryAccessMask::Aligned, 8u)};
+    // Contiguity (brick C v2): the binding's last byte's page must map to entry + distance (one
+    // cached buffer, contiguous) and be cached; else the binding is a miss (loads read 0) and
+    // its pages are flagged in the fault buffer (count 0 otherwise: the helper's loop runs no
+    // iteration), so ProcessFaultBuffer creates one buffer over the range. One extra
+    // page-table load per binding per invocation.
+    const Id size{OpUMax(U32[1], native_size_bytes[handle], ConstU32(1u))};
+    const Id last_byte{OpIAdd(U64, guest, OpUConvert(U64, OpISub(U32[1], size, ConstU32(1u))))};
+    const Id last_page{OpShiftRightLogical(U64, last_byte,
+                                           ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id last_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, last_page, ConstU32(3u)))};
+    const Id entry_last{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, last_addr),
+                               spv::MemoryAccessMask::Aligned, 8u)};
+    const Id distance{OpShiftLeftLogical(U64, OpISub(U64, last_page, page),
+                                         ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
+                                     OpINotEqual(U1[1], entry_last, u64_zero_value))};
+    const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                              OpLogicalNot(U1[1], contiguous))};
+    const Id npages{OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
+    const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+    OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
+                   NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
+                   OpSelect(U32[1], flag, npages, u32_zero_value));
+    const Id in_page{
+        OpBitwiseAnd(U64, guest, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
+    native_dev_base[handle] = OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page));
+    Name(native_dev_base[handle], fmt::format("buf{}_dev", binding));
+    native_pt_miss[handle] = miss;
+    native_guest_lo[handle] = lo;
+    native_guest_hi[handle] = hi;
+}
+
+void EmitContext::NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width,
+                                   bool scalar) {
+    // SHADPS4_NATIVE_PT=2: the page-table load against the descriptor load of the same element
+    // (both as bits, both 0 past the bound); count every mismatch, keep the first 64 (slot 64 =
+    // discard), as NativeCompareAttribute does.
+    // The atomic and the stores run only on a mismatch, inside a helper function (an atomic per
+    // load on one counter took the city to ~1 FPS, s459; a branch here would split the IR's block).
+    // Tag bits: 1 vs / 2 ps, bit 2 = a scalar (s_buffer_load) load (brick C v3 item 2).
+    const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (scalar ? 4u : 0u) | (width << 8);
+    OpFunctionCall(void_id, native_pt_report, ConstU32(buffers[handle].binding), rel_index, pt_bits,
+                   desc_bits, native_draw, native_guest_lo[handle], native_guest_hi[handle],
+                   ConstU32(tag));
+}
+
+Id EmitContext::DefineNativePtReport(std::string_view name, u32 counter_dword,
+                                     u32 entries_dword) {
+    // void(a, b, x, y, c, d, e, tag): when x != y, count at the compare SSBO's counter_dword and
+    // store the 8 words as entry (count < 64 ? count : 64) from entries_dword (NATIVE_PT=2 at
+    // 0 / 16, NATIVE_SEG=2 at 1 / 2048).
+    const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], U32[1], U32[1], U32[1],
+                                    U32[1], U32[1])};
+    const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    std::array<Id, 8> p{};
+    for (auto& param : p) {
+        param = OpFunctionParameter(U32[1]);
+    }
+    Name(func, name);
+    AddLabel();
+    const Id report_label{OpLabel()};
+    const Id merge_label{OpLabel()};
+    const Id bad{OpINotEqual(U1[1], p[2], p[3])};
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(bad, report_label, merge_label);
+    AddLabel(report_label);
+    const Id ptr0{OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
+                                ConstU32(counter_dword))};
+    const Id old{OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value, ConstU32(1u))};
+    const Id slot{OpSelect(U32[1], OpULessThan(U1[1], old, ConstU32(64u)), old, ConstU32(64u))};
+    const Id base{
+        OpIAdd(U32[1], ConstU32(entries_dword), OpIMul(U32[1], slot, ConstU32(16u)))};
+    for (u32 i = 0; i < p.size(); ++i) {
+        OpStore(OpAccessChain(native_records_ptr, native_pt_dbg, u32_zero_value,
+                              OpIAdd(U32[1], base, ConstU32(i))),
+                p[i]);
+    }
+    OpBranch(merge_label);
+    AddLabel(merge_label);
+    OpReturn();
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineNativePtFault() {
+    // void(fault_lo, fault_hi, first_page, count): the fault bit of pages first .. first +
+    // min(count, 256) - 1 in the fault buffer at the 64-bit address (bit page % 32 of word
+    // page / 32; a plain read-or-write, as DefineGetBdaPointer's single-page fault).
+    const Id func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], U32[1])};
+    const Id func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    const Id lo{OpFunctionParameter(U32[1])};
+    const Id hi{OpFunctionParameter(U32[1])};
+    const Id first{OpFunctionParameter(U32[1])};
+    const Id count{OpFunctionParameter(U32[1])};
+    Name(func, "native_pt_fault");
+    AddLabel();
+    const Id i_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                    spv::StorageClass::Function)};
+    OpStore(i_var, u32_zero_value);
+    const Id limit{OpUMin(U32[1], count, ConstU32(256u))};
+    const Id base{OpBitwiseOr(U64, OpUConvert(U64, lo),
+                              OpShiftLeftLogical(U64, OpUConvert(U64, hi), ConstU32(32u)))};
+    const Id header{OpLabel()};
+    const Id cond{OpLabel()};
+    const Id body{OpLabel()};
+    const Id cont{OpLabel()};
+    const Id merge{OpLabel()};
+    OpBranch(header);
+    AddLabel(header);
+    OpLoopMerge(merge, cont, spv::LoopControlMask::MaskNone);
+    OpBranch(cond);
+    AddLabel(cond);
+    const Id iv{OpLoad(U32[1], i_var)};
+    OpBranchConditional(OpULessThan(U1[1], iv, limit), body, merge);
+    AddLabel(body);
+    const Id p{OpIAdd(U32[1], first, iv)};
+    const Id word{OpShiftLeftLogical(U32[1], OpShiftRightLogical(U32[1], p, ConstU32(5u)),
+                                     ConstU32(2u))};
+    const Id ptr{OpConvertUToPtr(physical_pointer_type_u32, OpIAdd(U64, base, OpUConvert(U64, word)))};
+    const Id value{OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u)};
+    const Id bit{OpShiftLeftLogical(U32[1], u32_one_value, OpBitwiseAnd(U32[1], p, ConstU32(31u)))};
+    OpStore(ptr, OpBitwiseOr(U32[1], value, bit), spv::MemoryAccessMask::Aligned, 4u);
+    OpBranch(cont);
+    AddLabel(cont);
+    OpStore(i_var, OpIAdd(U32[1], iv, u32_one_value));
+    OpBranch(header);
+    AddLabel(merge);
+    OpReturn();
+    OpFunctionEnd();
+    return func;
+}
+
+void EmitContext::NativeSegRecordPointer(Id draw) {
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A): the batch's list entry of this draw (by pointer, at
+    // the table's list address) names the record: slot in bits 24..31 (a job thread's ring, or
+    // NativeSegLegacySlot = the batch's own records; clamped so a bad entry stays inside the
+    // table), ring index in the low bits (masked by the ring size). The slot's device address
+    // is in the table. Once per invocation (VS: DrawIndex, PS: the flat draw varying).
+    const auto u64_of = [&](Id lo32, Id hi32) {
+        return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                           OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+    };
+    const auto load_ptr = [&](Id addr) {
+        return OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                      spv::MemoryAccessMask::Aligned, 4u);
+    };
+    const Id list{u64_of(NativeTableLoad(Shader::NativeTableSegList),
+                         NativeTableLoad(Shader::NativeTableSegList + 1))};
+    const Id entry{load_ptr(OpIAdd(
+        U64, list, OpUConvert(U64, OpShiftLeftLogical(U32[1], draw, ConstU32(2u)))))};
+    Name(entry, "native_seg_entry");
+    const Id slot{OpUMin(U32[1],
+                         OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], entry, ConstU32(24u)),
+                                      ConstU32(Shader::NativeSegSlotMask)),
+                         ConstU32(Shader::NativeSegSlots - 1))};
+    const Id word{OpIAdd(U32[1], ConstU32(Shader::NativeTableSlotAddr),
+                         OpShiftLeftLogical(U32[1], slot, ConstU32(1u)))};
+    const Id base{u64_of(NativeTableLoad(word), NativeTableLoad(OpIAdd(U32[1], word, ConstU32(1u))))};
+    const Id ridx{OpBitwiseAnd(U32[1], entry, ConstU32(Shader::NativeSegRingMask))};
+    native_rec_ptr = OpIAdd(
+        U64, base,
+        OpUConvert(U64, OpIMul(U32[1], ridx, ConstU32(Shader::NativeRecordDwords * 4))));
+    Name(native_rec_ptr, "native_rec_ptr");
+    native_seg_entry = entry;
+    // Brick C v3 item 4: the slot words - the segment's table row of this draw's material
+    // (entry bits 29..31) when the batch has a table, else the record's own slot words.
+    const Id mat_addr{u64_of(NativeTableLoad(Shader::NativeTableSegMat),
+                             NativeTableLoad(Shader::NativeTableSegMat + 1))};
+    const Id mat{OpShiftRightLogical(U32[1], entry, ConstU32(Shader::NativeSegMatShift))};
+    const Id mat_ptr{OpIAdd(
+        U64, mat_addr,
+        OpUConvert(U64, OpIMul(U32[1], mat, ConstU32(Shader::NativeSegMatWords * 4))))};
+    const Id rec_slots{
+        OpIAdd(U64, native_rec_ptr, Constant(U64, u64{Shader::NativeRecordImgOffset} * 4))};
+    native_seg_slot_ptr = OpSelect(U64, OpINotEqual(U1[1], mat_addr, u64_zero_value), mat_ptr,
+                                   rec_slots);
+    Name(native_seg_slot_ptr, "native_seg_slot_ptr");
+}
+
+Id EmitContext::NativeSegSlotLoad(u32 word) {
+    const Id addr{OpIAdd(U64, native_seg_slot_ptr, Constant(U64, u64{word} * 4))};
+    return OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                  spv::MemoryAccessMask::Aligned, 4u);
+}
+
+Id EmitContext::NativeVbufLoad(Id dword_index, Id buffer) {
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, Sirit::ValidId(buffer) ? buffer : native_vbuf,
+                                        u32_zero_value, dword_index));
+}
+
+void EmitContext::NativeCompareAttribute(u32 loc, Id vindex, Id draw) {
+    // Diagnostic: the pulled value vs the real vertex input (both exist in compare mode).
+    const auto& a = Shader::t_native_emit.attrs[loc];
+    const auto& param = input_params[loc];
+    const Id pulled = NativePullAttribute(loc, vindex);
+    const Id vec_type = !param.is_integer ? F32[4]
+                        : param.component_type.value == U32[1].value ? U32[4]
+                                                                      : S32[4];
+    const Id real = OpLoad(vec_type, param.id);
+    Id bad = false_value;
+    std::array<Id, 4> pb{}, rb{};
+    for (u32 i = 0; i < 4; ++i) {
+        const Id p = OpCompositeExtract(param.component_type, pulled, i);
+        const Id r = OpCompositeExtract(param.component_type, real, i);
+        Id diff;
+        if (param.is_integer) {
+            diff = OpINotEqual(U1[1], p, r);
+            pb[i] = param.component_type.value == U32[1].value ? p : OpBitcast(U32[1], p);
+            rb[i] = param.component_type.value == U32[1].value ? r : OpBitcast(U32[1], r);
+        } else {
+            // Bit-exact: a depth-equal pass after a generic depth prepass needs identical
+            // positions, so 1-ulp differences matter.
+            pb[i] = OpBitcast(U32[1], p);
+            rb[i] = OpBitcast(U32[1], r);
+            diff = OpINotEqual(U1[1], pb[i], rb[i]);
+        }
+        bad = OpLogicalOr(U1[1], bad, diff);
+    }
+    const Id ptr0 = OpAccessChain(native_records_ptr, native_dbg, u32_zero_value, u32_zero_value);
+    const Id old = OpAtomicIAdd(U32[1], ptr0, ConstU32(1u), u32_zero_value,
+                                OpSelect(U32[1], bad, ConstU32(1u), u32_zero_value));
+    const Id slot = OpSelect(U32[1], OpLogicalAnd(U1[1], bad, OpULessThan(U1[1], old, ConstU32(64u))),
+                             old, ConstU32(64u));
+    const Id base = OpIAdd(U32[1], ConstU32(16u), OpIMul(U32[1], slot, ConstU32(16u)));
+    const std::array<Id, 16> words{ConstU32(loc), vindex, draw,
+                                   NativeRecordLoad(Shader::NativeRecordVoffOffset + loc),
+                                   pb[0], pb[1], pb[2], pb[3], rb[0], rb[1], rb[2], rb[3],
+                                   ConstU32(Shader::t_native_emit.vs_hash), ConstU32(u32(a.kind)),
+                                   ConstU32(u32(a.bits)), ConstU32(u32(a.count))};
+    for (u32 i = 0; i < 16; ++i) {
+        OpStore(OpAccessChain(native_records_ptr, native_dbg, u32_zero_value,
+                              OpIAdd(U32[1], base, ConstU32(i))),
+                words[i]);
+    }
+}
+
+Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
+    // What the Vulkan vertex input would fetch for location `loc` (binding = location, offset 0,
+    // per-vertex rate): `stride` bytes per vertex from the draw's stream offset, decoded by the
+    // format into the input variable's type, missing components (0, 0, 0, 1). Reads past the
+    // stream's bound size give (0, 0, 0, 1). Stream offsets / strides need not be 4-byte aligned
+    // (s301: 43% of textured draws are not): two dwords per dword, funnel-shifted.
+    using Shader::NativeVtxKind;
+    const auto& a = Shader::t_native_emit.attrs[loc];
+    const auto& param = input_params[loc];
+    const bool packed = a.bits == 0; // A2B10G10R10: R 0-9, G 10-19, B 20-29, A 30-31
+    const u32 bytes = packed ? 4u : u32(a.bits) / 8 * a.count;
+    const u32 ndw = (bytes + 3) / 4;
+    Id voff{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+    if (native_ring) {
+        voff = OpISub(U32[1], voff, NativeTableLoad(Shader::NativeTableVbase + loc));
+    }
+    const Id vsize{NativeRecordLoad(Shader::NativeRecordVsizeOffset + loc)};
+    const Id rel{OpIMul(U32[1], vindex, ConstU32(a.stride))};
+    const Id end{OpIAdd(U32[1], rel, ConstU32(bytes))};
+    const Id in_bounds{OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, vsize),
+                                    OpUGreaterThanEqual(U1[1], end, rel))};
+    // Out of bounds: read the stream's first bytes (a valid address) and discard them.
+    const Id addr{OpSelect(U32[1], in_bounds, OpIAdd(U32[1], voff, rel), voff)};
+    const Id dw0{OpShiftRightLogical(U32[1], addr, ConstU32(2u))};
+    const Id sh{
+        OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], addr, ConstU32(3u)), ConstU32(3u))};
+    const Id aligned{OpIEqual(U1[1], sh, u32_zero_value)};
+    const Id inv{OpISub(U32[1], ConstU32(32u), sh)};
+    std::array<Id, 4> d{};
+    const auto vbuf_dwords_from = [&](Id buffer) {
+        std::array<Id, 4> r{};
+        Id lo{NativeVbufLoad(dw0, buffer)};
+        for (u32 i = 0; i < ndw; ++i) {
+            const Id hi{NativeVbufLoad(OpIAdd(U32[1], dw0, ConstU32(i + 1)), buffer)};
+            const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], lo, sh),
+                                        OpShiftLeftLogical(U32[1], hi, inv))};
+            r[i] = OpSelect(U32[1], aligned, lo, funnel);
+            lo = hi;
+        }
+        return r;
+    };
+    const auto vbuf_dwords = [&] {
+        if (!Sirit::ValidId(native_vbuf2)) {
+            return vbuf_dwords_from(native_vbuf);
+        }
+        // q53: bit 16 + loc of the push word picks the second vertex SSBO (a uniform branch: the
+        // push constants are the same for every invocation); the same offsets and decode.
+        const Id mask_ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                        push_data_block, ConstU32(Shader::PushData::BufOffsetIndex),
+                                        u32_zero_value)};
+        const Id use_2{OpINotEqual(U1[1],
+                                   OpBitwiseAnd(U32[1], OpLoad(U32[1], mask_ptr), ConstU32(1u << (16 + loc))),
+                                   u32_zero_value)};
+        const Id l_2{OpLabel()};
+        const Id l_1{OpLabel()};
+        const Id l_merge{OpLabel()};
+        OpSelectionMerge(l_merge, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(use_2, l_2, l_1);
+        AddLabel(l_2);
+        const auto r2 = vbuf_dwords_from(native_vbuf2);
+        OpBranch(l_merge);
+        AddLabel(l_1);
+        const auto r1 = vbuf_dwords_from(native_vbuf);
+        OpBranch(l_merge);
+        AddLabel(l_merge);
+        std::array<Id, 4> r{};
+        for (u32 i = 0; i < ndw; ++i) {
+            r[i] = OpPhi(U32[1], r2[i], l_2, r1[i], l_1);
+        }
+        return r;
+    };
+    if (native_pt && native_ring && Shader::g_pt_vertex != 0) {
+        // q18: this location's stream may sit outside the bound vertex buffer (push mask bit): read it through
+        // the page table from its full guest address, as Guest bindings (NativePtTranslate).
+        const auto pt_dwords = [&] {
+            const auto u64_of = [&](Id lo32, Id hi32) {
+                return OpBitwiseOr(U64, OpUConvert(U64, lo32),
+                                   OpShiftLeftLogical(U64, OpUConvert(U64, hi32), ConstU32(32u)));
+            };
+            const Id glo{NativeRecordLoad(Shader::NativeRecordVoffOffset + loc)};
+            const Id ghi{OpBitFieldUExtract(U32[1], NativeRecordLoad(Shader::NativeRecordVhiOffset + loc / 4),
+                                            ConstU32((loc % 4) * 8), ConstU32(8u))};
+            const Id guest{u64_of(glo, ghi)};
+            const Id a{OpIAdd(U64, guest,
+                              OpUConvert(U64, OpSelect(U32[1], in_bounds, rel, u32_zero_value)))};
+            const Id a4{OpBitwiseAnd(U64, a, Constant(U64, ~u64{3}))};
+            // q18b: the attribute's real extent (the funnel's padding dword is not part of it).
+            const Id last{OpIAdd(U64, a, Constant(U64, u64{bytes} - 1))};
+            const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
+                                     NativeTableLoad(Shader::NativeTablePtFallback + 1))};
+            const Id page{OpShiftRightLogical(U64, a4, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const Id last_page{
+                OpShiftRightLogical(U64, last, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const auto entry_at = [&](Id pg) {
+                const Id ea{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, pg, ConstU32(3u)))};
+                return OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, ea),
+                              spv::MemoryAccessMask::Aligned, 8u);
+            };
+            const Id entry{entry_at(page)};
+            const Id entry_last{entry_at(last_page)};
+            const Id distance{OpShiftLeftLogical(U64, OpISub(U64, last_page, page),
+                                                 ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
+                                             OpINotEqual(U1[1], entry_last, u64_zero_value))};
+            const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                                      OpLogicalNot(U1[1], contiguous))};
+            const Id npages{
+                OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
+            const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+            OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
+                           NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
+                           OpSelect(U32[1], flag, npages, u32_zero_value));
+            const Id in_page{OpBitwiseAnd(U64, a4, Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1))};
+            const Id dev{OpSelect(U64, miss, fallback, OpIAdd(U64, entry, in_page))};
+            const Id psh{OpShiftLeftLogical(U32[1], OpBitwiseAnd(U32[1], OpUConvert(U32[1], a), ConstU32(3u)),
+                                            ConstU32(3u))};
+            const Id paligned{OpIEqual(U1[1], psh, u32_zero_value)};
+            const Id pinv{OpISub(U32[1], ConstU32(32u), psh)};
+            std::array<Id, 5> w{};
+            for (u32 j = 0; j <= ndw; ++j) {
+                Id daddr{OpIAdd(U64, dev, Constant(U64, u64{j} * 4))};
+                Id zero_it{miss};
+                if (j == ndw) {
+                    // q18b: the padding dword only inside the checked span (else a safe address, value 0).
+                    const Id inside{OpULessThanEqual(U1[1], OpIAdd(U64, a4, Constant(U64, u64{j} * 4)), last)};
+                    daddr = OpSelect(U64, inside, daddr, dev);
+                    zero_it = OpLogicalOr(U1[1], miss, OpLogicalNot(U1[1], inside));
+                }
+                const Id ptr{OpConvertUToPtr(physical_pointer_type_u32, daddr)};
+                w[j] = OpSelect(U32[1], zero_it, u32_zero_value,
+                                OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u));
+            }
+            std::array<Id, 4> r{};
+            for (u32 i = 0; i < ndw; ++i) {
+                const Id funnel{OpBitwiseOr(U32[1], OpShiftRightLogical(U32[1], w[i], psh),
+                                            OpShiftLeftLogical(U32[1], w[i + 1], pinv))};
+                r[i] = OpSelect(U32[1], paligned, w[i], funnel);
+            }
+            return r;
+        };
+        if (Shader::g_pt_vertex == 2) {
+            d = pt_dwords(); // q18 bit-exact gate: every location through the page table
+        } else {
+        const Id mask_ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                                        push_data_block, ConstU32(Shader::PushData::BufOffsetIndex),
+                                        u32_zero_value)};
+        const Id use_pt{OpINotEqual(U1[1], OpBitwiseAnd(U32[1], OpLoad(U32[1], mask_ptr), ConstU32(1u << loc)),
+                                    u32_zero_value)};
+        const Id l_pt{OpLabel()};
+        const Id l_vb{OpLabel()};
+        const Id l_merge{OpLabel()};
+        OpSelectionMerge(l_merge, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(use_pt, l_pt, l_vb);
+        AddLabel(l_pt);
+        const auto dp = pt_dwords();
+        OpBranch(l_merge);
+        AddLabel(l_vb);
+        const auto dv = vbuf_dwords();
+        // q53: vbuf_dwords may end in its own merge block; the phi names this one.
+        const Id l_vb_end{OpLabel()};
+        OpBranch(l_vb_end);
+        AddLabel(l_vb_end);
+        OpBranch(l_merge);
+        AddLabel(l_merge);
+        for (u32 i = 0; i < ndw; ++i) {
+            d[i] = OpPhi(U32[1], dp[i], l_pt, dv[i], l_vb_end);
+        }
+        }
+    } else {
+        d = vbuf_dwords();
+    }
+    const bool is_int = param.is_integer;
+    const Id comp_type = param.component_type;
+    const bool is_sint = is_int && comp_type.value == S32[1].value;
+    const bool is_uint = is_int && comp_type.value == U32[1].value;
+    const Id one = is_int ? (is_sint ? ConstS32(1) : ConstU32(1u)) : ConstF32(1.f);
+    const Id zero = is_int ? (is_sint ? ConstS32(0) : u32_zero_value) : f32_zero_value;
+    const auto from_float = [&](Id v) -> Id { return is_int ? OpBitcast(comp_type, v) : v; };
+    const auto from_bits = [&](Id v) -> Id {
+        return is_uint ? v : OpBitcast(comp_type, v);
+    };
+    // Vulkan's fixed-function conversion is the correctly rounded c / (2^b - 1) (s320: the
+    // GLSL unpack's c * (1 / 255) was 1 ulp off; a depth-equal colour pass after a generic depth
+    // prepass then failed on scattered pixels - speckles). Markstein: q0 = c * r, remainder by
+    // fma, one fma correction; checked against every 8 / 10 / 16-bit input (0 mismatches).
+    const auto exact_div = [&](Id cf, u32 d) -> Id {
+        const Id r = ConstF32(1.f / float(d));
+        const Id q0 = OpFMul(F32[1], cf, r);
+        Decorate(q0, spv::Decoration::NoContraction);
+        const Id e = OpFma(F32[1], OpFNegate(F32[1], q0), ConstF32(float(d)), cf);
+        return OpFma(F32[1], e, r, q0);
+    };
+    const auto unorm = [&](Id u, u32 w) {
+        return exact_div(OpConvertUToF(F32[1], u), (1u << w) - 1);
+    };
+    const auto snorm = [&](Id s_u32, u32 w) {
+        const Id sf = OpConvertSToF(F32[1], OpBitcast(S32[1], s_u32));
+        return OpFMax(F32[1], exact_div(sf, (1u << (w - 1)) - 1), ConstF32(-1.f));
+    };
+    std::array<Id, 4> c{zero, zero, zero, one};
+    for (u32 i = 0; packed && i < a.count; ++i) {
+        const u32 w = i < 3 ? 10u : 2u;
+        const Id pos = ConstU32(i * 10u);
+        const Id width = ConstU32(w);
+        const Id u = OpBitFieldUExtract(U32[1], d[0], pos, width);
+        const Id s = OpBitcast(S32[1], OpBitFieldSExtract(U32[1], d[0], pos, width));
+        switch (a.kind) {
+        case NativeVtxKind::Unorm:
+            c[i] = from_float(unorm(u, w));
+            break;
+        case NativeVtxKind::Snorm:
+            c[i] = from_float(snorm(OpBitcast(U32[1], s), w));
+            break;
+        case NativeVtxKind::Uint16:
+            c[i] = from_bits(u);
+            break;
+        case NativeVtxKind::Sint16:
+            c[i] = from_bits(OpBitcast(U32[1], s));
+            break;
+        case NativeVtxKind::Uscaled:
+            c[i] = from_float(OpConvertUToF(F32[1], u));
+            break;
+        case NativeVtxKind::Sscaled:
+            c[i] = from_float(OpConvertSToF(F32[1], s));
+            break;
+        default:
+            UNREACHABLE_MSG("native pull: packed kind {}", u32(a.kind));
+        }
+    }
+    for (u32 i = 0; !packed && i < a.count; ++i) {
+        const u32 bit = i * a.bits;
+        const Id word = d[bit / 32];
+        const Id pos = ConstU32(bit % 32);
+        const Id width = ConstU32(u32(a.bits));
+        switch (a.kind) {
+        case NativeVtxKind::Float:
+            c[i] = from_float(OpBitcast(F32[1], word));
+            break;
+        case NativeVtxKind::Uint:
+        case NativeVtxKind::Sint:
+            c[i] = from_bits(word);
+            break;
+        case NativeVtxKind::Half:
+            c[i] = from_float(
+                OpCompositeExtract(F32[1], OpUnpackHalf2x16(F32[2], word), (bit % 32) / 16));
+            break;
+        case NativeVtxKind::Unorm:
+            c[i] = from_float(unorm(OpBitFieldUExtract(U32[1], word, pos, width), a.bits));
+            break;
+        case NativeVtxKind::Snorm:
+            c[i] = from_float(snorm(OpBitFieldSExtract(U32[1], word, pos, width), a.bits));
+            break;
+        case NativeVtxKind::Uint16:
+            c[i] = from_bits(OpBitFieldUExtract(U32[1], word, pos, width));
+            break;
+        case NativeVtxKind::Sint16:
+            c[i] = from_bits(OpBitFieldSExtract(U32[1], word, pos, width));
+            break;
+        case NativeVtxKind::Uscaled:
+            c[i] = from_float(OpConvertUToF(F32[1], OpBitFieldUExtract(U32[1], word, pos, width)));
+            break;
+        case NativeVtxKind::Sscaled:
+            c[i] = from_float(OpConvertSToF(
+                F32[1], OpBitcast(S32[1], OpBitFieldSExtract(U32[1], word, pos, width))));
+            break;
+        default:
+            UNREACHABLE_MSG("native pull: kind {}", u32(a.kind));
+        }
+    }
+    // Out of bounds (robustBufferAccess2): components the format has read 0, missing ones
+    // keep the (0, 0, 1) fill (Opus code review #2).
+    const u32 present = packed ? 4u : u32(a.count);
+    for (u32 i = 0; i < 4; ++i) {
+        c[i] = OpSelect(comp_type, in_bounds, c[i], (i == 3 && i >= present) ? one : zero);
+    }
+    const Id vec_type = !is_int ? F32[4] : is_uint ? U32[4] : S32[4];
+    const Id value{OpCompositeConstruct(vec_type, c[0], c[1], c[2], c[3])};
+    Name(value, fmt::format("native_attr{}", loc));
+    return value;
+}
+
+Id EmitContext::NativeTableLoad(u32 dword) {
+    return OpLoad(U32[1],
+                  OpAccessChain(native_records_ptr, native_table, u32_zero_value, ConstU32(dword)));
+}
+
+Id EmitContext::NativeTableLoad(Id dword) {
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_table, u32_zero_value, dword));
+}
+
+Id EmitContext::LoadImage(const TextureDefinition& texture) {
+    if (!texture.bindless) {
+        return OpLoad(texture.image_type, texture.id);
+    }
+    const Id slot{native_seg ? NativeSegSlotLoad(texture.bindless_index)
+                             : NativeRecordLoad(Shader::NativeRecordImgOffset +
+                                                texture.bindless_index)};
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::UniformConstant, texture.image_type),
+                               texture.id, slot)};
+    const Id value{OpLoad(texture.image_type, ptr)};
+    return value;
+}
+
+Id EmitContext::LoadSampler(u32 index) {
+    if (!native_bindless) {
+        return OpLoad(sampler_type, samplers[index]);
+    }
+    const Id slot{native_seg
+                      ? NativeSegSlotLoad(Shader::g_bl_img_max + bindless_smp_base + index)
+                      : NativeRecordLoad(Shader::NativeRecordImgOffset + Shader::g_bl_img_max +
+                                         bindless_smp_base + index)}; // q54: samplers after g_bl_img_max images
+    const Id ptr{OpAccessChain(sampler_pointer_type, samplers[index], slot)};
+    const Id value{OpLoad(sampler_type, ptr)};
+    return value;
+}
+
+Id EmitContext::NativeRecordLoad(u32 dword) {
+    if (native_seg) {
+        // SHADPS4_NATIVE_SEG: the word through the record pointer; =2 the SSBO word too, a
+        // mismatch reported through the branching helper (the pointer's value is what the draw
+        // uses, so a mismatch is also visible on screen).
+        const Id addr{OpIAdd(U64, native_rec_ptr, Constant(U64, u64{dword} * 4))};
+        const Id value{OpLoad(U32[1], OpConvertUToPtr(physical_pointer_type_u32, addr),
+                              spv::MemoryAccessMask::Aligned, 4u)};
+        if (native_seg_compare) {
+            const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
+            const Id ssbo{OpLoad(
+                U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index))};
+            const u32 tag = (l_stage == LogicalStage::Fragment ? 2u : 1u) | (dword << 8);
+            OpFunctionCall(void_id, native_seg_report, ConstU32(dword), native_seg_entry, value,
+                           ssbo, native_draw, OpUConvert(U32[1], native_rec_ptr),
+                           OpUConvert(U32[1], OpShiftRightLogical(U64, native_rec_ptr,
+                                                                  ConstU32(32u))),
+                           ConstU32(tag));
+        }
+        return value;
+    }
+    const Id index{OpIAdd(U32[1], native_rec_base, ConstU32(dword))};
+    return OpLoad(U32[1], OpAccessChain(native_records_ptr, native_records, u32_zero_value, index));
 }
 
 spv::ImageFormat GetFormat(const AmdGpu::Image& image) {
@@ -995,11 +1723,12 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const u32 sampled = desc.is_written ? 2 : 1;
     switch (type) {
     case AmdGpu::ImageType::Color1D:
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, false, false, sampled, format);
+    case AmdGpu::ImageType::Color1DArray:
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, false, sampled, format);
-    case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
@@ -1012,6 +1741,62 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 void EmitContext::DefineImagesAndSamplers() {
+    if (native_bindless) {
+        // SHADPS4_NATIVE_BINDLESS (sec. 12): every image a runtime array of its own image type
+        // aliasing set 1 binding 0 (one sampled-image array), every sampler one of samplers at
+        // binding 1; indexed by the record's slot words. binding.unified advances as before (set 0 unchanged).
+        AddCapability(spv::Capability::RuntimeDescriptorArray);
+        // No NonUniform (s433: the decoration is a per-fetch loop on NVIDIA): the slot comes
+        // from the record of this draw, and DrawIndex is dynamically uniform within a draw.
+        if (profile.supported_spirv < 0x00010500) {
+            AddExtension("SPV_EXT_descriptor_indexing");
+        }
+        u32 index = info.l_stage == LogicalStage::Vertex ? Shader::t_native_emit.vs_img_base
+                                                         : 0u; // q3
+        for (const auto& image_desc : info.images) {
+            const auto sharp = image_desc.GetSharp(info);
+            const auto nfmt = sharp.GetNumberFmt();
+            const VectorIds& data_types = GetAttributeType(*this, nfmt);
+            const Id image_type{ImageType(*this, image_desc, data_types[1])};
+            const Id pointer_type{
+                TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type))};
+            const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, 0U);
+            Decorate(id, spv::Decoration::DescriptorSet, 1U);
+            binding.unified += image_desc.NumBindings(info);
+            Name(id, fmt::format("{}_bimg{}", stage, index));
+            images.push_back({
+                .data_types = &data_types,
+                .id = id,
+                .sampled_type = TypeSampledImage(image_type),
+                .image_type = image_type,
+                .view_type = sharp.GetHostViewType(image_desc.is_array),
+                .is_integer = AmdGpu::IsInteger(nfmt),
+                .is_storage = false,
+                .mip_fallback_mode = image_desc.mip_fallback_mode,
+                .bindless = true,
+                .bindless_index = index++,
+            });
+            interfaces.push_back(id);
+        }
+        if (info.samplers.empty()) {
+            return;
+        }
+        sampler_type = TypeSampler();
+        sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+        const Id array_ptr{
+            TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(sampler_type))};
+        for (size_t j = 0; j < info.samplers.size(); ++j) {
+            const Id id{AddGlobalVariable(array_ptr, spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, 1U);
+            Decorate(id, spv::Decoration::DescriptorSet, 1U);
+            ++binding.unified;
+            Name(id, fmt::format("{}_bsamp{}", stage, j));
+            samplers.push_back(id);
+            interfaces.push_back(id);
+        }
+        return;
+    }
     for (const auto& image_desc : info.images) {
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
@@ -1033,7 +1818,8 @@ void EmitContext::DefineImagesAndSamplers() {
         Decorate(id, spv::Decoration::Binding, binding.unified);
         binding.unified += num_bindings;
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
-        Name(id, fmt::format("{}_{}{}", hw_stage, "img", images.size()));
+        // TODO better naming for resources (flattened sharp_idx is not informative)
+        Name(id, fmt::format("{}_{}{}", stage, "img", image_desc.sharp_idx));
         images.push_back({
             .data_types = &data_types,
             .id = id,
@@ -1046,8 +1832,7 @@ void EmitContext::DefineImagesAndSamplers() {
         });
         interfaces.push_back(id);
     }
-    if (std::ranges::any_of(info.images,
-                            [](const ImageResource& image) { return image.is_atomic; })) {
+    if (std::ranges::any_of(info.images, &ImageResource::is_atomic)) {
         image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
         image_f32 = TypePointer(spv::StorageClass::Image, F32[1]);
     }
@@ -1060,7 +1845,12 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified++);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
-        Name(id, fmt::format("{}_{}{}", hw_stage, "samp", samplers.size()));
+        const auto sharp_desc =
+            samp_desc.is_inline_sampler
+                ? fmt::format("inline:{:#x}:{:#x}", samp_desc.inline_sampler.raw0,
+                              samp_desc.inline_sampler.raw1)
+                : fmt::format("sgpr:{}", samp_desc.sharp_idx);
+        Name(id, fmt::format("{}_{}{}", stage, "samp", sharp_desc));
         samplers.push_back(id);
         interfaces.push_back(id);
     }
@@ -1071,9 +1861,8 @@ void EmitContext::DefineSharedMemory() {
     if (num_types == 0) {
         return;
     }
-    ASSERT(info.hw_stage == HwStage::Compute);
-    const u32 shared_memory_size =
-        runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;
+    ASSERT(info.stage == Stage::Compute);
+    const u32 shared_memory_size = runtime_info.cs_info.shared_memory_size;
 
     const auto make_type = [&](IR::Type type, Id element_type, u32 element_size,
                                std::string_view name) {
@@ -1210,9 +1999,9 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
 }
 
 Id EmitContext::DefineGetBdaPointer() {
-    const auto caching_pagebits{Constant(U64, static_cast<u64>(profile.sparse_page_shift))};
-    const auto caching_pagemask{
-        Constant(U64, static_cast<u64>((1u << profile.sparse_page_shift) - 1))};
+    const auto caching_pagebits{
+        Constant(U64, static_cast<u64>(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const auto caching_pagemask{Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1)};
 
     const auto func_type{TypeFunction(U64, U64)};
     const auto func{OpFunction(U64, spv::FunctionControlMask::MaskNone, func_type)};
@@ -1299,6 +2088,9 @@ Id EmitContext::DefineReadConst(bool dynamic) {
 }
 
 void EmitContext::DefineFunctions() {
+    if (native_pt) {
+        native_pt_fault = DefineNativePtFault(); // called from the prologue (DefineMain)
+    }
     if (info.uses_pack_10_11_11) {
         f32_to_uf11 = DefineFloat32ToUfloatM5(6, "f32_to_uf11");
         f32_to_uf10 = DefineFloat32ToUfloatM5(5, "f32_to_uf10");
@@ -1309,6 +2101,12 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (native_pt_compare && Sirit::ValidId(native_pt_dbg)) {
+        native_pt_report = DefineNativePtReport("native_pt_report", 0, 16);
+    }
+    if (native_seg_compare && Sirit::ValidId(native_pt_dbg)) {
+        native_seg_report = DefineNativePtReport("native_seg_report", 1, 2048);
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

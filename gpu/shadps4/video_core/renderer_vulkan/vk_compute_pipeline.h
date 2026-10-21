@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <span>
-
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 
@@ -22,13 +20,6 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class DescriptorHeap;
-class AsyncCompiler;
-
-/// port: compiler threads that build compute pipelines met in game (PipelineCache).
-struct ComputeBuilder {
-    AsyncCompiler* compiler;
-    std::span<const vk::UniquePipelineCache> caches; ///< one per compiler thread
-};
 
 struct ComputePipelineKey {
     size_t value;
@@ -48,6 +39,8 @@ class ComputePipeline : public Pipeline {
 public:
     struct SerializationSupport {
         u32 dummy{};
+        // See the comment on the graphics pipeline's copy of this field.
+        std::vector<u32> image_binding_counts{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -56,23 +49,11 @@ public:
     ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
-                    const ComputeBuilder* builder = nullptr);
+                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
-
-    /// port: on the GPU thread, replaces a pipeline built without optimizations by the optimized
-    /// one once a compiler thread has it. The old one is destroyed once the GPU is past every
-    /// command buffer that may bind it.
-    void SwapInOptimized();
-
-    /// port: program hash and permutation (frame recorder).
-    const ComputePipelineKey& GetComputeKey() const {
-        return compute_key;
-    }
 
 private:
     ComputePipelineKey compute_key;
-    bool optimized_pending = false; ///< build->result will replace the unoptimized `pipeline`
 };
 
 } // namespace Vulkan

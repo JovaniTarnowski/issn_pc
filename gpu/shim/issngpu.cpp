@@ -24,9 +24,11 @@
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <array>
 #include <SDL3/SDL.h>
 #include "../issngpu.h"
 #include "common/elf_info.h"
+#include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
@@ -56,6 +58,24 @@ void runtime_report(void);
 }
 
 Frontend::WindowSDL* g_window = nullptr;
+
+// issn-axy: what axylpup's tree takes from its loader and patcher.
+namespace MemoryPatcher {
+uintptr_t g_eboot_address = 0;
+std::string g_game_serial;
+} // namespace MemoryPatcher
+namespace Common {
+extern const char g_scm_desc[];
+const char g_scm_desc[] = "issn_pc (axylpup second-son 2212a345)";
+bool FlushProcessWriteBuffersAll() {
+#ifdef _WIN32
+    FlushProcessWriteBuffers();
+    return true;
+#else
+    return false;
+#endif
+}
+} // namespace Common
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
@@ -97,9 +117,7 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     // Existing guest mappings are replayed by the runtime when hooks are installed.
     runtime_memory_set_gpu_hooks(
         [](uintptr_t address, uint64_t size) {
-            auto* r = Memory::Instance()->GetRasterizer();
-            r->RegisterMemory(address, size);
-            r->MapMemory(address, size);
+            Memory::Instance()->GetRasterizer()->MapMemory(address, size);
         },
         [](uintptr_t address, uint64_t size) { Memory::Instance()->GetRasterizer()->UnmapMemory(address, size); },
         [](uintptr_t address, uint64_t size) {
@@ -111,6 +129,78 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 }
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return runtime_memory_clamp(virtual_addr, size);
+}
+bool MemoryManager::IsValidMapping(VAddr virtual_addr, u64 size) {
+    return runtime_memory_is_mapped(virtual_addr, size ? size : 1) != 0;
+}
+u64 MemoryManager::TryClampRangeSize(VAddr virtual_addr, u64 size) {
+    if (!runtime_memory_is_mapped(virtual_addr, 1)) {
+        return 0;
+    }
+    return runtime_memory_clamp(virtual_addr, size);
+}
+bool MemoryManager::TryReadBacking(VAddr virtual_addr, u8* dest, u64 size) {
+    return runtime_memory_read_backing(virtual_addr, dest, size) != 0;
+}
+bool MemoryManager::TryReadGuest(VAddr virtual_addr, u8* dest, u64 size) {
+    if (TryReadBacking(virtual_addr, dest, size)) {
+        return true;
+    }
+    std::memset(dest, 0, size);
+    return false;
+}
+bool MemoryManager::FullyBacked(VAddr virtual_addr, u64 size) {
+    // Every mapped guest range lives in the runtime's backing view.
+    return runtime_memory_is_mapped(virtual_addr, size) != 0;
+}
+void MemoryManager::ExcludeFromDownloads(VAddr addr) {
+    static std::mutex m;
+    std::scoped_lock lk{m};
+    const u32 n = num_download_exclusions.load(std::memory_order_acquire);
+    for (u32 i = 0; i < n; ++i) {
+        if (download_exclusions[i].load(std::memory_order_relaxed) == addr) {
+            return;
+        }
+    }
+    if (n < MaxDownloadExclusions) {
+        download_exclusions[n].store(addr, std::memory_order_relaxed);
+        num_download_exclusions.store(n + 1, std::memory_order_release);
+    }
+}
+// From axylpup's memory.cpp: the download skips the excluded words (CP read pointers).
+bool MemoryManager::TryWriteBackingDownload(void* address, const void* data, u64 size) {
+    const u32 n = num_download_exclusions.load(std::memory_order_acquire);
+    if (n == 0) [[likely]] {
+        return TryWriteBacking(address, data, size);
+    }
+    const VAddr lo = reinterpret_cast<VAddr>(address);
+    const VAddr hi = lo + size;
+    std::array<VAddr, MaxDownloadExclusions> hits{};
+    u32 h = 0;
+    for (u32 i = 0; i < n; ++i) {
+        const VAddr e = download_exclusions[i].load(std::memory_order_relaxed);
+        if (e < hi && lo < e + 4) {
+            hits[h++] = e;
+        }
+    }
+    if (h == 0) {
+        return TryWriteBacking(address, data, size);
+    }
+    std::sort(hits.begin(), hits.begin() + h);
+    download_exclusion_hits.fetch_add(h, std::memory_order_relaxed);
+    bool ok = true;
+    VAddr cur = lo;
+    const auto* src = static_cast<const u8*>(data);
+    for (u32 i = 0; i <= h; ++i) {
+        const VAddr stop = i < h ? std::max(hits[i], lo) : hi;
+        if (stop > cur) {
+            ok &= TryWriteBacking(reinterpret_cast<void*>(cur), src + (cur - lo), stop - cur);
+        }
+        if (i < h) {
+            cur = std::max(cur, std::min(hits[i] + 4, hi));
+        }
+    }
+    return ok;
 }
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     while (size) {
@@ -140,6 +230,9 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
     });
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    if (const auto hook = g_backing_write_hook.load(std::memory_order_relaxed)) [[unlikely]] {
+        hook(reinterpret_cast<VAddr>(address), size);
+    }
     IssnWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, IssnWriteLog::Backing);
     IssnReadbackDiff::NoteApply(reinterpret_cast<uintptr_t>(address), data, size);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
@@ -158,6 +251,8 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
 }
 boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
     boost::icl::interval_set<VAddr> set;
+    // issn-axy: guest memory also lives in shadPS4's range below the host window (runtime_memory.c).
+    set += boost::icl::interval<VAddr>::right_open(0x2'0000'0000ULL, 0x8'0000'0000ULL);
     set += boost::icl::interval<VAddr>::right_open(0x10'0000'0000ULL, 0xfc'0000'0000ULL);
     return set;
 }
@@ -248,6 +343,10 @@ extern "C" int issngpu_init(const IssnGpuConfig* config) {
     if (config->user_dir) setenv("ISSN_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    MemoryPatcher::g_eboot_address = static_cast<uintptr_t>(config->eboot_base);
+    // The game-specific paths of the new core key on the EU serial; the US eboot's code is the
+    // same (axylpup's seed stamp: one code hash for CUSA00004 and CUSA00223).
+    MemoryPatcher::g_game_serial = "CUSA00004";
     const std::string title = config->title ? config->title : "inFAMOUS Second Son";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
@@ -302,6 +401,10 @@ extern "C" int issngpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
 }
 
+extern "C" void issngpu_mark_game_main_thread(void) {
+    Common::FaultMonitor::MarkGameMainThread();
+}
+
 extern "C" unsigned issngpu_symbol_count(void) {
     return unsigned(g_symbols.size());
 }
@@ -349,6 +452,7 @@ void LoadRenderDoc() {}
 void StartCapture() {}
 void EndCapture() {}
 void TriggerCapture() {}
+void OnFrameBoundary() {}
 void SetOutputDir(const std::filesystem::path&, const std::string&) {}
 bool IsRenderDocLoaded() { return false; }
 void RequestScreenshot(ScreenshotRequest) {}
@@ -398,11 +502,7 @@ extern "C" int issngpu_text_input_poll(char* out, uint64_t size) {
     return state;
 }
 
-// issn: ISSN_WRITE_MERGE (BufferCache::CpuWriteMerge), called by the runtime's memcpy/memset.
-extern "C" int issngpu_cpu_write(void* dst, const void* src, int fill, uint64_t size) {
-    auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
-    return rasterizer && rasterizer->GetBufferCache().CpuWriteMerge(reinterpret_cast<VAddr>(dst),
-                                                                     src, fill, size)
-               ? 1
-               : 0;
+// issn: ISSN_WRITE_MERGE was the old core's; the new one has no merge path (writes fault normally).
+extern "C" int issngpu_cpu_write(void*, const void*, int, uint64_t) {
+    return 0;
 }

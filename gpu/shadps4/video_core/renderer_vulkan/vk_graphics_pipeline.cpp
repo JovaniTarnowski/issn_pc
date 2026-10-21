@@ -1,42 +1,26 @@
-#include <cstdio>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
-#include "core/emulator_settings.h"
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "video_core/amdgpu/cp_split.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_bindless.h"
+#include "shader_recompiler/native_emit.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_lighting_test.h"
-#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
-#include "common/elf_info.h"
-#include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
-
-// port: where pipeline construction time goes (reported when the background warm-up ends).
-std::atomic<u64> g_issn_pipeline_total_ns, g_issn_pipeline_driver_ns;
-std::atomic<u32> g_issn_pipelines_built;
-namespace {
-using Clock = std::chrono::steady_clock;
-u64 NsSince(Clock::time_point start) {
-    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
-}
-} // namespace
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -52,14 +36,61 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::shared_ptr<const Shader::Gcn::FetchShaderData> fetch_shader_,
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    const DescSetBindings* derived /*= nullptr*/,
+    u32 native_records_binding_ /*= NoNativeRecords*/, bool native_bindless_ /*= false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
-    const auto started = Clock::now();
+    native_records_binding = native_records_binding_;
+    native_bindless = native_bindless_ && Bindless::Init(instance.GetDevice());
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
-    BuildDescSetLayout(preloading);
+    // With `derived`, the lookup thread already read everything below that needs an Info's
+    // user data (DeriveStageInputs); this constructor may be running on the compiler thread
+    // while that thread rewrites the Infos for its next draw.
+    ASSERT_MSG(!(derived && preloading), "Derived stage inputs are never preloaded");
+    if (derived) {
+        BuildDescSetLayout(std::span{derived->data(), derived->size()});
+    } else {
+        DescSetBindings bindings;
+        CollectDescSetBindings(stages, sdata, preloading, bindings);
+        if (native_records_binding != NoNativeRecords) {
+            // SHADPS4_NATIVE_PASS: the per-draw records the native vertex shader reads.
+            const u32 next =
+                bindings.empty() ? 0u : bindings.back().binding + bindings.back().descriptorCount;
+            ASSERT_MSG(next == native_records_binding, "native records binding {} vs {}", next,
+                       native_records_binding);
+            bindings.push_back({
+                .binding = native_records_binding,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            });
+            if (Shader::g_native_ring) {
+                // SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (ring index, bases).
+                native_table_binding = native_records_binding + 1;
+                bindings.push_back({
+                    .binding = native_table_binding,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer,
+                    .descriptorCount = 1,
+                    .stageFlags = vk::ShaderStageFlagBits::eVertex,
+                });
+                if (Shader::g_native_pt == 2) {
+                    // SHADPS4_NATIVE_PT=2: the compare SSBO (the page table itself is read by
+                    // pointer at the table's fallback address: no binding).
+                    native_pt_debug_binding = native_records_binding + 2;
+                    bindings.push_back({
+                        .binding = native_pt_debug_binding,
+                        .descriptorType = vk::DescriptorType::eStorageBuffer,
+                        .descriptorCount = 1,
+                        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+                    });
+                }
+            }
+        }
+        BuildDescSetLayout(std::span{bindings.data(), bindings.size()});
+    }
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -68,25 +99,31 @@ GraphicsPipeline::GraphicsPipeline(
         .size = sizeof(Shader::PushData),
     };
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    // Descriptor heap pipelines have neither a descriptor set layout nor a pipeline layout.
+    if (!uses_native_bindings) {
+        // SHADPS4_NATIVE_BINDLESS: set 1 = the global image / sampler arrays.
+        const std::array<vk::DescriptorSetLayout, 2> set_layouts{
+            *desc_layout, native_bindless ? *Bindless::G().layout : vk::DescriptorSetLayout{}};
+        const vk::PipelineLayoutCreateInfo layout_info = {
+            .setLayoutCount = native_bindless ? 2U : 1U,
+            .pSetLayouts = set_layouts.data(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_constants,
+        };
+        auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
+        ASSERT_MSG(layout_result == vk::Result::eSuccess,
+                   "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
+        pipeline_layout = std::move(layout);
+        SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    }
 
-    if (!preloading) {
+    if (!preloading && !derived) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
         if (!instance.IsVertexInputDynamicState()) {
-            const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
+            const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
             GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
-                            guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
+                            guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1,
+                            Shader::BoundStage{stages[u32(Shader::LogicalStage::Vertex)]});
         }
     }
 
@@ -104,22 +141,6 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
-    // port: ISSN_PIPELINE_LOG=1 lists every graphics pipeline built: primitive type, targets,
-    // vertex formats and shader hashes (finding which pass draws a broken effect).
-    static const bool pipeline_log = std::getenv("ISSN_PIPELINE_LOG") != nullptr;
-    if (pipeline_log) {
-        std::string formats;
-        for (const auto& attr : sdata.vertex_attributes) {
-            formats += fmt::format(" {}:{}", attr.location, vk::to_string(attr.format));
-        }
-        std::string hashes;
-        for (const auto hash : key.stage_hashes) {
-            hashes += fmt::format(" {:#x}", hash);
-        }
-        std::fprintf(stderr, "tlg-pipe: prim=%u poly=%u colors=%u z=%u hashes=[%s ] attrs=[%s ]\n",
-                     unsigned(key.prim_type), unsigned(key.polygon_mode), key.num_color_attachments,
-                     unsigned(key.z_format), hashes.c_str(), formats.c_str());
-    }
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
@@ -156,14 +177,12 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     if (!preloading) {
-        const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+        const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
         sdata.multisampling = {
             .rasterizationSamples = LiverpoolToVK::NumSamples(
                 key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
-            // port: ISSN_LIGHTING_TEST=shading keeps sample shading off (vk_lighting_test.h).
-            .sampleShadingEnable = !LightingTest::Current().shading &&
-                                   (fs_info.addr_flags.persp_sample_ena ||
-                                    fs_info.addr_flags.linear_sample_ena),
+            .sampleShadingEnable =
+                fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
         };
     }
 
@@ -207,7 +226,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
         shader_stages;
-    auto stage = u32(Shader::SwStage::Vertex);
+    auto stage = u32(Shader::LogicalStage::Vertex);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
@@ -215,7 +234,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::SwStage::Geometry);
+    stage = u32(Shader::LogicalStage::Geometry);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eGeometry,
@@ -223,7 +242,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::SwStage::TessellationControl);
+    stage = u32(Shader::LogicalStage::TessellationControl);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -233,7 +252,7 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
             sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -242,7 +261,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::SwStage::TessellationEval);
+    stage = u32(Shader::LogicalStage::TessellationEval);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
@@ -251,7 +270,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
                 AuxShaderType::PassthroughTES, fs_info);
         }
@@ -261,33 +280,26 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::SwStage::Fragment);
+    stage = u32(Shader::LogicalStage::Fragment);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (preloading ? !sdata.fragment.empty()
-                          : runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
-        // port: a preloaded pipeline has no runtime infos; its .key carries the discard shader.
+    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_emulation) {
         if (!preloading) {
-            const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
+            const auto vs_runtime_info =
+                runtime_infos[static_cast<u32>(Shader::LogicalStage::Vertex)].vs_info;
 
-            sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
+            sdata.fragment =
+                Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs_runtime_info.outputs);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = CompileSPV(sdata.fragment, instance.GetDevice()),
             .pName = "main",
         });
-    }
-
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
-    };
-    for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
     }
 
     const auto depth_format =
@@ -333,70 +345,47 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
-    // port: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
-    // MIN/MAX is drawn twice: native, then this pipeline squares the destination.
-    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
-    bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend_controls[i];
-        const auto target_format = key.color_buffers[i].num_format;
-        BlendEquation color_equation{control.color_src_factor, control.color_func,
-                                     control.color_dst_factor};
-        BlendEquation alpha_equation{
-            control.separate_alpha_blend ? control.alpha_src_factor : control.color_src_factor,
-            control.separate_alpha_blend ? control.alpha_func : control.color_func,
-            control.separate_alpha_blend ? control.alpha_dst_factor : control.color_dst_factor};
-        const auto color_rewrite =
-            RewriteScaledMinMaxBlend(color_equation, target_format, BlendChannel::Color);
-        const auto alpha_rewrite =
-            RewriteScaledMinMaxBlend(alpha_equation, target_format, BlendChannel::Alpha);
-        const bool writes_color = bool(key.write_masks[i] & (vk::ColorComponentFlagBits::eR |
-                                                             vk::ColorComponentFlagBits::eG |
-                                                             vk::ColorComponentFlagBits::eB));
-        const bool writes_alpha = bool(key.write_masks[i] & vk::ColorComponentFlagBits::eA);
-        if (control.enable &&
-            ((writes_color && color_rewrite == BlendRewriteResult::Unsupported) ||
-             (writes_alpha && alpha_rewrite == BlendRewriteResult::Unsupported))) {
-            LOG_WARNING(Render_Vulkan,
-                        "Scaled MIN/MAX blend on attachment {} has no Vulkan equivalent "
-                        "(format {}, color {}/{}/{}, alpha {}/{}/{})",
-                        i, u32(target_format), u32(color_equation.src_factor),
-                        u32(color_equation.function), u32(color_equation.dst_factor),
-                        u32(alpha_equation.src_factor), u32(alpha_equation.function),
-                        u32(alpha_equation.dst_factor));
-        }
-        const bool square_color =
-            control.enable && writes_color && color_rewrite == BlendRewriteResult::Squared;
-        const bool square_alpha =
-            control.enable && writes_alpha && alpha_rewrite == BlendRewriteResult::Squared;
-        needs_square_pass |= square_color || square_alpha;
 
-        const auto src_color = LiverpoolToVK::BlendFactor(color_equation.src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(color_equation.dst_factor);
+        const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
+        const auto dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
+        const auto color_blend = LiverpoolToVK::BlendOp(control.color_func);
+
+        const auto src_alpha = control.separate_alpha_blend
+                                   ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
+                                   : src_color;
+        const auto dst_alpha = control.separate_alpha_blend
+                                   ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
+                                   : dst_color;
+        const auto alpha_blend =
+            control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
+
+        const auto color_scaled_min_max =
+            (color_blend == vk::BlendOp::eMin || color_blend == vk::BlendOp::eMax) &&
+            (src_color != vk::BlendFactor::eOne || dst_color != vk::BlendFactor::eOne);
+        const auto alpha_scaled_min_max =
+            (alpha_blend == vk::BlendOp::eMin || alpha_blend == vk::BlendOp::eMax) &&
+            (src_alpha != vk::BlendFactor::eOne || dst_alpha != vk::BlendFactor::eOne);
+        if (color_scaled_min_max || alpha_scaled_min_max) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Unimplemented use of min/max blend op with blend factor not equal to one.");
+        }
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
             .srcColorBlendFactor = src_color,
             .dstColorBlendFactor = dst_color,
-            .colorBlendOp = LiverpoolToVK::BlendOp(color_equation.function),
-            .srcAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.src_factor),
-            .dstAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.dst_factor),
-            .alphaBlendOp = LiverpoolToVK::BlendOp(alpha_equation.function),
+            .colorBlendOp = color_blend,
+            .srcAlphaBlendFactor = src_alpha,
+            .dstAlphaBlendFactor = dst_alpha,
+            .alphaBlendOp = alpha_blend,
             .colorWriteMask =
                 instance.IsDynamicColorWriteMaskSupported()
                     ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
-        };
-        square_attachments[i] = vk::PipelineColorBlendAttachmentState{
-            .blendEnable = true,
-            .srcColorBlendFactor = vk::BlendFactor::eZero,
-            .dstColorBlendFactor = square_color ? vk::BlendFactor::eDstColor : vk::BlendFactor::eOne,
-            .colorBlendOp = vk::BlendOp::eAdd,
-            .srcAlphaBlendFactor = vk::BlendFactor::eZero,
-            .dstAlphaBlendFactor = square_alpha ? vk::BlendFactor::eDstAlpha : vk::BlendFactor::eOne,
-            .alphaBlendOp = vk::BlendOp::eAdd,
-            .colorWriteMask = attachments[i].colorWriteMask,
         };
 
         // On GCN GPU there is an additional mask which allows to control color components exported
@@ -436,8 +425,25 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    // Descriptor mappings go on shader stage creation; auxiliary stages bind nothing.
+    const NativeApi::PipelineCreateFlags2CreateInfo flags2_ci = {
+        .sType = NativeApi::StructureTypePipelineCreateFlags2CreateInfo,
         .pNext = &pipeline_rendering_ci,
+        .flags = NativeApi::PipelineCreate2DescriptorHeapBit,
+    };
+    if (uses_native_bindings) {
+        for (auto& shader_stage : shader_stages) {
+            if (const auto* mapping_info =
+                    NativeMappingInfo(shader_stage.stage, shader_stage.pNext)) {
+                shader_stage.pNext = mapping_info;
+            }
+        }
+    }
+
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .pNext = uses_native_bindings ? static_cast<const void*>(&flags2_ci)
+                                      : static_cast<const void*>(&pipeline_rendering_ci),
+        .flags = DiagPipelineCreateFlags(),
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -450,58 +456,45 @@ GraphicsPipeline::GraphicsPipeline(
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
-        .layout = *pipeline_layout,
+        .layout = uses_native_bindings ? vk::PipelineLayout{} : *pipeline_layout,
     };
 
-    // port: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
-    const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
-    if (EmulatorSettings.IsDumpShaders()) {
-        // issn: the driver may end the process while compiling: the last one named is the one.
-        std::fprintf(stderr, "Pipeline: creating graphics %s\n", debug_str.c_str());
-        std::fflush(stderr);
-    }
     auto [pipeline_result, pipe] =
-        CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
-                                     instance.GetPipelineBinaryGlobalKey(), binary_directory);
+        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // A cached pipeline the driver refuses is left out of the preload (IsCreated() false);
+        // the draw that needs it compiles it from its own state at play time. 2026-10-19: an
+        // RX 7800 XT returned ErrorInitializationFailed in the boot preload and the assert below
+        // ended the game on every launch after the first.
+        LOG_WARNING(Render_Vulkan,
+                    "Cached graphics pipeline {} refused by the driver ({}): left to compile at "
+                    "play time",
+                    debug_str, vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-    RecordWaveSizes();
-
-    if (needs_square_pass) {
-        auto square_blending = color_blending;
-        square_blending.logicOpEnable = false;
-        square_blending.pAttachments = square_attachments.data();
-        auto square_info = pipeline_info;
-        square_info.pColorBlendState = &square_blending;
-        auto [square_result, square] =
-            CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
-                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
-        ASSERT_MSG(square_result == vk::Result::eSuccess,
-                   "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
-        square_pipeline = std::move(square);
-        SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
-    }
-    g_issn_pipeline_total_ns += NsSince(started);
-    ++g_issn_pipelines_built;
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
+// GetVertexInputs on a fetch shader that is not yet owned by a pipeline (DeriveStageInputs).
 template <typename Attribute, typename Binding>
-void GraphicsPipeline::GetVertexInputs(
-    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
-    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
+static void FetchVertexInputs(const Shader::Gcn::FetchShaderData* fetch_shader,
+                              VertexInputs<Attribute>& attributes,
+                              VertexInputs<Binding>& bindings,
+                              VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                              VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                              u32 step_rate_1, const Shader::BoundStage& vs) {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
     if (!fetch_shader || fetch_shader->attributes.empty()) {
         return;
     }
-    const auto& vs_info = GetStage(Shader::SwStage::Vertex);
     for (const auto& attrib : fetch_shader->attributes) {
         const auto step_rate = attrib.GetStepRate();
-        const auto buffer = attrib.GetSharp(vs_info);
+        const auto buffer = attrib.GetSharp(vs);
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,
@@ -529,40 +522,166 @@ void GraphicsPipeline::GetVertexInputs(
     }
 }
 
+template <typename Attribute, typename Binding>
+void GraphicsPipeline::GetVertexInputs(
+    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::BoundStage& vs) const {
+    FetchVertexInputs<Attribute, Binding>(fetch_shader.get(), attributes, bindings, divisors,
+                                          guest_buffers, step_rate_0, step_rate_1, vs);
+}
+
 // Declare templated GetVertexInputs for necessary types.
 template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription>& attributes,
     VertexInputs<vk::VertexInputBindingDescription>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::BoundStage& vs) const;
 template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes,
     VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::BoundStage& vs) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+u32 GraphicsPipeline::DeriveVertexInputs(AmdGpu::CpSplit::VertexInputsDerived& out,
+                                         u32 step_rate_0, u32 step_rate_1,
+                                         const Shader::BoundStage& vs) const {
+    using namespace AmdGpu::CpSplit;
+    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+    static_assert(MaxVertexInputs == MaxVertexBufferCount);
+    out.header = {};
+    if (fetch_shader && !fetch_shader->attributes.empty()) {
+        // The GetVertexInputs loop (the 2EXT instantiation: the divisor rides in the binding).
+        for (const auto& attrib : fetch_shader->attributes) {
+            ASSERT_MSG(out.header.count < MaxVertexInputs,
+                       "Vertex attribute binding count exceeded limit: {} >= {}",
+                       out.header.count, MaxVertexInputs);
+            const auto step_rate = attrib.GetStepRate();
+            const auto buffer = attrib.GetSharp(vs);
+            auto& a = out.attribs[out.header.count++];
+            a.desc.vk_format = static_cast<u32>(
+                LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()));
+            a.desc.stride = buffer.GetStride();
+            a.desc.divisor = step_rate == InstanceIdType::OverStepRate0
+                                 ? step_rate_0
+                                 : (step_rate == InstanceIdType::OverStepRate1 ? step_rate_1 : 1);
+            a.desc.location = attrib.semantic;
+            a.desc.instanced = step_rate != InstanceIdType::None;
+            a.desc.pad = 0;
+            a.base_address = buffer.base_address;
+            a.size = buffer.GetSize();
+            a.range = VertexInputNoRange;
+            a.pad = 0;
+        }
+    }
+    // BindVertexBuffers' range list: the buffers with a base and a size, sorted by base
+    // (insertion sort: at most 32, usually a handful), connecting ranges merged.
+    std::array<VertexInputRange, MaxVertexInputs> sorted;
+    u32 num_sorted = 0;
+    for (u32 i = 0; i < out.header.count; ++i) {
+        const auto& a = out.attribs[i];
+        if (a.base_address == 0 || a.size == 0) {
+            continue;
+        }
+        const VertexInputRange range{a.base_address, a.base_address + a.size};
+        u32 pos = num_sorted++;
+        while (pos > 0 && sorted[pos - 1].base_address > range.base_address) {
+            sorted[pos] = sorted[pos - 1];
+            --pos;
+        }
+        sorted[pos] = range;
+    }
+    for (u32 i = 0; i < num_sorted; ++i) {
+        const auto& range = sorted[i];
+        if (i == 0 || out.ranges[out.header.range_count - 1].end_address < range.base_address) {
+            out.ranges[out.header.range_count++] = range;
+        } else {
+            auto& prev = out.ranges[out.header.range_count - 1];
+            prev.end_address = std::max(prev.end_address, range.end_address);
+        }
+    }
+    // The merged range each bound buffer falls in (BindVertexBuffers' find_if per buffer).
+    for (u32 i = 0; i < out.header.count; ++i) {
+        auto& a = out.attribs[i];
+        if (a.base_address == 0 || a.size == 0) {
+            continue;
+        }
+        u32 r = 0;
+        while (r < out.header.range_count &&
+               !(a.base_address >= out.ranges[r].base_address &&
+                 a.base_address < out.ranges[r].end_address)) {
+            ++r;
+        }
+        ASSERT(r < out.header.range_count);
+        a.range = static_cast<u16>(r);
+    }
+    return out.Bytes();
+}
+
+GraphicsPipeline::DescSetBindings GraphicsPipeline::DeriveStageInputs(
+    const Instance& instance, std::span<const Shader::Info*, MaxShaderStages> stages,
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    const Shader::Gcn::FetchShaderData* fetch_shader, SerializationSupport& sdata) {
+    // The same two reads of the Infos the constructor makes without `derived`, in its order.
+    DescSetBindings bindings;
+    CollectDescSetBindings(stages, sdata, false, bindings);
+    if (!instance.IsVertexInputDynamicState()) {
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
+        FetchVertexInputs(fetch_shader, sdata.vertex_attributes, sdata.vertex_bindings,
+                          sdata.divisors, guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1,
+                          Shader::BoundStage{stages[u32(Shader::LogicalStage::Vertex)]});
+    }
+    return bindings;
+}
+
+void GraphicsPipeline::CollectDescSetBindings(std::span<const Shader::Info* const> stages,
+                                              SerializationSupport& sdata, bool preloading,
+                                              DescSetBindings& bindings) {
     u32 binding{};
+    // Image descriptor counts cannot be recomputed while preloading, so they are carried in
+    // sdata. Populated on first creation, replayed on preload.
+    u32 image_idx{};
+    if (!preloading) {
+        sdata.image_binding_counts.clear();
+    }
 
     for (const auto* stage : stages) {
         if (!stage) {
             continue;
         }
-        const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
+        const auto stage_bit = LogicalStageToStageBit[u32(stage->l_stage)];
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
             bindings.push_back({
                 .binding = binding++,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
+                                                          : vk::DescriptorType::eUniformBuffer,
                 .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });
         }
         for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+            const bool have_cached = image_idx < sdata.image_binding_counts.size();
+            if (preloading && !have_cached) {
+                // Only reachable from a cache written before this field existed, which the
+                // version bump should already have rejected.
+                LOG_ERROR(Render_Vulkan,
+                          "Preloaded pipeline is missing image binding counts, descriptor set "
+                          "layout will be wrong");
+            }
+            const u32 num_bindings = (preloading && have_cached)
+                                         ? sdata.image_binding_counts[image_idx]
+                                         : image.NumBindings(*stage);
+            if (!preloading) {
+                sdata.image_binding_counts.push_back(num_bindings);
+            }
+            ++image_idx;
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
@@ -581,7 +700,27 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+}
+
+void GraphicsPipeline::BuildDescSetLayout(
+    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+    // The unified binding count is the next free index after the last binding.
+    const u32 binding =
+        bindings.empty() ? 0u : bindings.back().binding + bindings.back().descriptorCount;
+    if (instance.IsNativeBindingsActive()) {
+        // Same unified binding numbering, expressed as descriptor heap mappings instead.
+        BuildNativeMappings(bindings);
+        return;
+    }
+    // l4c: the total descriptor count (a sparse layout - SHADPS4_NATIVE_SPARSE_LAYOUT - has gaps);
+    // equal to `binding` for a contiguous one.
+    u32 total = 0;
+    for (const auto& b : bindings) {
+        total += b.descriptorCount;
+    }
+    uses_push_descriptors = total < instance.MaxPushDescriptors();
+    (void)binding;
+    BuildPacketBindings(bindings);
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

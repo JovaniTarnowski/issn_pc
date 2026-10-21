@@ -3,19 +3,14 @@
 
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <atomic>
-#include "video_core/texture_cache/readback_queue.h"
-#include "video_core/texture_cache/readback_sources.h"
-#include <chrono>
-#include "issn_toggles.h"
-#include <optional>
-#include <cstdlib>
-#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
-
 #include <condition_variable>
+#include "common/switch_mutex.h"
+#include <memory>
 #include <mutex>
+#include <span>
+#include <unordered_map>
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -36,10 +31,6 @@ namespace AmdGpu {
 struct Liverpool;
 }
 
-namespace Vulkan {
-class Runtime;
-}
-
 namespace VideoCore {
 
 class BufferCache;
@@ -50,11 +41,6 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
-    /// tlg (shadPS4-Infamous-FixBuild 0c3fada0): cards with a budget up to this keep the
-    /// collector's critical mark at least RESIDENCY_HEADROOM below it, forced budget or not.
-    static constexpr s64 SMALL_CARD_MEMORY = 6_GB;
-    /// Room the collector tries to leave for memory the buffer cache makes resident.
-    static constexpr s64 RESIDENCY_HEADROOM = 1_GB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -79,16 +65,11 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
-        /// tlg (gow3_pc #348): the shader reads with integer coordinates
-        /// (ImageResource::needs_native), not normalized sampling. Gates ResolveOverlap's partial
-        /// height views.
-        bool needs_native{true};
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
-              needs_native{desc.needs_native} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -102,20 +83,8 @@ public:
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                 Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache, PageManager& tracker);
     ~TextureCache();
-
-    /// port: changes whenever an image is registered or unregistered.
-    [[nodiscard]] u64 RegistryGeneration() const noexcept {
-        return registry_generation.load(std::memory_order_acquire);
-    }
-
-    /// port: FindImage's access tick for an image found by a memoized lookup. The LRU touch
-    /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
-    void MarkFound(ImageId image_id) {
-        slot_images[image_id].tick_accessed_last = scheduler.CurrentTick();
-    }
 
     TileManager& GetTileManager() noexcept {
         return tile_manager;
@@ -124,30 +93,20 @@ public:
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
-    /// tlg (gow3_pc #331): guest memory written through the backing view (readbacks, buffer
-    /// downloads), which bypasses page tracking. Any lock may be held: images over the range are
-    /// marked CPU-dirty at the next UpdateImage or GC tick (ApplyBackingWrites). Only with
-    /// ISSN_BACKING_INVALIDATE=1.
-    void NoteBackingWrite(VAddr address, u64 size);
-    [[nodiscard]] static bool BackingInvalidateEnabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("ISSN_BACKING_INVALIDATE");
-            return value && value[0] == '1';
-        }();
-        return enabled && !IssnToggle::Disabled(IssnToggle::BackingInvalidate);
-    }
-
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+
+    /// SHADPS4_BUFFER_IMAGE_ALIAS_DIAG=1 (diagnostic): a shader-written buffer range overlapping
+    /// cached images. "handled" is the formatted same-base case InvalidateMemoryFromGPU marks
+    /// GpuDirty; anything else ("missed") leaves the cached image as it was.
+    static bool BufferImageAliasDiag();
+    void DiagBufferWriteOverImages(VAddr address, size_t size, bool formatted);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
-    bool ResolveReadbacks(VAddr address, u64 size, bool assume_locks = true,
-                          ReadbackSource source = ReadbackSource::Unknown);
-    void CancelReadbacks(VAddr address, u64 size, bool exact = false);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -155,18 +114,17 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
-    /// port: a FindView result remembered by the caller for the same image and view info.
-    struct ViewMemo {
-        ImageId image_id{};
-        const void* backing = nullptr;
-        ImageViewId view_id{};
-    };
+    /// SHADPS4_DLSS: the image at exactly `address` with this size, the most recently used one
+    /// when several alias it (0x26b200000 holds the 1920x1080 scene depth and, after the AA, the
+    /// minimap's 768x768 depth: FindImageFromRange's byte-size test matches neither).
+    [[nodiscard]] ImageId FindImageAtSize(VAddr address, u32 width, u32 height);
+
+    /// SHADPS4_DRAW_REPEAT_HEAP: any image whose guest address is exactly `address` (the
+    /// candidates FindImageFromRange considers, without its size test or log).
+    [[nodiscard]] bool AnyImageAt(VAddr address);
 
     /// Retrieves an image view with the properties of the specified image id.
-    /// `refresh` false: an image found out of date is used as is (the texture binding helper
-    /// checked it beforehand; only a guest write racing with the draw can make it so).
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc,
-                                         ViewMemo* memo = nullptr, bool refresh = true);
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -174,63 +132,47 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// port: whether UpdateImage has nothing to do for this image (its fast path).
-    [[nodiscard]] bool IsUpToDate(ImageId image_id) const {
-        const Image& image = slot_images[image_id];
-        const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
-                              .load(std::memory_order_acquire);
-        constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
-        constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
-        constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
-        return (flags & (Dirty | Registered | Aliased)) == Registered &&
-               !has_backing_writes.load(std::memory_order_acquire) &&
-               image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-               image.lru_touched_tick == gc_tick;
-    }
-
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id) {
-        // port: a clean image already tracked and touched in this GC period needs nothing.
-        // Every texture binding comes here; the mutex (shared with the fault handlers of the
-        // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
-        // racing with this check races the same way with the locked path.
-        if (!IssnToggle::Disabled(IssnToggle::UpdateImageFastPath)) {
-            const Image& image = slot_images[image_id];
-            const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
-                                  .load(std::memory_order_acquire);
-            constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
-            constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
-            // Images sharing memory with another take the locked path: SynchronizeAlias.
-            constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
-            if ((flags & (Dirty | Registered | Aliased)) == Registered &&
-                !has_backing_writes.load(std::memory_order_acquire) &&
-                image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-                image.lru_touched_tick == gc_tick) {
-                return;
-            }
-        }
-        std::scoped_lock lock{mutex};
-        ApplyBackingWrites();
-        Image& image = slot_images[image_id];
-        TrackImage(image_id);
-        TouchImage(image);
-        RefreshImage(image);
-        SynchronizeAlias(image_id);
-    }
-
-    /// port: a GPU write to the image (render target, storage): images sharing its memory
-    /// copy from it before their next read. From cuesta4/shadPS4 (eltutz), which fixed God of
-    /// War III's exposure: it is measured into a small image and read through an alias.
-    void PublishAliasWrite(ImageId image_id);
+    void UpdateImage(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
                                                                ImageId cache_img_id,
-                                                               ImageId merged_image_id,
-                                                               bool native_reads);
+                                                               ImageId merged_image_id);
 
     /// Resolves depth overlap and either re-creates the image or returns existing one
+    /// SHADPS4_STENCIL_SHADOW=1: when overlap resolution replaces a depth-stencil image with
+    /// one without stencil (depth read or written as R32, depth-only target), the stencil plane
+    /// is saved to an R8 shadow keyed by guest address and restored into the next depth-stencil
+    /// image recreated there. Without it every hop drops the stencil (PS4 Pro checkerboard mask).
+    void SaveStencilShadow(ImageId depth_id);
+    void RestoreStencilShadow(ImageId depth_id);
+    void CopyStencilAspect(ImageId src_id, ImageId dst_id);
+    std::unordered_map<VAddr, ImageId> stencil_shadows;
+    // SHADPS4_STENCIL_PLANE_MERGE=1: guest stencil addresses of bound depth targets. A storage
+    // write to the R8 placeholder at one of them (Pro depth+stencil resolve compute) is merged
+    // into the depth's stencil aspect when that depth is next bound as a depth target.
+    std::unordered_set<VAddr> stencil_plane_addrs;
+
+public:
+    static bool StencilPlaneMerge() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("SHADPS4_STENCIL_PLANE_MERGE");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+    /// Called by the storage-image bind path for written images with no live depth association.
+    void NoteStorageWrite(Image& image) {
+        if (StencilPlaneMerge() && !image.info.props.is_depth &&
+            stencil_plane_addrs.contains(image.info.guest_address)) {
+            image.stencil_plane_written = true;
+        }
+    }
+
+public:
+
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);
 
@@ -240,35 +182,151 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
-    /// port: ISSN_BC_TINY: fills an is_bc_decoded image from a CPU decode of guest memory.
-    void UploadDecodedImage(Image& image);
+    /// SHADPS4_TEX_REPLACE: the user's pictures over parts of a just-uploaded texture.
+    void ApplyTexReplace(Image& image);
 
-    /// Retrieves the sampler that matches the provided S# descriptor.
-    /// extra_lod_bias: tlg, added to the S#'s bias (reduced scene rendering).
+    /// Retrieves the sampler that matches the provided S# descriptor. When native_index is
+    /// provided, it also receives the sampler's descriptor heap slot; the sampler object may
+    /// move in its map, so the slot is resolved here under the same lock.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth, float extra_lod_bias = 0.0f);
+                                         u32* native_index = nullptr);
 
     /// Retrieves the image with the specified id.
-    Image* TryGetImage(ImageId id, u64 uid) {
-        if (!slot_images.is_allocated(id)) return nullptr;
-        auto& image = slot_images[id];
-        return !uid || image.image_uid == uid ? &image : nullptr;
-    }
-    /// tlg diagnostics: writes level 0 of a color image to ISSN_DIAG_DIR as raw pixels
-    /// (<seq>_<tag>_<address>_<w>x<h>_p<pitch>_b<bytes per pixel>_f<vk format>.raw). Waits for
-    /// the GPU.
-    void DiagDumpImage(ImageId image_id, const char* tag);
-
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
         TouchImage(image);
         return image;
     }
 
+    /// SHADPS4_BIND_MEMO_STATS: the image without the LRU touch GetImage does.
+    /// q8: the table's bulk touch checks an id before PeekImage.
+    [[nodiscard]] bool IsImageAllocated(ImageId id) noexcept {
+        return id && slot_images.is_allocated(id);
+    }
+    [[nodiscard]] Image& PeekImage(ImageId id) noexcept {
+        return slot_images[id];
+    }
+
+    /// SHADPS4_NATIVE_BINDLESS (back thread): a T# -> image cache entry still names the image
+    /// FindImage would return - PreparedEntryValid's rule (allocated, same uid, registered, not
+    /// picked; same structure generation, or an exact-range match whose overlap epoch is
+    /// unchanged) - and the image needs no re-validation on a bind (clean, no depth association).
+    [[nodiscard]] bool BindlessEntryValid(ImageId id, u64 uid, u64 generation, bool local,
+                                          u64 overlap_epoch) {
+        if (!id || !uid || !slot_images.is_allocated(id)) {
+            return false;
+        }
+        const Image& image = slot_images[id];
+        const auto flags = std::atomic_ref<ImageFlagBits>{const_cast<ImageFlagBits&>(image.flags)}
+                               .load(std::memory_order_relaxed);
+        if (image.image_uid != uid || False(flags & ImageFlagBits::Registered) ||
+            True(flags & (ImageFlagBits::Picked | ImageFlagBits::Dirty)) || image.depth_id) {
+            return false;
+        }
+        if (struct_generation.load(std::memory_order_acquire) == generation) {
+            return true;
+        }
+        return local && std::atomic_ref<u64>{const_cast<u64&>(image.overlap_epoch)}.load(
+                            std::memory_order_relaxed) == overlap_epoch;
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: the UpdateImageLockFree predicate (registered, clean, tracked
+    /// over its whole guest range) with relaxed loads, no LRU touch and no counters. CP thread.
+    [[nodiscard]] bool ImageUpToDateRelaxed(ImageId id) noexcept {
+        Image& image = slot_images[id];
+        const auto flags =
+            std::atomic_ref<ImageFlagBits>{image.flags}.load(std::memory_order_relaxed);
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        return True(flags & ImageFlagBits::Registered) && False(flags & ImageFlagBits::Dirty) &&
+               std::atomic_ref<VAddr>{image.track_addr}.load(std::memory_order_relaxed) == begin &&
+               std::atomic_ref<VAddr>{image.track_addr_end}.load(std::memory_order_relaxed) == end;
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: bumped by every InvalidatePreparedImages call (image register,
+    /// unregister, delete, deferred erase), whether or not the prepared-image memo is enabled.
+    /// l4e: the GC tick and the age tick the LRU touches write (material memo touch skip).
+    [[nodiscard]] u64 GcTickNow() const noexcept {
+        return gc_tick;
+    }
+    [[nodiscard]] u64 AgeTickNow() const {
+        return AgeTick();
+    }
+    [[nodiscard]] u64 StructGeneration() const noexcept {
+        return struct_generation.load(std::memory_order_acquire);
+    }
+
+    /// SHADPS4_BIND_MEMO_STATS: bumped for every sampler the sampler GC destroys.
+    [[nodiscard]] u64 SamplerGeneration() const noexcept {
+        return sampler_generation.load(std::memory_order_acquire);
+    }
+
+    /// SHADPS4_TEX_BIND_MEMO: protects a binding-memo hit's validation and LRU touches the way
+    /// the FindImage/UpdateImage fast paths are protected: the lock-free handshake when
+    /// SHADPS4_TEX_LOCKFREE_HIT is on (Refused while a foreign CacheLock holder is active; the
+    /// caller then runs the full path), otherwise the cache mutex. Nothing inside the section may
+    /// take the cache lock.
+    /// SHADPS4_TEX_MEMO_LOCAL_GEN: the slot still holds an image (not erased). Inside a memo section.
+    [[nodiscard]] bool ImageAllocated(ImageId id) const {
+        return slot_images.is_allocated(id);
+    }
+    enum class MemoSection : u8 { Refused, LockFree, Locked };
+    [[nodiscard]] MemoSection EnterMemoSection();
+    void LeaveMemoSection(MemoSection section);
+
+    /// SHADPS4_TEX_BIND_MEMO: FindImage's perfect-match predicate (non-exact format) for `id`
+    /// against the requested info, including its "enough resources" check. Bindings resolved by
+    /// overlap resolution fail it and are never memoized.
+    [[nodiscard]] bool IsPerfectMatch(const ImageInfo& requested, ImageId id);
+
+    /// SHADPS4_TEX_BIND_MEMO: what FindImage/UpdateImage do to a reused image on their fast
+    /// paths (access tick and LRU touch). Call inside a memo section.
+    void TouchImageAccess(Image& image);
+
+    /// SHADPS4_TEX_BIND_MEMO: LRU id of the cached sampler for this S#, or ~0 when absent.
+    [[nodiscard]] size_t SamplerLruId(const AmdGpu::Sampler& sampler);
+
+    /// SHADPS4_TEX_BIND_MEMO: the LRU touch GetSampler does on a hit, for every id, if no
+    /// sampler has been destroyed since `generation` (else returns false and touches nothing).
+    [[nodiscard]] bool TouchSamplers(std::span<const size_t> lru_ids, u64 generation);
+
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];
+    }
+
+    /// Diagnostic (SHADPS4_DUMP_IMAGES): writes mip 0 / layer 0 of every registered image whose
+    /// guest address is listed to `<log dir>/imgdump_<tag>_<addr>_<w>x<h>_<format>_<uid>.raw`
+    /// (tightly packed texels, first aspect). Blocks on the GPU; CP thread only.
+    void DebugDumpImages(const std::vector<VAddr>& addresses, u32 tag);
+
+    /// SHADPS4_STENCIL_STORAGE: the registered depth image at `address` whose extent matches
+    /// `size`. One address can hold several depth surfaces (PS4 Pro: 1600x1800 scene depth and a
+    /// 3200x1800 reconstruction depth-stencil share a base address).
+    ImageId FindDepthImageBySize(VAddr address, const Extent3D& size) {
+        std::scoped_lock lock{mutex};
+        ImageId found{};
+        if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+            for (const ImageId id : *it) {
+                const Image& image = slot_images[id];
+                if (image.info.guest_address == address && image.info.props.is_depth &&
+                    image.info.size == size && True(image.flags & ImageFlagBits::Registered)) {
+                    found = id;
+                }
+            }
+        }
+        return found;
+    }
+
+    /// SHADPS4_STENCIL_STORAGE: an image outside the cache's page table, LRU and page tracking,
+    /// never refreshed from guest memory. The caller owns it for the rest of the run.
+    ImageId InsertScratchImage(const ImageInfo& info) {
+        CacheLock lock{*this};
+        const ImageId id =
+            slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+        slot_images[id].flags = ImageFlagBits::Empty;
+        return id;
     }
 
     /// Get the associated depth stencil image if it is still valid.
@@ -288,25 +346,18 @@ public:
         return {};
     }
 
-    enum class MetaType {
-        CMask,
-        FMask,
-        HTile,
-    };
-
-    /// Returns meta type if the specified address is a metadata surface.
-    std::optional<MetaType> IsMeta(VAddr address) const {
-        auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            return it->second.type;
-        }
-        return std::nullopt;
+    /// Returns true if the specified address is a metadata surface.
+    bool IsMeta(VAddr address) const {
+        return surface_metas.contains(address);
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
         if (it != surface_metas.end()) {
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Touch(it.value().cf, AmdGpu::MtbConflict::Meta);
+            }
             return it.value().clear_mask & (1u << slice);
         }
         return false;
@@ -317,19 +368,45 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
+            ++meta_clear_epoch;
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Change(it.value().cf, AmdGpu::MtbConflict::Meta);
+            }
             return true;
         }
         return false;
     }
 
+    /// SHADPS4_RENDER_STATE_MEMO: bumped whenever a clear bit of a metadata surface is set
+    /// (ClearMeta, TouchMeta with is_clear). While it stands still, a slice that read "not
+    /// cleared" still reads so. CP thread only, like surface_metas.
+    [[nodiscard]] u64 MetaClearEpoch() const noexcept {
+        return meta_clear_epoch;
+    }
+
+    /// SHADPS4_RENDER_STATE_MEMO: what FindRenderTarget / FindDepthTarget do to a target that
+    /// was already resolved by them with the same descriptor and whose image, backing and
+    /// registered metadata are unchanged since: the GPU-modified flag, the usage bit, the
+    /// linear-readback registration and UpdateImage. No meta registration, stencil link or view
+    /// lookup (their results are unchanged by construction; see the memo's validity checks).
+    void NoteTargetUse(ImageId image_id, bool is_depth);
+
     /// Updates the state of a slice of the specified metadata surface.
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
+            if (AmdGpu::MtbConflict::g_enabled) [[unlikely]] {
+                AmdGpu::MtbConflict::Touch(it.value().cf, AmdGpu::MtbConflict::Meta);
+            }
+            const s32 old_mask = it.value().clear_mask;
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
+                ++meta_clear_epoch;
             } else {
                 it.value().clear_mask &= ~(1u << slice);
+            }
+            if (AmdGpu::MtbConflict::g_enabled && it.value().clear_mask != old_mask) [[unlikely]] {
+                AmdGpu::MtbConflict::Change(it.value().cf, AmdGpu::MtbConflict::Meta);
             }
             return true;
         }
@@ -338,13 +415,6 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
-
-    /// port: frees the images unused for as long as the collector's gentlest pass waits, without
-    /// its limit on how many go, for an allocation that failed for lack of device memory. Only
-    /// on the thread that owns the caches, with the texture binding helper joined. Returns
-    /// about how many bytes went. The memory is released once the GPU is done with the images
-    /// (Scheduler::PopPendingOperations after a Finish).
-    u64 ReleaseMemoryForAllocation();
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -387,22 +457,6 @@ public:
         }
     }
 
-    /// port: BP02 (shadPS4 145932bf, #5240) images whose guest address is exactly `cpu_addr`. Every
-    /// image is registered in all of its pages, so they are all in the bucket of the first page.
-    template <typename Func>
-    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
-        const auto it = page_table.find(cpu_addr >> Traits::PageBits);
-        if (it == nullptr) {
-            return;
-        }
-        for (const ImageId image_id : *it) {
-            Image& image = slot_images[image_id];
-            if (image.info.guest_address == cpu_addr) {
-                func(image_id, image);
-            }
-        }
-    }
-
 private:
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -423,14 +477,6 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
-    /// port: a recorded image-to-staging copy, written to guest memory after a GPU wait.
-    struct PendingDownload {
-        VAddr guest_address;
-        u32 size;
-        Vulkan::StagingBufferRef staging;
-    };
-    /// Records the copy of a GPU-modified image into a deferred staging allocation.
-    std::optional<PendingDownload> RecordImageDownload(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -459,13 +505,20 @@ private:
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
+    /// Clock of Image::tick_accessed_last and of ResolveOverlap's "safe to delete" age: the
+    /// scheduler tick minus the cadence-only submissions (Scheduler::NoteCadenceFlush), so the
+    /// eviction age does not shrink when batches are submitted more often.
+    /// SHADPS4_TEX_AGE_RAW=1 restores the plain scheduler tick.
+    u64 AgeTick() const;
+
+    /// True if another registered image over [guest_address, +guest_size) uses `meta_addr` as
+    /// one of its metadata surfaces (images that alias the same guest memory share them).
+    bool MetaUsedByOtherImage(VAddr meta_addr, VAddr guest_address, u64 guest_size);
+
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
-        const auto& image = slot_images[image_id];
-        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
-                         ReadbackSource::ImageFree);
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -474,28 +527,108 @@ private:
     void GarbageCollectImages();
     void GarbageCollectSamplers();
 
+    // Only the surviving perfect-match path is memoized. These are all its selection inputs;
+    // view_info is left live (that path never changes its range). Binding type is conservative.
+    struct PreparedImageKey {
+        VAddr address{};
+        u32 guest_size{};
+        Extent3D size{};
+        AmdGpu::ImageType type{};
+        vk::Format format{};
+        SubresourceExtent resources{};
+        BindingType binding{};
+        bool exact_fmt{};
+
+        bool operator==(const PreparedImageKey&) const = default;
+    };
+    struct PreparedImage {
+        PreparedImageKey key{};
+        ImageId id{};
+        u64 uid{};
+        u64 generation{};
+        /// SHADPS4_PREPARED_LOCAL: the image's overlap_epoch when recorded. A perfect match covers
+        /// exactly the lookup range, and every register / unregister of another image on one of
+        /// its pages bumps that image's epoch, so an unchanged epoch keeps the entry exact even
+        /// after the global generation moved (texture streaming moves it constantly).
+        u64 overlap_epoch{};
+        bool local{};
+    };
+    struct PreparedImages {
+        static constexpr size_t Capacity = 4096;
+        std::array<PreparedImage, Capacity> entries{};
+        // Atomic because deferred slot reclamation does not take the lookup mutex. This does
+        // not replace the existing page-table/slot synchronization or authorize concurrent use.
+        std::atomic<u64> generation{1};
+        bool verify{};
+        bool local{}; ///< SHADPS4_PREPARED_LOCAL=1
+        u64 calls{}, hits{}, fallbacks{}, verified{}; // FindImage mutex protects entries/counters.
+        u64 local_hits{}; ///< hits the global generation test would have missed
+    };
+
+    /// True when `memo` (key already equal) still names a registered, unpicked image with the
+    /// recorded uid, and either the global generation or (SHADPS4_PREPARED_LOCAL) the image's
+    /// overlap epoch is unchanged. `local_hit` reports a hit only the epoch test allowed.
+    [[nodiscard]] bool PreparedEntryValid(const PreparedImage& memo, u64 generation,
+                                          bool& local_hit);
+
+    /// Memo slot for a lookup, or nullptr when the lookup is not eligible for memoization.
+    PreparedImage* PreparedSlot(const ImageInfo& info, BindingType type, bool exact_fmt,
+                                PreparedImageKey& key);
+
+    /**
+     * SHADPS4_TEX_LOCKFREE_HIT=1: the CP thread answers FindImage memo hits and no-op UpdateImage
+     * calls without the cache mutex (~30k lock pairs a frame, ~9% of CP time on a16).
+     *
+     * Who else touches the cache: guest write-fault handlers (InvalidateMemory) only change an
+     * image's flags, tracked range and hash under the mutex - the fast paths read those with
+     * relaxed loads, and a fault landing just after the read is the same as one landing just
+     * after the locked version. Structural changes (slot vector, page table, LRU, memo) are made
+     * by the CP itself, except for off-CP callers such as video-out buffer registration and guest
+     * unmaps. Those take CacheLock, which first raises `lf_foreign`, forces a serializing
+     * instruction on every core (FlushProcessWriteBuffers) and waits until the CP is outside its
+     * fast path; the CP marks `lf_cp_in_fast` with a plain store and then checks `lf_foreign`,
+     * falling back to the locked path when set (asymmetric Dekker handshake).
+     */
+    class CacheLock {
+    public:
+        explicit CacheLock(TextureCache& cache);
+        ~CacheLock();
+        CacheLock(const CacheLock&) = delete;
+        CacheLock& operator=(const CacheLock&) = delete;
+
+    private:
+        TextureCache& cache;
+        bool foreign;
+    };
+    ImageId FindImageLockFree(const ImageDesc& desc, bool exact_fmt);
+    bool UpdateImageLockFree(ImageId image_id);
+    void CountLockFree(bool find, bool hit);
+    bool lockfree_hit{};
+    alignas(64) std::atomic<u32> lf_cp_in_fast{0};
+    alignas(64) std::atomic<u32> lf_foreign{0};
+    u64 lf_find_calls{}, lf_find_fast{}, lf_update_calls{}, lf_update_fast{};
+
+    // Any future in-place change of guest range, size, type, format or resources must invalidate
+    // here under the same synchronization as the mapping change. Currently those are immutable:
+    // expansion/depth replacement creates and registers a new Image instead.
+    void InvalidatePreparedImages();
+
 private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
-    Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
     BlitHelper blit_helper;
     TileManager tile_manager;
-    Common::SlotVector<Image> slot_images;
-    Common::SlotVector<ImageView> slot_image_views;
+    Common::SlotVector<Image, Common::StableSlotCapacity> slot_images;
+    Common::SlotVector<ImageView, Common::StableSlotCapacity> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
-    u64 gc_evictions = 0, gc_downloads = 0; ///< port: pressure report
-    std::chrono::steady_clock::time_point gc_report_time{};
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
-    /// port: the most critical_gc_memory may be on small cards (0: no cap), see SMALL_CARD_MEMORY.
-    u64 headroom_gc_memory = 0;
-    void ApplyResidencyHeadroom();
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
@@ -503,127 +636,33 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
-    const bool readback_linear_images;
-    const bool deferred_readbacks = [] {
-        const char* value = std::getenv("ISSN_DEFERRED_READBACK");
-        return value && value[0] == '1';
-    }();
-    /// port: ISSN_STALE_READBACK=1 (needs deferred readbacks). A pending copy only blocks CPU
-    /// writes: CPU reads see the version the GPU published last (one frame late) instead of
-    /// waiting for the GPU. Writes still wait, so no byte is lost.
-    const bool stale_readbacks = deferred_readbacks && [] {
-        const char* value = std::getenv("ISSN_STALE_READBACK");
-        return value && value[0] == '1';
-    }();
-    template <bool track>
-    void WatchReadback(VAddr address, u64 size);
-    struct ReadbackImageStat {
-        VAddr address;
-        u32 width, height, bits, copies, cpu_accesses;
-        vk::Format format;
-        u64 Bytes() const { return u64{width} * height * bits / 8; }
-    };
-    std::array<ReadbackImageStat, 16> readback_images{};
-    /// tlg (ISSN_PERF_DIAG, from gow3_pc #348): images FindImage had to create, by request, and the
-    /// image that was cached at that memory before (none: nothing overlapped).
-    struct CreateStat {
-        VAddr address;
-        u32 width, height, count;
-        vk::Format format;
-        BindingType binding;
-        const char* reason;
-        VAddr prev_address;
-        u32 prev_width, prev_height, overlaps;
-        vk::Format prev_format;
-        u32 pitch, tile, prev_pitch, prev_tile;
-        bool needs_native;
-    };
-    std::array<CreateStat, 16> create_stats{};
-    u64 images_created = 0;
-    std::chrono::steady_clock::time_point create_report = std::chrono::steady_clock::now();
-    void ReportImageCreates();
-    /// tlg (ISSN_PERF_DIAG): requests answered by IssnToggle::PartialHeightViews.
-    struct PartialViewStat {
-        VAddr address;
-        vk::Format format, used_format;
-        u32 used_width, used_height, min_height, max_height, count;
-        BindingType binding;
-    };
-    std::array<PartialViewStat, 16> partial_view_stats{};
-    u64 partial_views = 0;
-    void NotePartialView(const ImageInfo& request, const ImageInfo& used, BindingType binding);
-    u64 readbacks_released = 0;
-    u64 readbacks_neighbors = 0; ///< resolves ExactReadbackWaits let through (report)
-    bool ExactReadbackWaits() const {
-        return stale_readbacks && !IssnToggle::Disabled(IssnToggle::ExactReadbackWaits);
-    }
-    ReadbackQueue<Vulkan::StagingBufferRef> pending_readbacks;
-    std::mutex readback_mutex;
-    std::atomic<bool> has_pending_readbacks{false};
-    u64 readbacks_queued = 0, readbacks_completed = 0, readbacks_waited = 0;
-    u64 readbacks_canceled = 0, readbacks_peak_bytes = 0;
-    std::chrono::steady_clock::time_point readback_report = std::chrono::steady_clock::now();
-    ReadbackSourceStats readback_sources;
-    void RetireReadbacks();
+    bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
-    /// tlg (gow3_pc #331): under `mutex`. GPU-modified images hold the written data themselves.
-    void ApplyBackingWrites();
-    std::mutex backing_writes_mutex;
-    std::vector<std::pair<VAddr, u64>> backing_writes;
-    std::atomic<bool> has_backing_writes{false};
-    /// port: images with the same guest address (guarded by `mutex`). `backing` holds the
-    /// complete contents; `writer` is a newer write not yet copied into it.
-    struct AliasState {
-        u64 backing_uid{};
-        u64 writer_uid{};
-        ImageId backing{};
-        ImageId writer{};
-        u32 members{};
-        void ResetAuthority() {
-            const u32 count = members;
-            *this = {};
-            members = count;
-        }
-    };
-    tsl::robin_map<VAddr, AliasState> alias_states;
-    std::atomic<u64> alias_generation{};
-    [[nodiscard]] bool IsLiveImage(ImageId image_id, u64 image_uid) const {
-        return image_id && slot_images.is_allocated(image_id) &&
-               slot_images[image_id].image_uid == image_uid;
-    }
-    template <typename Func>
-    void ForEachAlias(const Image& image, Func&& func);
-    void SynchronizeAlias(ImageId image_id);
-    [[nodiscard]] bool CommitAliasWriter(AliasState& state);
-    void CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent);
-    void InvalidateAlias(Image& image);
-    // port: FindImage results for unchanged image registrations (guarded by `mutex`).
-    struct FindImageCacheEntry {
-        VAddr address = 0;
-        u64 size = 0;
-        Extent3D extent{};
-        vk::Format format{};
-        AmdGpu::ImageType type{};
-        bool exact_fmt = false;
-        BindingType binding{};
-        bool needs_native = true;
-        u32 levels = 0;
-        u32 layers = 0;
-        u64 generation = ~0ULL;
-        ImageId image_id{};
-        int view_mip = -1;
-        int view_slice = -1;
-    };
-    std::array<FindImageCacheEntry, 1024> find_image_cache{};
-    std::atomic<u64> registry_generation{0};
-    std::mutex samplers_mutex;
+    /// Registered images per page_table page, maintained under `mutex`, read without it by the
+    /// guest write-fault pre-check in InvalidateMemory (SHADPS4_TEX_INVALIDATE_PRECHECK=1).
+    std::unique_ptr<std::atomic<u32>[]> page_image_counts;
+    // SHADPS4_FAST_TEX_MUTEX=1: inline futex locks (measured 2026-09-24: lock/unlock of these
+    // two was ~9% of the CP's wall time at ~30k acquisitions per frame).
+    Common::SwitchMutex<Common::FastTexMutexFlag> mutex;
+    Common::SwitchMutex<Common::FastTexMutexFlag> samplers_mutex;
     std::mutex download_images_mutex;
+    std::unique_ptr<PreparedImages> prepared_images; // Allocated only when explicitly enabled.
+    // SHADPS4_BIND_MEMO_STATS: see StructGeneration and SamplerGeneration.
+    std::atomic<u64> struct_generation{0};
+    std::atomic<u64> sampler_generation{0};
     struct MetaDataInfo {
-        MetaType type;
+        enum class Type {
+            CMask,
+            FMask,
+            HTile,
+        };
+        Type type;
         s32 clear_mask = -1;
+        /// SHADPS4_MTB_CONFLICT (diagnostic): batch of the last clear-bit change / draw touch.
+        mutable AmdGpu::MtbConflict::Stamp cf{};
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    u64 meta_clear_epoch{}; // SHADPS4_RENDER_STATE_MEMO, see MetaClearEpoch
 };
 
 } // namespace VideoCore

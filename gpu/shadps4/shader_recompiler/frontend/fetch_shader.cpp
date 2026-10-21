@@ -1,58 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstring>
-#include <unordered_map>
-#include <vector>
-#include "issn_toggles.h"
+#include <cstdlib>
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "shader_recompiler/frontend/code_match.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 
 namespace Shader::Gcn {
-
-namespace {
-thread_local const FetchShaderSnapshot* compiler_snapshot = nullptr;
-}
-
-AmdGpu::Buffer VertexAttribute::GetSharp(const Shader::Info& info) const noexcept {
-    if (compiler_snapshot && compiler_snapshot->info == &info && compiler_snapshot->fetch) {
-        const auto& attributes = compiler_snapshot->fetch->attributes;
-        for (size_t i = 0; i < attributes.size(); ++i) {
-            if (attributes[i] == *this) {
-                return compiler_snapshot->buffers[i];
-            }
-        }
-        UNREACHABLE_MSG("Fetch attribute missing from compiler snapshot");
-    }
-    auto buffer = info.ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
-    buffer.base_address += inst_offset;
-    if (data_format) {
-        buffer.data_format = data_format;
-        buffer.num_format = num_format;
-    }
-    return buffer;
-}
-
-void FetchShaderSnapshot::Capture(const Info& source) {
-    info = &source;
-    fetch = ParseFetchShader(source);
-    buffers.clear();
-    if (fetch) {
-        for (const auto& attribute : fetch->attributes) {
-            buffers.push_back(attribute.GetSharp(source));
-        }
-    }
-}
-
-ScopedFetchShaderSnapshot::ScopedFetchShaderSnapshot(const FetchShaderSnapshot& snapshot)
-    : previous{compiler_snapshot} {
-    compiler_snapshot = &snapshot;
-}
-
-ScopedFetchShaderSnapshot::~ScopedFetchShaderSnapshot() {
-    compiler_snapshot = previous;
-}
 
 /**
  * s_load_dwordx4 s[8:11], s[2:3], 0x00
@@ -88,34 +44,11 @@ static bool IsTypedBufferLoad(const Gcn::GcnInst& inst) {
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     const u32* code;
-    std::memcpy(&code, &info.UserData()[sgpr_base], sizeof(code));
+    std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
     return code;
 }
 
-std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
-    if (compiler_snapshot && compiler_snapshot->info == &info) {
-        return compiler_snapshot->fetch;
-    }
-    if (!info.has_fetch_shader) {
-        return std::nullopt;
-    }
-
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
-
-    // port: the pipeline cache parses the fetch shader on every draw. Results are cached
-    // per thread by code address and revalidated against a copy of the code, which is
-    // much cheaper than decoding it again.
-    struct CachedParse {
-        std::vector<u32> code;
-        FetchShaderData data;
-    };
-    thread_local std::unordered_map<const u32*, CachedParse> cache;
-    if (const auto it = cache.find(code);
-        !IssnToggle::Disabled(IssnToggle::FetchShaderCache) && it != cache.end() &&
-        std::memcmp(code, it->second.code.data(), it->second.code.size() * sizeof(u32)) == 0) {
-        return it->second.data;
-    }
-
+static FetchShaderData DecodeFetchShader(const u32* code) {
     FetchShaderData data{};
     GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
     GcnDecodeContext decoder;
@@ -173,11 +106,75 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
     }
 
-    if (cache.size() >= 4096) {
-        cache.clear();
-    }
-    cache[code] = CachedParse{std::vector<u32>(code, code_slice.position()), data};
     return data;
+}
+
+std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+    if (!info.has_fetch_shader) {
+        return std::nullopt;
+    }
+    if (g_synthetic_fetch) [[unlikely]] {
+        return *g_synthetic_fetch;
+    }
+    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_FETCH_CACHE");
+        return !value || value[0] != '0';
+    }();
+    static const bool verify = [] {
+        const char* value = std::getenv("SHADPS4_FETCH_VERIFY");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return DecodeFetchShader(code);
+    }
+
+    // Parsing depends only on the instruction bytes, not the current vertex buffers,
+    // user data or instance divisors. Those are still read by StageSpecialization.
+    // Address selects a bounded slot; every hit validates the full instruction stream,
+    // including its terminating instruction. No guest write tracking is assumed.
+    struct Entry {
+        const u32* address{};
+        std::vector<u32> words;
+        FetchShaderData data;
+    };
+    static thread_local std::array<Entry, 256> entries;
+    const auto address = reinterpret_cast<uintptr_t>(code);
+    auto& entry = entries[((address >> 2) ^ (address >> 12) ^ (address >> 20)) & 255];
+    const bool hit = entry.address == code && !entry.words.empty() &&
+                     FetchShaderCodeMatches(code, entry.words);
+    if (!hit) {
+        auto decoded = DecodeFetchShader(code);
+        // Keep per-thread storage bounded even for unusual generated programs.
+        if (decoded.size > 4096) {
+            return decoded;
+        }
+        entry.address = code;
+        entry.words.assign(code, code + decoded.size / sizeof(u32));
+        entry.data = std::move(decoded);
+    }
+    if (verify) {
+        const auto reference = DecodeFetchShader(code);
+        const auto& cached = entry.data;
+        // Existing equality intentionally ignores several fields used by other paths.
+        ASSERT(cached.size == reference.size &&
+               cached.vertex_offset_sgpr == reference.vertex_offset_sgpr &&
+               cached.instance_offset_sgpr == reference.instance_offset_sgpr &&
+               cached.attributes.size() == reference.attributes.size());
+        for (size_t i = 0; i < cached.attributes.size(); ++i) {
+            const auto& a = cached.attributes[i];
+            const auto& b = reference.attributes[i];
+            ASSERT(a == b && a.inst_offset == b.inst_offset && a.data_format == b.data_format &&
+                   a.num_format == b.num_format);
+        }
+        static thread_local u64 calls = 0, hits = 0;
+        hits += hit;
+        if (++calls % 100000 == 0) {
+            LOG_INFO(Render, "FetchCacheVerify: calls={} hits={} hit_pct={:.2f}", calls, hits,
+                     100.0 * hits / calls);
+        }
+    }
+    return entry.data;
 }
 
 } // namespace Shader::Gcn

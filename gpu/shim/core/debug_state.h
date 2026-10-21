@@ -1,6 +1,8 @@
 // port: shadPS4's frame/register dump tooling is not part of this port.
 #pragma once
 #include <span>
+#include <utility>
+#include <vector>
 #include <string>
 #include "common/types.h"
 #include "shader_recompiler/runtime_info.h"
@@ -20,6 +22,8 @@ class DebugStateImpl {
 public:
     using CsState = AmdGpu::ComputeProgram;
     bool is_using_fsr{};
+    std::pair<u32, u32> game_resolution{};
+    std::pair<u32, u32> output_resolution{};
     void IncFlipFrameNum() {}
     void IncDrawCall() noexcept {}
     void IncDispatch() noexcept {}
@@ -31,7 +35,8 @@ public:
     void PushQueueDump(QueueDump) {}
     void PushRegsDump(uintptr_t, uintptr_t, const AmdGpu::Regs&) {}
     void PushRegsDumpCompute(uintptr_t, uintptr_t, const CsState&) {}
-    void CollectShader(const std::string&, Shader::SwStage, vk::ShaderModule, std::span<const u32>,
+    template <typename Stage>
+    void CollectShader(const std::string&, Stage, vk::ShaderModule, std::span<const u32>,
                        std::span<const u32>, std::span<const u32>, bool) {}
     void ShowDebugMessage(std::string) {}
     bool IsGuestThreadsPaused() const { return false; }

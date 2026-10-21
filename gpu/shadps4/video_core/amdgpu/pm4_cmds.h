@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include <cstdlib>
 #include <atomic>
-#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include "common/logging/log.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"
@@ -246,6 +246,9 @@ struct PM4CmdNop {
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
+        /// Emulator-private (SHADPS4_DRAW_TAG): trailing NOP of an HLE DrawIndex carries the
+        /// game job thread's (slot, sub-run) tag in data_block[1]. No back effect.
+        NativeDrawTag = 0x4e415430u, // 'NAT0'
     };
 };
 
@@ -340,61 +343,44 @@ enum class InterruptSelect : u32 {
     IrqUndocumented = 3,
 };
 
-// port: ISSN_GPU_TIMESTAMP=fixed (ISS_GPU_TIMESTAMP): GPU timestamps advance a fixed step per
-// write (ISSN_GPU_TIMESTAMP_STEP_US, default 20 us) instead of reading the host clock when the
-// packet is parsed. Our timestamps mark when the command processor reached the packet, not when
-// the GPU finished the work before it, so a game that budgets effects by measured GPU time sees
-// noise. Diagnostic for inFAMOUS distant smoke flickering (emitters dropped every other frame).
-struct GpuTimestampOverride {
-    bool fixed{};
-    u64 step_ns{20000};
-    u64 base_clock_ns{}; // host clock and TSC when the first timestamp was asked for
-    u64 base_tsc{};
-    std::atomic<u64> next_ns{};
-
-    GpuTimestampOverride() {
-        const char* env = std::getenv("ISSN_GPU_TIMESTAMP");
-        fixed = env && std::strcmp(env, "fixed") == 0;
-        if (const char* step = std::getenv("ISSN_GPU_TIMESTAMP_STEP_US")) {
-            if (const u64 us = std::strtoull(step, nullptr, 10)) {
-                step_ns = us * 1000;
-            }
-        }
-        base_clock_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             std::chrono::high_resolution_clock::now()
-                                                 .time_since_epoch())
-                                             .count());
-        base_tsc = Libraries::Kernel::sceKernelReadTsc();
-    }
-};
-inline GpuTimestampOverride& GpuTimestampMode() {
-    static GpuTimestampOverride mode;
-    return mode;
-}
-// Nanoseconds since the first timestamp, advanced one step per call.
-inline u64 FixedGpuTimestampNs() {
-    return GpuTimestampMode().next_ns.fetch_add(GpuTimestampMode().step_ns,
-                                               std::memory_order_relaxed);
-}
-
 static u64 GetGpuClock64() {
-    if (GpuTimestampMode().fixed) {
-        return GpuTimestampMode().base_clock_ns + FixedGpuTimestampNs();
-    }
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
     return static_cast<u64>(ticks);
 }
 
+/// SHADPS4_GPU_TIMESTAMP_STATS=1 (diagnostic): logs guest GPU-timestamp label writes (EOP / EOS /
+/// RELEASE_MEM with GpuClock64 or PerfCounter data): address, kind, value, and the delta to the
+/// previous timestamp written anywhere. inFAMOUS Second Son measures its particle draw time on the
+/// GPU and switches to a lower-resolution particle buffer when it is "too long" (GDC 2014 particle
+/// talk, slide 62); here these values are CP-time host clocks.
+/// SHADPS4_TIMESTAMP_READER=1 (diagnostic, Windows): find the guest code that reads the timestamp.
+void ArmTimestampReaderProbe(const void* address);
+
+inline void NoteGpuTimestamp(const void* address, u64 value, const char* kind) {
+    ArmTimestampReaderProbe(address);
+    static const bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_GPU_TIMESTAMP_STATS");
+        return v && v[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<u64> count{0};
+    static std::atomic<u64> last{0};
+    const u64 n = count.fetch_add(1, std::memory_order_relaxed);
+    const u64 prev = last.exchange(value, std::memory_order_relaxed);
+    if (n < 400 || (n & 0xfff) == 0) {
+        LOG_INFO(Render, "GpuTimestamp: n={} kind={} addr={:#x} value={} delta_prev={}", n, kind,
+                 reinterpret_cast<u64>(address), value, static_cast<s64>(value - prev));
+    }
+}
+
 static u64 GetGpuPerfCounter() {
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
     const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
 
-    if (GpuTimestampMode().fixed) {
-        return Common::MultiplyAndDivide64(GpuTimestampMode().base_tsc, gpu_freq, cpu_freq) +
-               Common::MultiplyAndDivide64(FixedGpuTimestampNs(), gpu_freq, 1000000000);
-    }
     const auto cpu_cycles = Libraries::Kernel::sceKernelReadTsc();
     const auto gpu_cycles = Common::MultiplyAndDivide64(cpu_cycles, gpu_freq, cpu_freq);
 
@@ -527,11 +513,15 @@ struct PM4CmdEventWriteEop {
             break;
         }
         case DataSelect::GpuClock64: {
-            write_mem(address, GetGpuClock64(), sizeof(u64));
+            const u64 value = GetGpuClock64();
+            NoteGpuTimestamp(address, value, "eop_clock64");
+            write_mem(address, value, sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            write_mem(address, GetGpuPerfCounter(), sizeof(u64));
+            const u64 value = GetGpuPerfCounter();
+            NoteGpuTimestamp(address, value, "eop_perf");
+            write_mem(address, value, sizeof(u64));
             break;
         }
         default: {
@@ -583,21 +573,17 @@ enum class DmaDataSrc : u32 {
 
 struct PM4DmaData {
     PM4Type3Header header;
-    struct {
-        u32 engine : 1;
-        u32 reserved1 : 11;
-        u32 src_atc : 1;
-        u32 src_cache_policy : 2;
-        u32 src_volatile : 1;
-        u32 reserved2 : 4;
-        DmaDataDst dst_sel : 2;
-        u32 reserved3 : 2;
-        u32 dst_atc : 1;
-        u32 dst_cache_policy : 2;
-        u32 dst_volatile : 1;
-        u32 reserved4 : 1;
-        DmaDataSrc src_sel : 2;
-        u32 cp_sync : 1;
+    union {
+        BitField<0, 1, u32> engine;
+        BitField<12, 1, u32> src_atc;
+        BitField<13, 2, u32> src_cache_policy;
+        BitField<15, 1, u32> src_volatile;
+        BitField<20, 2, DmaDataDst> dst_sel;
+        BitField<24, 1, u32> dst_atc;
+        BitField<25, 2, u32> dst_cache_policy;
+        BitField<27, 1, u32> dst_volatile;
+        BitField<29, 2, DmaDataSrc> src_sel;
+        BitField<31, 1, u32> cp_sync;
     };
     union {
         u32 src_addr_lo;
@@ -606,18 +592,7 @@ struct PM4DmaData {
     u32 src_addr_hi;
     u32 dst_addr_lo;
     u32 dst_addr_hi;
-    struct {
-        u32 num_bytes : 21;
-        u32 dis_wc : 1;
-        u32 src_swap : 2;
-        u32 dst_swap : 2;
-        u32 sas : 1;
-        u32 das : 1;
-        u32 saic : 1;
-        u32 daic : 1;
-        u32 raw_wait : 1;
-        u32 reserved5 : 1;
-    } command;
+    u32 command;
 
     template <typename T>
     T SrcAddress() const {
@@ -630,7 +605,7 @@ struct PM4DmaData {
     }
 
     u32 NumBytes() const noexcept {
-        return command.num_bytes;
+        return command & 0x1fffff;
     }
 };
 
@@ -744,10 +719,7 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
-    }
-
-    bool TestValue(u32 value) const {
+        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
         switch (function.Value()) {
         case Function::Always: {
             return true;
@@ -1010,11 +982,15 @@ struct PM4CmdReleaseMem {
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            const u64 value = GetGpuClock64();
+            NoteGpuTimestamp(Address<void*>(), value, "rel_clock64");
+            *Address<u64*>() = value;
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            const u64 value = GetGpuPerfCounter();
+            NoteGpuTimestamp(Address<void*>(), value, "rel_perf");
+            *Address<u64*>() = value;
             break;
         }
         case DataSelect::GdsMemStore: {

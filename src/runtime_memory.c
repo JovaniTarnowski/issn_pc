@@ -40,6 +40,20 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+/* issn-axy: guest mappings without a fixed address start at shadPS4's mapping base, below the
+ * host-owned window [LOW_MIN, USER_MIN), so the game's memory lands where it does under shadPS4
+ * (its 512 MiB GPU heap at 0x248000000, ...): the tuned video core of axylpup's build names
+ * those addresses. ISSN_GUEST_LOW=0, or a range Windows cannot reserve, keeps the old layout. */
+#define GUEST_LOW_MIN UINT64_C(0x200000000)
+#define GUEST_LOW_MAX UINT64_C(0x0800000000)
+static int guest_low_enabled = -1;
+static int guest_low(void) {
+    if (guest_low_enabled<0) {
+        const char *e=getenv("ISSN_GUEST_LOW");
+        guest_low_enabled = !(e && *e=='0');
+    }
+    return guest_low_enabled;
+}
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -154,9 +168,18 @@ static void region_erase(size_t at, size_t n) {
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    if (guest_low()) {
+        if (VirtualAlloc2(NULL,(void *)GUEST_LOW_MIN,GUEST_LOW_MAX-GUEST_LOW_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0)) {
+            region_insert(0,(HostRegion){GUEST_LOW_MIN,GUEST_LOW_MAX,0,0});
+        } else {
+            fprintf(stderr,"Runtime: 0x%" PRIx64 "-0x%" PRIx64 " is in use (error %lu): guest memory starts at 0x%" PRIx64 "\n",
+                    GUEST_LOW_MIN,GUEST_LOW_MAX,GetLastError(),USER_MIN);
+            guest_low_enabled=0;
+        }
+    }
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
-    region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
+    region_insert(region_count,(HostRegion){USER_MIN,USER_MAX,0,0});
 }
 static void view_map(const HostRegion *r, DWORD protect) {
     DWORD initial=protect==PAGE_NOACCESS ? PAGE_READWRITE : protect, old;
@@ -362,14 +385,23 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
         if (!ignore_reserved || vmas[i].kind!=KIND_RESERVED) return 1;
     return 0;
 }
-/* First-fit search in the PS4 user range, starting from the hint. */
-static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
-    uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
-    for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
+/* First-fit search in [lo, hi), starting from the hint. */
+static uintptr_t find_free_in(uintptr_t hint, uint64_t size, uint64_t alignment, uintptr_t lo, uintptr_t hi) {
+    uintptr_t at=align_up(hint<lo ? lo : hint, alignment);
+    for (size_t i=vma_index(at); at+size<=hi; ++i) {
         if (i==vma_count || vmas[i].start>=at+size) return at;
         at=align_up(vmas[i].end,alignment);
     }
     return 0;
+}
+/* First-fit search in the PS4 user range, starting from the hint: shadPS4's low range first
+ * (guest_low), then the rest. */
+static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
+    if (guest_low() && hint<GUEST_LOW_MAX) {
+        const uintptr_t at=find_free_in(hint,size,alignment,GUEST_LOW_MIN,GUEST_LOW_MAX);
+        if (at) return at;
+    }
+    return find_free_in(hint,size,alignment,USER_MIN,USER_MAX);
 }
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;

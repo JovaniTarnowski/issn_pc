@@ -83,53 +83,12 @@ find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 
-# port: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
-set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
 
-# Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
-set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
-set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
-set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
-set(SHADER_HEADERS "")
-function(add_host_shader FILENAME SHADER_NAME)
-    set(OUT ${SHADER_DIR}/${SHADER_NAME}.h)
-    string(TOUPPER ${SHADER_NAME} SYMBOL)
-    set(DEFINES ${ARGN})
-    list(TRANSFORM DEFINES PREPEND "-D")
-    add_custom_command(OUTPUT ${OUT}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
-        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${DEFINES} ${SHADER_SRC}/${FILENAME}
-        COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${OUT}" -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
-        DEPENDS ${SHADER_SRC}/${FILENAME} VERBATIM)
-    set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
-endfunction()
-add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
-add_host_shader(color_to_ms_depth.frag color_to_ms_depth_fallback_frag SAMPLE_FALLBACK=1)
-add_host_shader(ms_image_blit.frag ms_image_blit_frag)
-add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
-add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
-add_host_shader(fs_tri.vert fs_tri_vert)
-add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
-add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
-add_host_shader(post_process.frag post_process_frag)
-add_host_shader(camera_motion.comp camera_motion_comp)
-add_host_shader(upscale_merge.comp upscale_merge_comp)
-add_host_shader(upscale_reactive.comp upscale_reactive_comp)
-add_host_shader(taa.comp taa_comp)
-add_host_shader(taa_sharpen.comp taa_sharpen_comp)
-add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
-add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
-add_host_shader(depth_resample.frag depth_resample_frag)
-add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
-add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
-add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
-foreach(BPP IN ITEMS 8 16 32 64 96 128)
-    add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
-    add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
-endforeach()
-add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
+
+# Host shaders -> GLSL source strings compiled at run time by glslang (axylpup's tree, shadPS4 0.17).
+add_subdirectory(shadps4/video_core/host_shaders)
+set(SHADER_INCLUDE ${HOST_SHADERS_INCLUDE})
+find_package(glslang CONFIG REQUIRED)
 
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
@@ -157,6 +116,7 @@ set(COMMON
     shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
     shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
+    shadps4/common/fault_monitor.cpp shadps4/common/reserved_memory.cpp shadps4/common/stb.cpp
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
@@ -184,14 +144,22 @@ target_compile_definitions(issngpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     ISSN_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/issn_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
-target_include_directories(issngpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_include_directories(issngpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include
+    third_party/streamline-sdk/include third_party/stb)
 target_compile_definitions(issngpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(issngpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against issn-probe.
 if (NOT WIN32)
     target_link_options(issngpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-target_link_libraries(issngpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+# glslang's own CMake package: SPIRV and the default resource limits are separate targets in
+# older releases only.
+target_link_libraries(issngpu PRIVATE glslang::glslang)
+foreach(glslang_part glslang::SPIRV glslang::glslang-default-resource-limits)
+    if (TARGET ${glslang_part})
+        target_link_libraries(issngpu PRIVATE ${glslang_part})
+    endif()
+endforeach()
 target_link_libraries(issngpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 target_include_directories(issngpu PRIVATE third_party/xbyak)
@@ -277,136 +245,11 @@ if (WIN32)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
-add_executable(pipeline-binary-cache-test EXCLUDE_FROM_ALL ../tests/test_pipeline_binary_cache.cpp
-    ../tests/test_gpu_runtime_stubs.cpp)
-target_compile_definitions(pipeline-binary-cache-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_include_directories(pipeline-binary-cache-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(pipeline-binary-cache-test PRIVATE issngpu)
-target_compile_options(pipeline-binary-cache-test PRIVATE -fPIC)
-if (WIN32)
-    target_sources(pipeline-binary-cache-test PRIVATE ../src/compat_win.c)
-    target_compile_definitions(pipeline-binary-cache-test PRIVATE sigjmp_buf=issn_jmp_buf)
-    target_compile_options(pipeline-binary-cache-test PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
-    target_link_libraries(pipeline-binary-cache-test PRIVATE onecore)
-endif()
-# issn: the inFAMOUS Second Son shader fixes on translated GCN code.
-add_executable(issn-shader-fixes-test EXCLUDE_FROM_ALL ../tests/test_issn_shader_fixes.cpp
-    ../tests/test_gpu_runtime_stubs.cpp)
-target_compile_definitions(issn-shader-fixes-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_include_directories(issn-shader-fixes-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(issn-shader-fixes-test PRIVATE issngpu)
-target_compile_options(issn-shader-fixes-test PRIVATE -fPIC)
-if (WIN32)
-    target_sources(issn-shader-fixes-test PRIVATE ../src/compat_win.c)
-    target_compile_definitions(issn-shader-fixes-test PRIVATE sigjmp_buf=issn_jmp_buf)
-    target_compile_options(issn-shader-fixes-test PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
-    target_link_libraries(issn-shader-fixes-test PRIVATE onecore)
-endif()
-add_executable(pipeline-binary-initialization-test EXCLUDE_FROM_ALL
-    ../tests/test_pipeline_binary_initialization.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_compile_definitions(pipeline-binary-initialization-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_include_directories(pipeline-binary-initialization-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(pipeline-binary-initialization-test PRIVATE issngpu)
-target_compile_options(pipeline-binary-initialization-test PRIVATE -fPIC)
-if (WIN32)
-    target_sources(pipeline-binary-initialization-test PRIVATE ../src/compat_win.c)
-    target_compile_definitions(pipeline-binary-initialization-test PRIVATE sigjmp_buf=issn_jmp_buf)
-    target_compile_options(pipeline-binary-initialization-test PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
-    target_link_libraries(pipeline-binary-initialization-test PRIVATE onecore)
-endif()
-set_source_files_properties(../tests/test_pipeline_binary_cache.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
-add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
-target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(motion-history-test PRIVATE ..)
-add_executable(motion-shader-test EXCLUDE_FROM_ALL ../tests/test_motion_shaders.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(motion-shader-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(motion-shader-test PRIVATE issngpu)
+# issn-axy: the tests of the old video core (pipeline binaries, FSR, TAA, motion, readback
+# queue, ...) went with it; the shim and loader tests stay.
 add_executable(png-decode-test EXCLUDE_FROM_ALL ../tests/test_png_decode.cpp shim/issn_png.cpp)
 target_compile_options(png-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_link_libraries(png-decode-test PRIVATE PkgConfig::FFMPEG)
-add_executable(aliasing-test EXCLUDE_FROM_ALL ../tests/test_aliasing.cpp
-    shadps4/video_core/texture_cache/aliasing.cpp shadps4/video_core/texture_cache/host_compatibility.cpp)
-target_compile_options(aliasing-test PRIVATE -UNDEBUG)
-target_include_directories(aliasing-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(aliasing-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-add_executable(blend-rewrite-test EXCLUDE_FROM_ALL ../tests/test_blend_rewrite.cpp)
-target_compile_options(blend-rewrite-test PRIVATE -UNDEBUG)
-target_include_directories(blend-rewrite-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(blend-rewrite-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-add_executable(depth-stencil-state-test EXCLUDE_FROM_ALL ../tests/test_depth_stencil_state.cpp)
-add_executable(async-compiler-test EXCLUDE_FROM_ALL ../tests/test_async_compiler.cpp)
-target_compile_options(async-compiler-test PRIVATE -UNDEBUG)
-target_include_directories(async-compiler-test PRIVATE shadps4)
-add_executable(warmup-inbox-test EXCLUDE_FROM_ALL ../tests/test_warmup_inbox.cpp)
-target_compile_options(warmup-inbox-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(warmup-inbox-test PRIVATE shadps4)
-add_executable(wave-stats-test EXCLUDE_FROM_ALL ../tests/test_wave_stats.cpp)
-target_compile_options(wave-stats-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(wave-stats-test PRIVATE shadps4)
-add_executable(pass-census-test EXCLUDE_FROM_ALL ../tests/test_pass_census.cpp)
-target_compile_options(pass-census-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(pass-census-test PRIVATE shadps4)
-add_executable(frame-capture-test EXCLUDE_FROM_ALL ../tests/test_frame_capture.cpp
-    shadps4/video_core/renderer_vulkan/vk_frame_capture.cpp)
-target_compile_options(frame-capture-test PRIVATE -UNDEBUG)
-target_include_directories(frame-capture-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(frame-capture-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-add_executable(lighting-test-knob-test EXCLUDE_FROM_ALL ../tests/test_lighting_test.cpp)
-target_compile_options(lighting-test-knob-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(lighting-test-knob-test PRIVATE shadps4)
-add_executable(amd-paths-test EXCLUDE_FROM_ALL ../tests/test_amd_paths.cpp)
-target_compile_options(amd-paths-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(amd-paths-test PRIVATE shadps4)
-add_executable(no-msaa-test EXCLUDE_FROM_ALL ../tests/test_no_msaa.cpp
-    shadps4/video_core/amdgpu/pixel_format.cpp)
-target_compile_options(no-msaa-test PRIVATE -UNDEBUG)
-target_include_directories(no-msaa-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(no-msaa-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-add_executable(async-pipeline-cache-test EXCLUDE_FROM_ALL ../tests/test_async_pipeline_cache.cpp)
-target_compile_options(async-pipeline-cache-test PRIVATE -UNDEBUG)
-target_include_directories(async-pipeline-cache-test PRIVATE shadps4)
-target_link_libraries(async-pipeline-cache-test PRIVATE Vulkan::Vulkan)
-add_executable(async-fetch-snapshot-test EXCLUDE_FROM_ALL ../tests/test_async_fetch_snapshot.cpp
-    shadps4/shader_recompiler/frontend/fetch_shader.cpp
-    shadps4/shader_recompiler/frontend/decode.cpp
-    shadps4/shader_recompiler/frontend/format.cpp)
-target_compile_options(async-fetch-snapshot-test PRIVATE -UNDEBUG)
-target_include_directories(async-fetch-snapshot-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(async-fetch-snapshot-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-target_compile_options(depth-stencil-state-test PRIVATE -UNDEBUG)
-target_include_directories(depth-stencil-state-test PRIVATE shim shadps4 third_party/gcn/include)
-target_link_libraries(depth-stencil-state-test PRIVATE Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum)
-add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
-target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-target_include_directories(ui-composition-test PRIVATE ..)
-
-add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
-# The test's Vulkan-Hpp inline methods have a different set of platform extensions
-# from vk_platform.cpp. Keep them local and use an explicit dispatcher in the test.
-target_compile_options(scene-resolution-test PRIVATE -UNDEBUG -fPIC)
-set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
-target_link_libraries(scene-resolution-test PRIVATE issngpu)
-add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
-set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
-target_link_libraries(taa-shader-test PRIVATE issngpu)
-add_dependencies(taa-shader-test host_shaders)
-
-add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
-target_link_libraries(camera-motion-test PRIVATE issngpu)
-add_dependencies(camera-motion-test host_shaders)
-
-# port: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/issn_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
@@ -427,12 +270,6 @@ add_executable(cheat-hooks-test EXCLUDE_FROM_ALL ../tests/test_cheat_hooks.cpp)
 target_compile_options(cheat-hooks-test PRIVATE -UNDEBUG)
 add_executable(signatures-test EXCLUDE_FROM_ALL ../tests/test_signatures.cpp)
 target_compile_options(signatures-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-add_executable(readback-queue-test EXCLUDE_FROM_ALL ../tests/test_readback_queue.cpp)
-target_include_directories(readback-queue-test PRIVATE shadps4)
-target_compile_options(readback-queue-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-add_executable(wait-diagnostics-test EXCLUDE_FROM_ALL ../tests/test_wait_diagnostics.cpp)
-target_include_directories(wait-diagnostics-test PRIVATE shadps4)
-target_compile_options(wait-diagnostics-test PRIVATE -UNDEBUG)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/issn_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)
@@ -440,18 +277,5 @@ target_compile_options(graphics-settings-test PRIVATE -UNDEBUG)
 add_executable(actor-hook-test EXCLUDE_FROM_ALL ../tests/test_actor_hook.cpp)
 target_include_directories(actor-hook-test PRIVATE shim)
 target_compile_options(actor-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-add_executable(readback-sources-test EXCLUDE_FROM_ALL ../tests/test_readback_sources.cpp)
-target_include_directories(readback-sources-test PRIVATE shadps4)
-target_compile_options(readback-sources-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-add_executable(page-state-test EXCLUDE_FROM_ALL ../tests/test_page_state.cpp)
-target_include_directories(page-state-test PRIVATE ../tests/stubs shim shadps4)
-target_link_libraries(page-state-test PRIVATE Boost::headers)
-target_compile_options(page-state-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-
-add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
-    shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
-target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
-target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
-
 add_executable(cheat-hook-test ../tests/test_cheat_hook.cpp)
 target_compile_options(cheat-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)

@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_set>
+#include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -11,7 +16,6 @@ namespace Shader::Optimization {
 void Visit(Info& info, const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::GetAttribute:
-    case IR::Opcode::GetAttributeU1:
     case IR::Opcode::GetAttributeU32:
         info.loads.Set(inst.Arg(0).Attribute(), inst.Arg(1).U32());
         break;
@@ -54,7 +58,6 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicAnd32:
     case IR::Opcode::SharedAtomicOr32:
     case IR::Opcode::SharedAtomicXor32:
-    case IR::Opcode::SharedAtomicCmpSwap32:
         info.shared_types |= IR::Type::U32;
         break;
     case IR::Opcode::SharedAtomicIAdd64:
@@ -68,7 +71,6 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::SharedAtomicAnd64:
     case IR::Opcode::SharedAtomicOr64:
     case IR::Opcode::SharedAtomicXor64:
-    case IR::Opcode::SharedAtomicCmpSwap64:
         info.uses_shared_int64_atomics = true;
         [[fallthrough]];
     case IR::Opcode::LoadSharedU64:
@@ -88,12 +90,8 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::ImageWrite:
         info.has_storage_images = true;
         break;
-    case IR::Opcode::QuadBroadcast:
+    case IR::Opcode::QuadShuffle:
         info.uses_group_quad = true;
-        break;
-    case IR::Opcode::Shuffle:
-    case IR::Opcode::ShuffleXor:
-        info.uses_group_shuffle = true;
         break;
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
@@ -130,32 +128,25 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::BufferAtomicUMin64:
         info.uses_buffer_int64_atomics = true;
         break;
-    case IR::Opcode::DataAppend:
-    case IR::Opcode::DataConsume:
-    case IR::Opcode::Ballot:
-    case IR::Opcode::InverseBallot:
-    case IR::Opcode::BallotFindLsb:
-        info.uses_group_ballot = true;
-        [[fallthrough]];
     case IR::Opcode::LaneId:
         info.uses_lane_id = true;
         break;
-    case IR::Opcode::Memtime:
-        info.uses_shader_clock = true;
-        break;
     case IR::Opcode::ReadConst:
-        if (!info.has_readconst) {
+        if (!info.uses_dma) {
             info.buffers.push_back({
                 .used_types = IR::Type::U32,
+                // We can't guarantee that flatbuf will not grow past UBO
+                // limit if there are a lot of ReadConsts. (We could specialize)
+                .inline_cbuf = AmdGpu::Buffer::Placeholder(std::numeric_limits<u32>::max()),
                 .buffer_type = BufferType::Flatbuf,
             });
-            info.has_readconst = true;
         }
-        if (inst.Flags<u32>() == 0) {
+        if (inst.Flags<u32>() != 0) {
             info.readconst_types |= Info::ReadConstType::Immediate;
+        } else {
             info.readconst_types |= Info::ReadConstType::Dynamic;
-            info.uses_dma = true;
         }
+        info.uses_dma = true;
         break;
     case IR::Opcode::PackUfloat10_11_11:
         info.uses_pack_10_11_11 = true;
@@ -169,14 +160,52 @@ void Visit(Info& info, const IR::Inst& inst) {
 }
 
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
-    Info& info = program.info;
+    auto& info = program.info;
+    static const bool who = [] {
+        const char* env = std::getenv("SHADPS4_LANE_WHO");
+        return env && env[0] == '1';
+    }();
+    std::string rc_offs; // q9 census: ReadConst flatbuf offsets (0 = dynamic)
+    u32 rc_n = 0;
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             Visit(info, inst);
+            if (who && inst.GetOpcode() == IR::Opcode::ReadConst) {
+                ++rc_n;
+                if (rc_n <= 48) {
+                    rc_offs += fmt::format(" {}", inst.Flags<u32>());
+                }
+            }
+        }
+    }
+    if (who && rc_n != 0 && info.stage == Stage::Compute) {
+        static std::mutex mu;
+        static std::unordered_set<u64> seen;
+        std::scoped_lock lk{mu};
+        if (seen.insert(info.pgm_hash).second) {
+            LOG_INFO(Render_Recompiler, "LaneWhoReadConst: cs_{:08x} readconst={} types={} offs(dw):{}",
+                     info.pgm_hash, rc_n, static_cast<u32>(info.readconst_types), rc_offs);
         }
     }
 
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    // q9b (SHADPS4_ASC_NODMA=1): an all-Immediate compute program reads its constants from the
+    // flatbuf (the SRT walk at bind) - unless its program is pinned to DMA.
+    if (NoDmaMode() && info.uses_dma && info.stage == Stage::Compute &&
+        info.readconst_types == Info::ReadConstType::Immediate &&
+        !(info.pinned_uses_dma && *info.pinned_uses_dma)) {
+        info.uses_dma = false;
+        info.readconst_types = Info::ReadConstType::None;
+        info.nodma_pinned = true;
+        NoteNoDmaPinned(info.pgm_hash);
+    } else if (NoDmaMode() && info.stage == Stage::Compute && info.pinned_uses_dma &&
+               !*info.pinned_uses_dma && True(info.readconst_types & Info::ReadConstType::Dynamic)) {
+        LOG_ERROR(Render_Recompiler, "AscNoDma: cs_{:08x} permutation has dynamic ReadConst under a "
+                                     "non-DMA program (reads 0)", info.pgm_hash);
+    }
+    // A later permutation is pinned to its program's DMA state: every permutation shares the
+    // first one's Info for the pipeline layout, and the DMA buffers shift every image binding.
+    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() ||
+        (info.pinned_uses_dma && !*info.pinned_uses_dma)) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }
@@ -184,16 +213,38 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     if (info.uses_dma) {
         info.buffers.push_back({
             .used_types = IR::Type::U64,
+            .inline_cbuf = AmdGpu::Buffer::Placeholder(VideoCore::BufferCache::BDA_PAGETABLE_SIZE),
             .buffer_type = BufferType::BdaPagetable,
             .is_written = true,
         });
         info.buffers.push_back({
             .used_types = IR::Type::U32,
+            .inline_cbuf = AmdGpu::Buffer::Placeholder(std::numeric_limits<u32>::max()),
             .buffer_type = BufferType::FaultBuffer,
             .is_written = true,
         });
-        LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
     }
 }
 
 } // namespace Shader::Optimization
+
+namespace Shader {
+namespace {
+std::mutex g_nodma_mu;
+std::unordered_set<u64> g_nodma_hashes;
+} // namespace
+bool NoDmaPinnedHash(u64 pgm_hash) {
+    if (!NoDmaMode()) {
+        return false;
+    }
+    std::scoped_lock lk{g_nodma_mu};
+    return g_nodma_hashes.contains(pgm_hash);
+}
+void NoteNoDmaPinned(u64 pgm_hash) {
+    std::scoped_lock lk{g_nodma_mu};
+    if (g_nodma_hashes.insert(pgm_hash).second) {
+        LOG_INFO(Render_Recompiler, "AscNoDma: cs_{:08x} translated without DMA (flatbuf ReadConsts)",
+                 pgm_hash);
+    }
+}
+} // namespace Shader

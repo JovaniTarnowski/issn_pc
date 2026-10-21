@@ -1,31 +1,109 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-#include <cstdlib>
-
 #include <boost/container/small_vector.hpp>
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
 
-#include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
-#include "video_core/renderer_vulkan/vk_async_compiler.h"
+#include "video_core/buffer_cache/back_clean.h"
+#include "video_core/buffer_cache/buffer.h"
+#include "video_core/host_shaders/infamous_particle_sort_comp.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+namespace {
+/// q36 (design-game-main D2 round 3): the sort replacement's guard counter {hits, first, last, overflow}, host-visible,
+/// read by pointer from the shader. One per process; never freed (lives as long as the pipelines that point at it).
+VideoCore::Buffer* SortGuardBuffer(const Instance& instance, Scheduler& scheduler) {
+    static VideoCore::Buffer* const buffer = [&]() -> VideoCore::Buffer* {
+        if (!instance.GetDevice() || !instance.GetPhysicalDevice()) {
+            return nullptr;
+        }
+        auto* b = new VideoCore::Buffer(instance, scheduler, VideoCore::MemoryUsage::Download, 0,
+                                        vk::BufferUsageFlagBits::eStorageBuffer |
+                                            vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                                        256);
+        if (b->mapped_data.size() < 16) {
+            LOG_WARNING(Render_Vulkan, "q36: sort guard buffer not host-mapped; guard counts off");
+            return nullptr;
+        }
+        std::memset(b->mapped_data.data(), 0, 64); // + the SORT_VERIFY words 4..9
+        VideoCore::g_sort_guard_words = reinterpret_cast<volatile u32*>(b->mapped_data.data());
+        return b;
+    }();
+    return buffer;
+}
+} // namespace
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/,
-                                 const ComputeBuilder* builder /*=nullptr*/)
+                                 SerializationSupport& sdata, bool preloading /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
-    auto& info = stages[int(Shader::SwStage::Compute)];
+    auto& info = stages[int(Shader::LogicalStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
+    const auto device = instance.GetDevice();
+
+    // The game's 64-lane merge loop reads other lanes' SSBO writes between steps.
+    // Its translated shader has no barriers. Keep this targeted diagnostic opt-in;
+    // changing the pipeline module here also covers shader-cache preloading without
+    // replacing/persisting the cached guest SPIR-V or its binding metadata.
+    static const bool synchronize_smoke_sort = [] {
+        const char* value = std::getenv("SHADPS4_SMOKE_SORT_SYNC");
+        return value && std::string_view{value} == "1";
+    }();
+    vk::ShaderModule synchronized_module{};
+    SCOPE_EXIT {
+        if (synchronized_module) {
+            device.destroyShaderModule(synchronized_module);
+        }
+    };
+    if (synchronize_smoke_sort && info->pgm_hash == 0xa16fa93a) {
+        ASSERT_MSG(info->buffers.size() == 5 && info->images.empty() && info->samplers.empty(),
+                   "Unexpected particle sort binding contract");
+        std::vector<std::string> defines;
+        if (auto* guard = SortGuardBuffer(instance, scheduler)) {
+            const u64 addr = guard->BufferDeviceAddress(); // q36: invalid-width guard counter
+            defines.push_back(fmt::format("SORT_GUARD_LO={}u", static_cast<u32>(addr)));
+            defines.push_back(fmt::format("SORT_GUARD_HI={}u", static_cast<u32>(addr >> 32)));
+            // SHADPS4_SORT_VERIFY=1 (2026-10-18, the particle flicker hunt): each dispatch checks
+            // that its input runs are sorted and its own in-group output (counters in the guard).
+            static const bool verify = [] {
+                const char* v = std::getenv("SHADPS4_SORT_VERIFY");
+                return v && v[0] == '1';
+            }();
+            if (verify) {
+                defines.push_back("SORT_VERIFY=1");
+            }
+        }
+        synchronized_module = Compile(HostShaders::INFAMOUS_PARTICLE_SORT_COMP,
+                                      vk::ShaderStageFlagBits::eCompute, device, defines);
+        module = synchronized_module;
+        SetObjectName(device, module, "Synchronized infamous particle sort");
+        LOG_INFO(Render_Vulkan, "Smoke sort synchronization enabled for {:#x}, preloading={}",
+                 info->pgm_hash, preloading);
+    }
+
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+        .requiredSubgroupSize = 64,
+    };
+    vk::PipelineShaderStageCreateInfo shader_ci = {
+        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .stage = vk::ShaderStageFlagBits::eCompute,
+        .module = module,
+        .pName = "main",
+    };
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
@@ -37,13 +115,27 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
         bindings.push_back({
             .binding = binding++,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
+                                                      : vk::DescriptorType::eUniformBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
+    if (!preloading) {
+        sdata.image_binding_counts.clear();
+    }
+    u32 image_idx{};
     for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+        // Image descriptor counts need the user data, which is unavailable while preloading, so
+        // they are carried in sdata. Getting them wrong shifts every later binding index.
+        const bool have_cached = image_idx < sdata.image_binding_counts.size();
+        const u32 num_bindings =
+            (preloading && have_cached) ? sdata.image_binding_counts[image_idx]
+                                        : image.NumBindings(*info);
+        if (!preloading) {
+            sdata.image_binding_counts.push_back(num_bindings);
+        }
+        ++image_idx;
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
@@ -62,6 +154,33 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
 
+    if (instance.IsNativeBindingsActive()) {
+        // Descriptor heap model: mappings ride on the shader stage, the pipeline carries the
+        // heap flag and there is no descriptor set layout or pipeline layout at all.
+        BuildNativeMappings(bindings);
+        if (const auto* mapping_info =
+                NativeMappingInfo(vk::ShaderStageFlagBits::eCompute, shader_ci.pNext)) {
+            shader_ci.pNext = mapping_info;
+        }
+        const NativeApi::PipelineCreateFlags2CreateInfo flags2_ci = {
+            .sType = NativeApi::StructureTypePipelineCreateFlags2CreateInfo,
+            .flags = NativeApi::PipelineCreate2DescriptorHeapBit,
+        };
+        const vk::ComputePipelineCreateInfo native_pipeline_ci = {
+            .pNext = &flags2_ci,
+            .stage = shader_ci,
+            .layout = VK_NULL_HANDLE,
+        };
+        auto [pipeline_result, pipe] =
+            instance.GetDevice().createComputePipelineUnique(pipeline_cache, native_pipeline_ci);
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+                   "Failed to create descriptor heap compute pipeline: {}",
+                   vk::to_string(pipeline_result));
+        pipeline = std::move(pipe);
+        SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+        return;
+    }
+
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
         .offset = 0,
@@ -69,6 +188,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    BuildPacketBindings(std::span<const vk::DescriptorSetLayoutBinding>{bindings.data(),
+                                                                        bindings.size()});
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};
@@ -77,7 +198,6 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };
-    const auto device = instance.GetDevice();
     auto [descriptor_set_result, descriptor_set] =
         device.createDescriptorSetLayoutUnique(desc_layout_ci);
     ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
@@ -98,131 +218,35 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
-    // Runs on the compiler threads too: it only uses what stays fixed after construction and
-    // the layout, which the destructor keeps alive until the build is done. Returns no pipeline
-    // when one may only come from the driver's cache and it isn't there.
-    const auto create = [&instance, module, layout = *pipeline_layout,
-                         debug_str](vk::PipelineCache cache,
-                                    vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
-        const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-            .requiredSubgroupSize = 64,
-        };
-        const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
-            .flags = flags,
-            .stage{
-                .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
-                .stage = vk::ShaderStageFlagBits::eCompute,
-                .module = module,
-                .pName = "main",
-            },
-            .layout = layout,
-        };
-        const auto device = instance.GetDevice();
-        auto created = device.createComputePipelineUnique(cache, compute_pipeline_ci);
-        for (u32 attempt = 1;
-             RetryPipelineCreation(created.result, attempt, "compute", debug_str); ++attempt) {
-            created = device.createComputePipelineUnique(cache, compute_pipeline_ci);
-        }
-        if (created.result == vk::Result::ePipelineCompileRequired &&
-            (flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
-            return {};
-        }
-        ASSERT_MSG(created.result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
-                   vk::to_string(created.result));
-        SetObjectName(device, *created.value, "Compute Pipeline {}", debug_str);
-        return std::move(created.value);
-    };
-
-    // port: a dispatch is waiting for a pipeline met in game, and compute work cannot be skipped
-    // (5e7995ac skipped it: not taken, for fidelity). Built on the GPU thread, a new one took
-    // 60-190 ms in inFAMOUS Second Son and an effect brings a few dozen: freezes of 0.6-3.8 s.
-    // ISSN_COMPUTE_ASYNC_BUILD=0 builds every one here as before.
-    static const bool async_build = [] {
-        const char* env = std::getenv("ISSN_COMPUTE_ASYNC_BUILD");
-        return !(env && env[0] == '0');
-    }();
-    if (builder && !preloading && async_build &&
-        instance.IsPipelineCreationCacheControlSupported()) {
-        // One the driver built before (its disk cache) comes at once.
-        pipeline = create(pipeline_cache,
-                          vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
-        if (pipeline) {
-            RecordWaveSizes();
-            return;
-        }
-        auto state = std::make_shared<Build>();
-        const auto caches = builder->caches;
-        // issn: ISSN_COMPUTE_FAST_FIRST=1 always builds an unoptimized pipeline here first (the
-        // optimized one replaces it later), even with the recording thread: on AMD's driver an
-        // optimized compute pipeline takes ~90 ms, and the dispatch waits for it.
-        static const bool fast_first = [] {
-            const char* env = std::getenv("ISSN_COMPUTE_FAST_FIRST");
-            return env && env[0] == '1';
-        }();
-        const bool deferred_bind = scheduler.RecordsOnThread() && !fast_first;
-        // With the Vulkan recording thread, the dispatch binds the pipeline there (Handle()
-        // waits for it), so the GPU thread goes on and the next new pipelines are built
-        // alongside: a burst costs about one build instead of their sum. NVIDIA builds one
-        // without optimizations about as slowly, so the optimized one is built directly.
-        // Otherwise one is built here without optimizations, several times quicker on some
-        // drivers, and the optimized one replaces it (SwapInOptimized).
-        const bool queued = builder->compiler->Submit(
-            [state, create, caches, deferred_bind, debug_str] {
-                const auto start = std::chrono::steady_clock::now();
-                auto built = create(*caches[AsyncCompiler::WorkerIndex()], {});
-                LOG_INFO(Render_Vulkan, "port: compute pipeline {} built on a compiler thread in "
-                         "{:.1f} ms{}", debug_str,
-                         std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - start).count(),
-                         deferred_bind ? "" : " (replaces the unoptimized one)");
-                {
-                    std::scoped_lock lock{state->mutex};
-                    if (deferred_bind) {
-                        state->handle.store(static_cast<VkPipeline>(*built), std::memory_order_release);
-                    }
-                    state->result = std::move(built);
-                    state->done.store(true, std::memory_order_release);
-                }
-                state->cv.notify_all();
-            },
-            deferred_bind);
-        if (queued) {
-            build = std::move(state);
-            if (!deferred_bind) {
-                pipeline = create(pipeline_cache, vk::PipelineCreateFlagBits::eDisableOptimization);
-                build->handle.store(static_cast<VkPipeline>(*pipeline), std::memory_order_release);
-                optimized_pending = true;
-            }
-            return;
-        }
-        // The compiler queue is full: built here, as before.
-    }
-    pipeline = create(pipeline_cache, {});
-    RecordWaveSizes();
-}
-
-ComputePipeline::~ComputePipeline() {
-    // A build still queued uses the layout and module.
-    if (build) {
-        std::unique_lock lock{build->mutex};
-        build->cv.wait(lock, [this] { return build->done.load(std::memory_order_acquire); });
-    }
-}
-
-void ComputePipeline::SwapInOptimized() {
-    if (!optimized_pending || !build->done.load(std::memory_order_acquire)) {
+    // SHADPS4_ASYNC_COMPUTE_PIPELINES: only the driver compile is deferred; layouts and bindings
+    // above exist now. The smoke-sort replacement module dies with this constructor (SCOPE_EXIT),
+    // so that one pipeline stays synchronous.
+    if (AsyncComputePipelinesEnabled() && !synchronized_module) {
+        deferred = std::make_unique<DeferredPipeline>();
+        deferred->device = device;
+        deferred->cache = pipeline_cache;
+        deferred->module = module;
+        deferred->layout = *pipeline_layout;
+        deferred->subgroup_size_64 = instance.IsSubgroupSize64Supported();
+        deferred->preload = preloading;
+        deferred->debug_name = fmt::format("Compute Pipeline {}", debug_str);
+        deferred->out = &pipeline;
+        PipelineCompilePool::Push(deferred.get());
         return;
     }
-    optimized_pending = false;
-    vk::UniquePipeline old = std::move(pipeline);
-    pipeline = std::move(build->result);
-    build->handle.store(static_cast<VkPipeline>(*pipeline), std::memory_order_release);
-    // Commands recorded so far, some perhaps still queued for the recording thread or the draw
-    // pipe, may bind the old one: it is destroyed once the GPU is past the command buffer being
-    // recorded now and then past the one recorded when that is done.
-    scheduler.DeferOperation([scheduler = &scheduler, old = std::move(old)]() mutable {
-        scheduler->DeferOperation([old = std::move(old)]() mutable { old.reset(); });
-    });
+    const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = DiagPipelineCreateFlags(),
+        .stage = shader_ci,
+        .layout = *pipeline_layout,
+    };
+    auto [pipeline_result, pipe] =
+        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
+               vk::to_string(pipeline_result));
+    pipeline = std::move(pipe);
+    SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }
+
+ComputePipeline::~ComputePipeline() = default;
 
 } // namespace Vulkan

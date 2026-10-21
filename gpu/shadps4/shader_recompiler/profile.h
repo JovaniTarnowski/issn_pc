@@ -8,12 +8,12 @@
 namespace Shader {
 
 struct Profile {
+    u64 max_ubo_size{};
     u32 max_viewport_width{};
     u32 max_viewport_height{};
     u32 max_shared_memory_size{};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
-    u32 sparse_page_shift{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};
@@ -34,7 +34,6 @@ struct Profile {
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
-    bool supports_maximal_reconvergence{}; // port: BP06
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
@@ -44,31 +43,14 @@ struct Profile {
     bool supports_workgroup_explicit_memory_layout{};
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
-    bool supports_shader_subgroup_clock{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
-    /// port: NVIDIA without fragment shader barycentrics (Pascal and older).
-    bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
-    /// issn: also synchronize LDS accesses of compute workgroups larger than a GCN wave (see
-    /// SharedMemoryBarrierPass), for code relying on the 64 invocations of a wave in lockstep.
-    bool lds_barriers_multi_wave{};
-    /// issn: compute workgroups spanning several host subgroups are synchronized after the
-    /// buffer stores of their uniform loops (see WaveMemoryBarrierPass), for code exchanging data
-    /// through memory within a GCN wave (inFAMOUS Second Son).
-    bool wave_memory_barriers{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
-    /// port: ISSN_LIGHTING_TEST=dref (vk_lighting_test.h): depth comparisons return the result
-    /// in all four channels instead of (v, 0, 0, 0).
-    bool dref_broadcast{};
-    /// port: block-compressed 1D textures are 2D images (video_core/amdgpu/issn_block1d.h).
-    bool block1d_as_2d{};
-    /// port: tiny BC textures decoded to plain images (video_core/amdgpu/issn_bc_tiny.h).
-    bool bc_tiny_decode{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -4,7 +4,6 @@
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/translate/translate.h"
-#include "shader_recompiler/recompiler_toggles.h"
 
 namespace Shader::Gcn {
 
@@ -101,32 +100,8 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_MOV_B64(inst);
         case Opcode::S_NOT_B64:
             return S_NOT_B64(inst);
-        case Opcode::S_WQM_B64: {
-            // port: from the SotC native port (AjncSystem/ShadowOfTheColossus-PC, commits debb0c49
-            // and e3227814); it was a no-op here.
-            // s_wqm_b64 exec, exec needs nothing: pixel lanes already run as whole quads. Other
-            // forms write the source mask grown to whole quads (a quad with any bit set gets all
-            // four): SotC's lake/river water does s_wqm_b64 vcc, exec and later
-            // s_and_saveexec_b64 vcc; leaving VCC unset made that branch take garbage and skip the
-            // water normal map. A plain copy is not enough: alpha-tested foliage grows its test
-            // mask to quads so the neighbours used for the texture LOD stay alive.
-            // ISSN_WQM=0 restores the old no-op (A/B comparisons).
-            if (!Toggles::WholeQuadMode() || (inst.dst[0].field == OperandField::ExecLo &&
-                                               inst.src[0].field == OperandField::ExecLo)) {
-                break;
-            }
-            // Masks are per-lane booleans for the recompiler (InverseBallot elimination), so the
-            // growth is done per lane: a lane is set when any lane of its quad has its bit.
-            const IR::U1 bit{ir.InverseBallot(GetSrc64(inst.src[0]))};
-            const IR::U32 v{ir.Select(bit, ir.Imm32(1u), ir.Imm32(0u))};
-            const IR::U32 quad{ir.BitwiseOr(
-                ir.BitwiseOr(ir.QuadBroadcast(v, ir.Imm32(0u)), ir.QuadBroadcast(v, ir.Imm32(1u))),
-                ir.BitwiseOr(ir.QuadBroadcast(v, ir.Imm32(2u)), ir.QuadBroadcast(v, ir.Imm32(3u))))};
-            const IR::U64 mask{ir.Ballot(ir.INotEqual(quad, ir.Imm32(0u)))};
-            SetDst64(inst.dst[0], mask);
-            ir.SetScc(ir.InverseBallot(mask));
-            return;
-        }
+        case Opcode::S_WQM_B64:
+            break;
         case Opcode::S_BREV_B32:
             return S_BREV_B32(inst);
         case Opcode::S_BCNT1_I32_B32:
@@ -145,10 +120,6 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_BITSET_B32(inst, 0);
         case Opcode::S_BITSET1_B32:
             return S_BITSET_B32(inst, 1);
-        case Opcode::S_BITSET0_B64:
-            return S_BITSET_B64(inst, 0);
-        case Opcode::S_BITSET1_B64:
-            return S_BITSET_B64(inst, 1);
         case Opcode::S_AND_SAVEEXEC_B64:
             return S_SAVEEXEC_B64(NegateMode::None, false, inst);
         case Opcode::S_ORN2_SAVEEXEC_B64:
@@ -275,14 +246,11 @@ void Translator::S_SUBB_U32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 borrow{ir.Select(ir.GetScc(), ir.Imm32(1U), ir.Imm32(0U))};
-    const IR::U32 difference{ir.ISub(src0, src1)};
-    const IR::U32 result{ir.ISub(difference, borrow)};
+    const IR::U32 result{ir.ISub(ir.ISub(src0, src1), borrow)};
     SetDst(inst.dst[0], result);
 
-    // SCC = (S1.u + SCC > S0.u) as a 33-bit compare.
-    const IR::U1 underflow{ir.IGreaterThan(src1, src0, false)};
-    const IR::U1 borrow_underflow{ir.IGreaterThan(borrow, difference, false)};
-    ir.SetScc(ir.LogicalOr(underflow, borrow_underflow));
+    const IR::U32 sum_with_borrow{ir.IAdd(src1, borrow)};
+    ir.SetScc(ir.ILessThan(src0, sum_with_borrow, false));
 }
 
 void Translator::S_ADD_I32(const GcnInst& inst) {
@@ -317,12 +285,7 @@ void Translator::S_ADDC_U32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{ir.Select(ir.GetScc(), ir.Imm32(1U), ir.Imm32(0U))};
-    const IR::U32 result1{ir.IAdd(src0, src1)};
-    const IR::U32 result2{ir.IAdd(result1, carry)};
-    const IR::U1 carry_out1{ir.ILessThan(result1, src0, false)};
-    const IR::U1 carry_out2{ir.ILessThan(result2, result1, false)};
-    SetDst(inst.dst[0], result2);
-    ir.SetScc(ir.LogicalOr(carry_out1, carry_out2));
+    SetDst(inst.dst[0], ir.IAdd(ir.IAdd(src0, src1), carry));
 }
 
 void Translator::S_MIN_U32(bool is_signed, const GcnInst& inst) {
@@ -348,10 +311,10 @@ void Translator::S_CSELECT_B32(const GcnInst& inst) {
 }
 
 void Translator::S_CSELECT_B64(const GcnInst& inst) {
-    const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    const IR::U64 result{ir.Select(ir.GetScc(), src0, src1)};
-    SetDst64(inst.dst[0], result);
+    const IR::U1 src0{GetSrc1(inst.src[0])};
+    const IR::U1 src1{GetSrc1(inst.src[1])};
+    const IR::U1 result{ir.Select(ir.GetScc(), src0, src1)};
+    SetDst1(inst.dst[0], result);
 }
 
 void Translator::S_AND_B32(NegateMode negate, const GcnInst& inst) {
@@ -369,17 +332,17 @@ void Translator::S_AND_B32(NegateMode negate, const GcnInst& inst) {
 }
 
 void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
-    const IR::U64 src0{GetSrc64(inst.src[0])};
-    IR::U64 src1{GetSrc64(inst.src[1])};
+    const IR::U1 src0{GetSrc1(inst.src[0])};
+    IR::U1 src1{GetSrc1(inst.src[1])};
     if (negate == NegateMode::Src1) {
-        src1 = ir.BitwiseNot(src1);
+        src1 = ir.LogicalNot(src1);
     }
-    IR::U64 result = ir.BitwiseAnd(src0, src1);
+    IR::U1 result = ir.LogicalAnd(src0, src1);
     if (negate == NegateMode::Result) {
-        result = ir.BitwiseNot(result);
+        result = ir.LogicalNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
-    SetDst64(inst.dst[0], result);
+    ir.SetScc(result);
+    SetDst1(inst.dst[0], result);
 }
 
 void Translator::S_OR_B32(const GcnInst& inst) {
@@ -391,17 +354,17 @@ void Translator::S_OR_B32(const GcnInst& inst) {
 }
 
 void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
-    const IR::U64 src0{GetSrc64(inst.src[0])};
-    IR::U64 src1{GetSrc64(inst.src[1])};
+    const IR::U1 src0{GetSrc1(inst.src[0])};
+    IR::U1 src1{GetSrc1(inst.src[1])};
     if (negate == NegateMode::Src1) {
-        src1 = ir.BitwiseNot(src1);
+        src1 = ir.LogicalNot(src1);
     }
-    IR::U64 result = is_xor ? ir.BitwiseXor(src0, src1) : ir.BitwiseOr(src0, src1);
+    IR::U1 result = is_xor ? ir.LogicalXor(src0, src1) : ir.LogicalOr(src0, src1);
     if (negate == NegateMode::Result) {
-        result = ir.BitwiseNot(result);
+        result = ir.LogicalNot(result);
     }
-    ir.SetScc(ir.InverseBallot(result));
-    SetDst64(inst.dst[0], result);
+    ir.SetScc(result);
+    SetDst1(inst.dst[0], result);
 }
 
 void Translator::S_XOR_B32(const GcnInst& inst) {
@@ -530,16 +493,7 @@ void Translator::S_CMPK(ConditionOp cond, bool is_signed, const GcnInst& inst) {
 
 void Translator::S_ADDK_I32(const GcnInst& inst) {
     const s32 simm16 = inst.control.sopk.simm;
-    const IR::U32 src0{GetSrc(inst.dst[0])};
-    const IR::U32 src1{ir.Imm32(simm16)};
-    const IR::U32 result{ir.IAdd(src0, src1)};
-    SetDst(inst.dst[0], result);
-
-    const IR::U32 shift{ir.Imm32(31)};
-    const IR::U32 sign0{ir.ShiftRightLogical(src0, shift)};
-    const IR::U32 sign1{ir.ShiftRightLogical(src1, shift)};
-    const IR::U32 signr{ir.ShiftRightLogical(result, shift)};
-    ir.SetScc(ir.LogicalAnd(ir.IEqual(sign0, sign1), ir.INotEqual(sign0, signr)));
+    SetDst(inst.dst[0], ir.IAdd(GetSrc(inst.dst[0]), ir.Imm32(simm16)));
 }
 
 void Translator::S_MULK_I32(const GcnInst& inst) {
@@ -550,18 +504,35 @@ void Translator::S_MULK_I32(const GcnInst& inst) {
 // SOP1
 
 void Translator::S_MOV(const GcnInst& inst) {
+    if (inst.dst[0].field == OperandField::ScalarGPR) {
+        if (inst.src[0].field == OperandField::ExecLo) {
+            ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), ir.GetExec());
+            return;
+        } else if (inst.src[0].field == OperandField::ExecHi) {
+            return;
+        }
+    }
     SetDst(inst.dst[0], GetSrc(inst.src[0]));
 }
 
 void Translator::S_MOV_B64(const GcnInst& inst) {
-    SetDst64(inst.dst[0], GetSrc64(inst.src[0]));
+    // Moving SGPR to SGPR is used for thread masks, like most operations, but it can also be used
+    // for moving sharps.
+    if (inst.dst[0].field == OperandField::ScalarGPR &&
+        inst.src[0].field == OperandField::ScalarGPR) {
+        ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
+                        ir.GetScalarReg(IR::ScalarReg(inst.src[0].code)));
+        ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code + 1),
+                        ir.GetScalarReg(IR::ScalarReg(inst.src[0].code + 1)));
+    }
+    SetDst1(inst.dst[0], GetSrc1(inst.src[0]));
 }
 
 void Translator::S_NOT_B64(const GcnInst& inst) {
-    const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 result = ir.BitwiseNot(src0);
-    ir.SetScc(ir.InverseBallot(result));
-    SetDst64(inst.dst[0], result);
+    const IR::U1 src0{GetSrc1(inst.src[0])};
+    const IR::U1 result = ir.LogicalNot(src0);
+    ir.SetScc(result);
+    SetDst1(inst.dst[0], result);
 }
 
 void Translator::S_BREV_B32(const GcnInst& inst) {
@@ -587,8 +558,7 @@ void Translator::S_FF1_I32_B32(const GcnInst& inst) {
 }
 
 void Translator::S_FF1_I32_B64(const GcnInst& inst) {
-    const IR::U64 src0{GetSrc64(inst.src[0])};
-    SetDst(inst.dst[0], ir.BallotFindLsb(src0));
+    SetDst(inst.dst[0], ir.BallotFindLsb(ir.Ballot(GetSrc1(inst.src[0]))));
 }
 
 void Translator::S_FLBIT_I32_B32(const GcnInst& inst) {
@@ -620,30 +590,24 @@ void Translator::S_BITSET_B32(const GcnInst& inst, u32 bit_value) {
     SetDst(inst.dst[0], result);
 }
 
-void Translator::S_BITSET_B64(const GcnInst& inst, u32 bit_value) {
-    const IR::U64 old_value{GetSrc64(inst.dst[0])};
-    const IR::U32 offset{ir.BitwiseAnd(GetSrc(inst.src[0]), ir.Imm32(0x3F))};
-    const IR::U64 result{
-        ir.BitFieldInsert(old_value, ir.Imm64(u64(bit_value)), offset, ir.Imm32(1U))};
-    SetDst64(inst.dst[0], result);
-}
-
 void Translator::S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& inst) {
-    IR::U64 exec{ir.Ballot(ir.GetExec())};
-    const IR::U64 src{GetSrc64(inst.src[0])};
-    SetDst64(inst.dst[0], exec);
+    // This instruction normally operates on 64-bit data (EXEC, VCC, SGPRs)
+    // However here we flatten it to 1-bit EXEC and 1-bit VCC. For the destination
+    // SGPR we have a special IR opcode for SPGRs that act as thread masks.
+    IR::U1 exec{ir.GetExec()};
+    const IR::U1 src{GetSrc1(inst.src[0])};
+    SetDst1(inst.dst[0], exec);
 
     // Update EXEC.
     if (negate == NegateMode::Src1) {
-        exec = ir.BitwiseNot(exec);
+        exec = ir.LogicalNot(exec);
     }
-    IR::U64 result = is_or ? ir.BitwiseOr(exec, src) : ir.BitwiseAnd(exec, src);
+    IR::U1 result = is_or ? ir.LogicalOr(exec, src) : ir.LogicalAnd(exec, src);
     if (negate == NegateMode::Result) {
-        result = ir.BitwiseNot(result);
+        result = ir.LogicalNot(result);
     }
-    const IR::U1 result_u1 = ir.InverseBallot(result);
-    ir.SetExec(result_u1);
-    ir.SetScc(result_u1);
+    ir.SetExec(result);
+    ir.SetScc(result);
 }
 
 void Translator::S_ABS_I32(const GcnInst& inst) {
@@ -680,22 +644,23 @@ void Translator::S_CMP(ConditionOp cond, bool is_signed, const GcnInst& inst) {
 
 void Translator::S_BITCMP(bool compare_mode, u32 bits, const GcnInst& inst) {
     const IR::U1 result = [&] {
+        const IR::U32 src0 = GetSrc(inst.src[0]);
         const IR::U32 src1 = GetSrc(inst.src[1]);
-        const IR::U32 mask = ir.Imm32(bits == 64 ? 0x3f : 0x1f);
+
+        IR::U32 mask;
+        switch (bits) {
+        case 32:
+            mask = ir.Imm32(0x1f);
+            break;
+        case 64:
+            mask = ir.Imm32(0x3f);
+            break;
+        default:
+            UNREACHABLE();
+        }
+
         const IR::U32 bitpos{ir.BitwiseAnd(src1, mask)};
-        const IR::U32 bittest = [&]() -> IR::U32 {
-            if (bits == 64) {
-                const IR::U64 src0 = GetSrc64(inst.src[0]);
-                const IR::U64 bit{
-                    ir.BitwiseAnd(ir.ShiftRightLogical(src0, bitpos), ir.Imm64(u64(1)))};
-                return ir.UConvert(32, bit);
-            }
-            if (bits != 32) {
-                UNREACHABLE();
-            }
-            const IR::U32 src0 = GetSrc(inst.src[0]);
-            return ir.BitwiseAnd(ir.ShiftRightLogical(src0, bitpos), ir.Imm32(1));
-        }();
+        const IR::U32 bittest{ir.BitwiseAnd(ir.ShiftRightLogical(src0, bitpos), ir.Imm32(1))};
 
         if (!compare_mode) {
             return ir.IEqual(bittest, ir.Imm32(0));

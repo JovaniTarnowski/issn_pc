@@ -14,6 +14,13 @@ struct Archive;
 
 namespace Shader::Gcn {
 
+/// SHADPS4_CACHE_REBUILD (2026-10-16): V#s standing in for the guest vertex-buffer table while a
+/// vertex shader is re-translated at WarmUp (the table is not in memory yet), keyed by
+/// (sgpr_base << 8) | dword_offset; made from the cached VS attribute specialization (number
+/// class, swizzle). Per thread (thread_local), set around one translation.
+inline thread_local const std::vector<std::pair<u32, AmdGpu::Buffer>>* g_synthetic_vs_sharps =
+    nullptr;
+
 struct VertexAttribute {
     enum InstanceIdType : u8 {
         None = 0,
@@ -36,7 +43,29 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept;
+    constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
+        AmdGpu::Buffer buffer{};
+        bool synthetic = false;
+        if (g_synthetic_vs_sharps) [[unlikely]] {
+            const u32 key = (u32{sgpr_base} << 8) | dword_offset;
+            for (const auto& [k, v] : *g_synthetic_vs_sharps) {
+                if (k == key) {
+                    buffer = v;
+                    synthetic = true;
+                    break;
+                }
+            }
+        }
+        if (!synthetic) {
+            buffer = info.template ReadUdReg<AmdGpu::Buffer>(sgpr_base, dword_offset);
+        }
+        buffer.base_address += inst_offset;
+        if (data_format) {
+            buffer.data_format = data_format;
+            buffer.num_format = num_format;
+        }
+        return buffer;
+    }
 
     bool operator==(const VertexAttribute& other) const {
         return semantic == other.semantic && dest_vgpr == other.dest_vgpr &&
@@ -60,23 +89,12 @@ struct FetchShaderData {
     bool Deserialize(Serialization::Archive& buffer);
 };
 
-// port: compiler workers read captured fetch data instead of mutable guest pointers.
-struct FetchShaderSnapshot {
-    const Info* info{};
-    std::optional<FetchShaderData> fetch;
-    std::vector<AmdGpu::Buffer> buffers;
-    void Capture(const Info& source);
-};
-
-class ScopedFetchShaderSnapshot {
-public:
-    explicit ScopedFetchShaderSnapshot(const FetchShaderSnapshot& snapshot);
-    ~ScopedFetchShaderSnapshot();
-private:
-    const FetchShaderSnapshot* previous;
-};
-
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
+
+/// SHADPS4_CACHE_REBUILD (2026-10-16): while set, ParseFetchShader returns this instead of
+/// decoding guest memory - a vertex shader re-translated at WarmUp from the game's files has no
+/// fetch subroutine in memory yet; its cached FetchShaderData stands in (per thread).
+inline thread_local const FetchShaderData* g_synthetic_fetch = nullptr;
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 

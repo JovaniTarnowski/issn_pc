@@ -3,12 +3,7 @@
 
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <bit>
-#include <bitset>
 #include <cstring>
-#include <vector>
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -92,9 +87,7 @@ union Regs {
         PsInput ps_input_addr;
         INSERT_PADDING_WORDS(1);
         u32 num_interp : 6;
-        INSERT_PADDING_WORDS(1);
-        BarycentricControl barycentric_control;
-        INSERT_PADDING_WORDS(10);
+        INSERT_PADDING_WORDS(12);
         ShaderPosFormat shader_pos_format;
         ShaderExportFormat z_export_format;
         ColorExportFormat color_export_format;
@@ -195,103 +188,35 @@ union Regs {
     void SetDefaults();
 };
 
-// port: register blocks written by a stretch of packets, and their values at its end. The
-// draw-preparation scanner records one per submission so a worker reaches the state at the
-// start of any later submission without replaying the packets in between.
-/// issn: a fixed bit set whose set bits are visited word by word. std::bitset has no such
-/// walk in libc++ (Windows): the draw pipeline tested all 1664 bits of RegDirty per draw,
-/// ~13% of the GPU command thread in the city (ISSN_SAMPLE).
-template <u32 N>
-struct BlockBits {
-    static constexpr u32 Words = (N + 63) / 64;
-    std::array<u64, Words> words{};
-    void set(u32 i) noexcept {
-        words[i / 64] |= u64(1) << (i % 64);
-    }
-    [[nodiscard]] bool test(u32 i) const noexcept {
-        return (words[i / 64] >> (i % 64)) & 1;
-    }
-    void reset() noexcept {
-        words.fill(0);
-    }
-    [[nodiscard]] bool any() const noexcept {
-        for (const u64 w : words) {
-            if (w) {
-                return true;
-            }
-        }
-        return false;
-    }
-    [[nodiscard]] static constexpr u32 size() noexcept {
-        return N;
-    }
-    /// f(index) for every set bit, in ascending order.
-    template <typename F>
-    void ForEach(F&& f) const {
-        for (u32 w = 0; w < Words; ++w) {
-            for (u64 bits = words[w]; bits; bits &= bits - 1) {
-                f(w * 64 + static_cast<u32>(std::countr_zero(bits)));
-            }
-        }
-    }
-};
-
-struct RegDirty {
-    static constexpr u32 BlockWords = 32;
-    static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
-    BlockBits<NumBlocks> blocks;
-    bool reset = false; ///< ClearState: defaults, then only the blocks marked after it
-
-    void Mark(u32 word, u32 count) {
-        if (count == 0 || word >= Regs::NumRegs) {
-            return;
-        }
-        const u32 last = std::min(word + count, Regs::NumRegs) - 1;
-        for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
-            blocks.set(block);
-        }
-    }
-    template <typename T>
-    void MarkField(const Regs& regs, const T& field) {
-        const auto offset = reinterpret_cast<const u8*>(&field) -
-                            reinterpret_cast<const u8*>(regs.reg_array.data());
-        Mark(u32(offset / sizeof(u32)), u32((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
-    }
-    void Clear() {
-        blocks.reset();
-        reset = false;
-    }
-};
-
-struct RegDelta {
-    bool reset = false;
-    std::vector<u16> blocks;
-    std::vector<u32> words;
-
-    void Capture(const Regs& regs, const RegDirty& dirty) {
-        reset = dirty.reset;
-        blocks.clear();
-        words.clear();
-        dirty.blocks.ForEach([&](u32 block) {
-            blocks.push_back(u16(block));
-            const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
-            words.insert(words.end(), src, src + RegDirty::BlockWords);
-        });
-    }
-    void Apply(Regs& regs) const {
-        if (reset) {
-            regs.SetDefaults();
-        }
-        for (size_t i = 0; i < blocks.size(); ++i) {
-            std::memcpy(regs.reg_array.data() + blocks[i] * RegDirty::BlockWords,
-                        words.data() + i * RegDirty::BlockWords,
-                        RegDirty::BlockWords * sizeof(u32));
-        }
-    }
-};
-
 #undef DO_CONCAT2
 #undef CONCAT2
 #undef INSERT_PADDING_WORDS
+
+/// The native batch / segment rule for context-register state (notes/native-path-2026-10-09.md
+/// sec. 25 item 3): two context blocks are the same state when every word but the per-draw
+/// index DMA slots VGT_DMA_BASE_HI / BASE / MAX_SIZE / INDEX_TYPE agrees (s285: at 97% of the
+/// back's refusals only those differed). Shared by the back (Rasterizer::NativeCtxSame) and the
+/// front's segment builder (SegB) so the two rules cannot drift.
+constexpr u32 NativeCtxBlockWords = 0x400;
+inline bool NativeCtxBlockSame(const u32* now, const u32* ref) {
+    constexpr u32 kDmaBaseHi = 0x1f9, kDmaBase = 0x1fa, kDmaMax = 0x29e, kDmaType = 0x29f;
+    return std::memcmp(now, ref, sizeof(u32) * kDmaBaseHi) == 0 &&
+           std::memcmp(now + kDmaBase + 1, ref + kDmaBase + 1,
+                       sizeof(u32) * (kDmaMax - kDmaBase - 1)) == 0 &&
+           std::memcmp(now + kDmaType + 1, ref + kDmaType + 1,
+                       sizeof(u32) * (NativeCtxBlockWords - kDmaType - 1)) == 0;
+}
+/// The first context word the rule counts that differs (NativeCtxBlockWords: none).
+inline u32 NativeCtxBlockFirstDiff(const u32* now, const u32* ref) {
+    for (u32 i = 0; i < NativeCtxBlockWords; ++i) {
+        if (i == 0x1f9 || i == 0x1fa || i == 0x29e || i == 0x29f) {
+            continue;
+        }
+        if (now[i] != ref[i]) {
+            return i;
+        }
+    }
+    return NativeCtxBlockWords;
+}
 
 } // namespace AmdGpu

@@ -3,7 +3,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <ctime>
+#include <mutex>
+#include <vector>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -18,6 +24,8 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <bit>
+#include <intrin.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -242,13 +250,508 @@ void AccurateTimer::End() {
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
 }
 
-std::string GetCurrentThreadName() {
 #ifdef _WIN32
-    PWSTR name{};
-    if (FAILED(GetThreadDescription(GetCurrentThread(), &name)) || name == nullptr) {
+namespace {
+// Efficiency class per logical processor index from the CPU set list (P-cores report the
+// highest class on hybrid parts). Index 0..63 only; enough for this machine (20 threads).
+struct CpuClasses {
+    std::array<u8, 64> cls{};
+    std::array<u8, 64> core{};
+    std::array<ULONG, 64> ids{};
+    u8 max_class{};
+    size_t count{};
+};
+const CpuClasses& GetCpuClasses() {
+    static const CpuClasses classes = [] {
+        CpuClasses c{};
+        ULONG len = 0;
+        GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
+        std::vector<u8> buf(len);
+        auto* info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data());
+        if (!GetSystemCpuSetInformation(info, len, &len, GetCurrentProcess(), 0)) {
+            return c;
+        }
+        for (ULONG off = 0; off < len;) {
+            auto* e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
+            if (e->Type == CpuSetInformation && e->CpuSet.LogicalProcessorIndex < 64) {
+                const auto idx = e->CpuSet.LogicalProcessorIndex;
+                c.cls[idx] = e->CpuSet.EfficiencyClass;
+                c.core[idx] = e->CpuSet.CoreIndex;
+                c.ids[idx] = e->CpuSet.Id;
+                c.max_class = std::max<u8>(c.max_class, e->CpuSet.EfficiencyClass);
+                c.count = std::max<size_t>(c.count, idx + 1);
+            }
+            off += e->Size;
+        }
+        return c;
+    }();
+    return classes;
+}
+
+/// The process affinity mask now (2026-10-15: a harness or the user may restrict it after start,
+/// e.g. the weaker-CPU arms; every placement below stays inside it).
+u64 ProcessMaskNow() {
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || proc == 0) {
+        return ~u64{0};
+    }
+    return static_cast<u64>(proc);
+}
+
+// Whole performance cores handed to single threads (SHADPS4_CP_QOS=3, SHADPS4_HOT_CORES): the
+// process default CPU set is everything except the reserved cores (both logical processors).
+std::mutex g_reserved_mutex;
+std::array<bool, 64> g_reserved_core{}; // by CoreIndex, performance cores only
+
+/// Gives the calling thread the `rank`-th performance core counted from the last one (0 = last)
+/// and keeps the rest of the process off it. `first` receives its first logical processor.
+bool ReservePerformanceCore(int rank, int& first, size_t& others_count) {
+    const auto& c = GetCpuClasses();
+    const u64 allowed = ProcessMaskNow();
+    std::vector<int> firsts;
+    for (size_t i = 0; i < c.count; ++i) {
+        // 2026-10-15: only a P-core whose first logical processor is inside the process mask
+        // (10-14 W4E arm: the CP landed on logical 10, outside a 4-E-core mask).
+        if (c.cls[i] == c.max_class &&
+            (i == 0 || c.core[i - 1] != c.core[i] || c.cls[i - 1] != c.max_class) &&
+            ((allowed >> i) & 1) != 0) {
+            firsts.push_back(int(i));
+        }
+    }
+    first = -1;
+    if (rank < 0 || size_t(rank) >= firsts.size()) {
+        return false;
+    }
+    first = firsts[firsts.size() - 1 - size_t(rank)];
+    std::scoped_lock lock{g_reserved_mutex};
+    g_reserved_core[c.core[first]] = true;
+    std::vector<ULONG> others;
+    for (size_t i = 0; i < c.count; ++i) {
+        if (!(c.cls[i] == c.max_class && g_reserved_core[c.core[i]]) && ((allowed >> i) & 1) != 0) {
+            others.push_back(c.ids[i]);
+        }
+    }
+    others_count = others.size();
+    const ULONG mine = c.ids[first];
+    return SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(), ULONG(others.size())) &&
+           SetThreadSelectedCpuSets(GetCurrentThread(), &mine, 1);
+}
+} // namespace
+
+void ApplyCriticalThreadPriority(HotThread which) {
+    // SHADPS4_CRIT_PRIO (2026-10-15, default off): bit 1 = the recorder lanes and the front, bit 2 =
+    // Game:Main, at THREAD_PRIORITY_ABOVE_NORMAL. Nothing is lowered (the reverted POOL_AUTO helper
+    // drop put below-normal workers on the back's waits). Trace s1201 (6c/12t mask, b15g): the CP
+    // waited 31% of its wall time on the recorders while they were ready-but-not-running 25% of
+    // theirs (the front 33%): lean and job threads held the cores the critical chain needed.
+    static const unsigned crit = [] {
+        const char* value = std::getenv("SHADPS4_CRIT_PRIO");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    // Requires SHADPS4_SPINLOCK_PARK (Opus review 10-15): with pure-pause SpinLocks an above-normal
+    // waiter never gives its core to a preempted normal-priority holder (region / page locks are
+    // taken by guest faults, the front and the recorders alike).
+    static const bool park = [] {
+        const char* value = std::getenv("SHADPS4_SPINLOCK_PARK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0 && !park) {
+        LOG_WARNING(Common, "SHADPS4_CRIT_PRIO={} ignored: needs SHADPS4_SPINLOCK_PARK", crit);
+    } else if ((crit & (which == HotThread::GameMain ? 2u : 1u)) != 0) {
+        const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        LOG_INFO(Common, "SHADPS4_CRIT_PRIO={}: {} above normal, ok {}", crit,
+                 which == HotThread::Recorder ? "recorder"
+                 : which == HotThread::Front  ? "front"
+                                              : "Game:Main",
+                 prio_ok);
+    }
+}
+
+void ApplyHotThreadPlacement(HotThread which) {
+    ApplyCriticalThreadPriority(which);
+    static const unsigned mask = [] {
+        const char* value = std::getenv("SHADPS4_HOT_CORES");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    const unsigned bit = which == HotThread::Recorder ? 1u : which == HotThread::Front ? 2u : 4u;
+    if ((mask & bit) == 0) {
+        return;
+    }
+    THREAD_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling,
+                         sizeof(throttling));
+    int first = -1;
+    size_t others = 0;
+    const int rank = which == HotThread::Recorder ? 1 : which == HotThread::Front ? 2 : 3;
+    const bool ok = ReservePerformanceCore(rank, first, others);
+    LOG_INFO(Common, "SHADPS4_HOT_CORES={}: {} on logical {}, {} logical for the rest, ok {}", mask,
+             which == HotThread::Recorder ? "recorder"
+             : which == HotThread::Front  ? "front"
+                                          : "Game:Main",
+             first, others, ok);
+}
+
+namespace {
+/// Every logical processor of the given class kind (true: performance) minus reserved P-cores.
+std::vector<ULONG> ClassCpuSets(bool performance) {
+    const auto& c = GetCpuClasses();
+    const u64 allowed = ProcessMaskNow();
+    std::vector<ULONG> ids;
+    std::scoped_lock lock{g_reserved_mutex};
+    for (size_t i = 0; i < c.count; ++i) {
+        const bool p = c.cls[i] == c.max_class;
+        if (p == performance && !(p && g_reserved_core[c.core[i]]) && ((allowed >> i) & 1) != 0) {
+            ids.push_back(c.ids[i]);
+        }
+    }
+    return ids;
+}
+} // namespace
+
+void ApplyGuestThreadPlacement(void* handle, const char* name) {
+    static const unsigned mask = [] {
+        const char* value = std::getenv("SHADPS4_GUEST_PCORE");
+        return value ? static_cast<unsigned>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    if (mask == 0 || name == nullptr) {
+        return;
+    }
+    const bool job = std::strncmp(name, "JobWorker", 9) == 0;
+    const bool main = std::strcmp(name, "Game:Main") == 0;
+    if (main) {
+        // Review RISK: SHADPS4_HOT_CORES bit 2 already gave Game:Main a whole reserved core.
+        const char* hot = std::getenv("SHADPS4_HOT_CORES");
+        if (hot && (std::strtoul(hot, nullptr, 0) & 4u) != 0) {
+            return;
+        }
+    }
+    if (!((job && (mask & 1)) || (main && (mask & 2)))) {
+        return;
+    }
+    const HANDLE h = static_cast<HANDLE>(handle);
+    THREAD_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetThreadInformation(h, ThreadPowerThrottling, &throttling, sizeof(throttling));
+    const auto ids = ClassCpuSets(true);
+    const bool ok = !ids.empty() && SetThreadSelectedCpuSets(h, ids.data(), ULONG(ids.size()));
+    LOG_INFO(Common, "SHADPS4_GUEST_PCORE={}: {} on {} performance logical processors, ok {}", mask,
+             name, ids.size(), ok);
+}
+
+u32 AutoPoolWorkers(bool lean) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_POOL_AUTO");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!on) {
+        return 0;
+    }
+    const u32 n = static_cast<u32>(std::popcount(ProcessMaskNow()));
+    // lean: 6 logical -> 3, 12 -> 5, 20 -> 7 (measured best: 6 -> 3, 12 -> 4); A2: 1 below 16.
+    const u32 w = lean ? std::clamp<u32>(n / 4 + 2, 2, 8) : (n < 16 ? 1u : 2u);
+    LOG_INFO(Common, "SHADPS4_POOL_AUTO: {} logical processors -> {} {} workers", n, w,
+             lean ? "lean" : "A2");
+    return w;
+}
+
+void ApplyHelperThreadPlacement(const char* name) {
+    static const int mode = [] {
+        const char* value = std::getenv("SHADPS4_HELPER_PLACE");
+        // Not implied by SHADPS4_POOL_AUTO (b15f did, b15g reverted): below-normal workers sit on
+        // the back's wait paths (Opus review 10-15: starvation risk on < 16 logical), and
+        // SHADPS4_SPINLOCK_PARK=1 alone recovered more at 4c/8t (57.9 vs 54.4 FPS, s1182 / s1172).
+        return value ? value[0] - '0' : 0;
+    }();
+    if (mode <= 0) {
+        return;
+    }
+    bool ok = false;
+    size_t n = 0;
+    if (mode == 1) {
+        const auto ids = ClassCpuSets(false);
+        n = ids.size();
+        ok = !ids.empty() &&
+             SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()));
+    } else if (mode == 2) {
+        ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    LOG_INFO(Common, "SHADPS4_HELPER_PLACE={}: {} ({} efficiency logical processors), ok {}", mode,
+             name, n, ok);
+}
+
+void ApplyCommandProcessorPlacement() {
+    const char* value = std::getenv("SHADPS4_CP_QOS");
+    const int mode = value ? value[0] - '0' : 0;
+    if (mode <= 0) {
+        return;
+    }
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0; // always high QoS
+    const bool proc_ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                               &throttling, sizeof(throttling));
+    THREAD_POWER_THROTTLING_STATE thread_throttling{};
+    thread_throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    thread_throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    thread_throttling.StateMask = 0;
+    const bool thread_ok = SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
+                                                &thread_throttling, sizeof(thread_throttling));
+    const bool prio_ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    bool sets_ok = true;
+    size_t p_cores = 0;
+    if (mode == 3) {
+        // A whole P-core for this thread: the last performance core's first logical processor
+        // for us, and every other thread (process default) kept off both of its siblings.
+        int first = -1;
+        sets_ok = ReservePerformanceCore(0, first, p_cores);
+        if (first >= 0) {
+            LOG_INFO(Common, "SHADPS4_CP_QOS=3: CP on logical {} (core {}), {} logical for the rest",
+                     first, GetCpuClasses().core[first], p_cores);
+        }
+    } else if (mode >= 2) {
+        const auto& c = GetCpuClasses();
+        const u64 allowed = ProcessMaskNow();
+        std::vector<ULONG> ids;
+        for (size_t i = 0; i < c.count; ++i) {
+            if (c.cls[i] == c.max_class && ((allowed >> i) & 1) != 0) {
+                ids.push_back(c.ids[i]);
+            }
+        }
+        p_cores = ids.size();
+        sets_ok = !ids.empty() &&
+                  SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()));
+    }
+    LOG_INFO(Common, "SHADPS4_CP_QOS={}: process throttling off {}, thread {}, priority {}, "
+                     "P-core set {} ({} logical)",
+             mode, proc_ok, thread_ok, prio_ok, sets_ok, p_cores);
+}
+
+void SampleCommandProcessorCore() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_CP_CORE_STATS");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::array<u64, 64> hits{};
+    static u64 samples = 0;
+    const DWORD cpu = GetCurrentProcessorNumber();
+    ++hits[cpu & 63];
+    if (++samples % 200000 != 0) {
+        return;
+    }
+    const auto& c = GetCpuClasses();
+    u64 p = 0;
+    std::string top;
+    for (size_t i = 0; i < 64; ++i) {
+        if (hits[i] && c.cls[i] == c.max_class) {
+            p += hits[i];
+        }
+        if (hits[i] * 20 >= samples) {
+            top += fmt::format(" cpu{}(c{}):{:.0f}%", i, c.cls[i], 100.0 * hits[i] / samples);
+        }
+    }
+    LOG_INFO(Common, "CP_CORE_STATS: samples {} on P-cores {:.1f}%{}", samples,
+             100.0 * p / samples, top);
+    hits.fill(0);
+    samples = 0;
+}
+namespace {
+struct ThreadPlacementState {
+    std::array<u32, 64> hits{};
+    std::array<u32, 48> probes{};
+    u32 calls{};
+    u32 samples{};
+    u32 migrations{};
+    u32 num_probes{};
+    u32 last_cpu{~0u};
+    u64 window_tsc{};
+    u64 probe_tsc{};
+    u64 tsc_per_s{3'500'000'000ULL};
+    LARGE_INTEGER window_qpc{};
+    u64 cpu_100ns{};
+};
+
+u64 ThreadCpuTime100ns() {
+    FILETIME creation, exit, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    return ((u64(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+           ((u64(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+}
+
+/// TSC ticks for 4096 iterations of a two-operation dependency chain (rotate, xor): the chain
+/// runs at the core's real clock, the TSC at a fixed rate. Best of four; ~1 us each.
+__declspec(noinline) u32 ClockProbeTicks() {
+    static volatile u64 seed = 0x9E3779B97F4A7C15ULL;
+    u64 best = ~0ULL;
+    for (int rep = 0; rep < 4; ++rep) {
+        u64 v = seed;
+        const u64 t0 = __rdtsc();
+        for (u32 i = 0; i < 4096; ++i) {
+            v = std::rotl(v, 7) ^ i;
+        }
+        const u64 dt = __rdtsc() - t0;
+        seed = v;
+        best = std::min(best, dt);
+    }
+    return static_cast<u32>(std::min<u64>(best, 0xffffffffULL));
+}
+
+/// Busy share of every logical processor since the previous call (whole machine, all
+/// processes), from the kernel's per-processor idle times. One caller only (the CP back).
+std::string LogicalProcessorLoad() {
+    struct ProcessorPerf {
+        LARGE_INTEGER idle, kernel, user, dpc, interrupt;
+        ULONG interrupts;
+    };
+    using QueryFn = LONG(__stdcall*)(ULONG, PVOID, ULONG, PULONG);
+    static const QueryFn query = reinterpret_cast<QueryFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    static std::array<ProcessorPerf, 64> last{};
+    std::array<ProcessorPerf, 64> now{};
+    ULONG bytes = 0;
+    // 8 = SystemProcessorPerformanceInformation
+    if (!query || query(8, now.data(), ULONG(sizeof(now)), &bytes) < 0) {
+        return {};
+    }
+    const size_t count = bytes / sizeof(ProcessorPerf);
+    std::string out;
+    for (size_t i = 0; i < count; ++i) {
+        // kernel time includes idle time
+        const double total = double((now[i].kernel.QuadPart - last[i].kernel.QuadPart) +
+                                    (now[i].user.QuadPart - last[i].user.QuadPart));
+        const double idle = double(now[i].idle.QuadPart - last[i].idle.QuadPart);
+        out += fmt::format(" {}:{:.0f}", i, total > 0 ? 100.0 * (total - idle) / total : 0.0);
+    }
+    last = now;
+    return out;
+}
+} // namespace
+
+u32 CurrentProcessor() {
+    return GetCurrentProcessorNumber();
+}
+bool IsPerformanceProcessor(u32 cpu) {
+    const auto& c = GetCpuClasses();
+    return cpu >= 64 || c.cls[cpu] == c.max_class;
+}
+u32 ClockProbe() {
+    return ClockProbeTicks();
+}
+
+const bool g_thread_stats = [] {
+    const char* value = std::getenv("SHADPS4_THREAD_STATS");
+    return value && value[0] == '1';
+}();
+
+void SampleThreadPlacementSlow(const char* role, unsigned stride_log2) {
+    thread_local ThreadPlacementState st;
+    if ((++st.calls & ((1u << stride_log2) - 1)) != 0) {
+        return;
+    }
+    const u32 cpu = GetCurrentProcessorNumber() & 63;
+    ++st.hits[cpu];
+    ++st.samples;
+    st.migrations += st.last_cpu != ~0u && cpu != st.last_cpu;
+    st.last_cpu = cpu;
+    const u64 now = __rdtsc();
+    if (st.window_tsc == 0) {
+        st.window_tsc = now;
+        st.probe_tsc = now;
+        QueryPerformanceCounter(&st.window_qpc);
+        st.cpu_100ns = ThreadCpuTime100ns();
+        return;
+    }
+    if (now - st.probe_tsc > st.tsc_per_s / 4 && st.num_probes < st.probes.size()) {
+        st.probes[st.num_probes++] = ClockProbeTicks();
+        st.probe_tsc = __rdtsc();
+    }
+    if (now - st.window_tsc < st.tsc_per_s * 10) {
+        return;
+    }
+    LARGE_INTEGER qpc, freq;
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&freq);
+    const double wall_s = double(qpc.QuadPart - st.window_qpc.QuadPart) / double(freq.QuadPart);
+    const u64 cpu_100ns = ThreadCpuTime100ns();
+    const double cpu_s = double(cpu_100ns - st.cpu_100ns) * 1e-7;
+    if (wall_s > 1.0) {
+        st.tsc_per_s = static_cast<u64>(double(now - st.window_tsc) / wall_s);
+    }
+    const auto& c = GetCpuClasses();
+    std::string top;
+    for (size_t i = 0; i < 64; ++i) {
+        if (u64(st.hits[i]) * 50 >= st.samples) {
+            top += fmt::format(" cpu{}({}{}):{:.0f}%", i, c.cls[i] == c.max_class ? "P" : "E",
+                               c.core[i], 100.0 * st.hits[i] / st.samples);
+        }
+    }
+    std::sort(st.probes.begin(), st.probes.begin() + st.num_probes);
+    const u32 probe_min = st.num_probes ? st.probes[0] : 0;
+    const u32 probe_med = st.num_probes ? st.probes[st.num_probes / 2] : 0;
+    // 8192 chain operations per probe: operations per TSC tick x TSC rate = core clock estimate
+    // (exact only if each operation takes one cycle; compare between runs of the same EXE).
+    const auto ghz = [&](u32 ticks) {
+        return ticks ? 8192.0 / double(ticks) * double(st.tsc_per_s) * 1e-9 : 0.0;
+    };
+    LOG_INFO(Common,
+             "ThreadStats: role={} window_s={:.2f} cpu_s={:.2f} ({:.1f}%) samples={} migrations={} "
+             "clock_probe_ticks med={} min={} n={} (~{:.2f} / {:.2f} GHz) tsc_mhz={:.0f} on{}",
+             role, wall_s, cpu_s, 100.0 * cpu_s / std::max(wall_s, 1e-9), st.samples,
+             st.migrations, probe_med, probe_min, st.num_probes, ghz(probe_med), ghz(probe_min),
+             double(st.tsc_per_s) * 1e-6, top);
+    if (role[0] == 'b') {
+        LOG_INFO(Common, "ThreadStats: logical processor busy % (all processes):{}",
+                 LogicalProcessorLoad());
+    }
+    st.hits.fill(0);
+    st.samples = 0;
+    st.migrations = 0;
+    st.num_probes = 0;
+    st.window_tsc = now;
+    st.window_qpc = qpc;
+    st.cpu_100ns = cpu_100ns;
+}
+#else
+u32 AutoPoolWorkers(bool) {
+    return 0;
+}
+void ApplyGuestThreadPlacement(void*, const char*) {}
+void ApplyHelperThreadPlacement(const char*) {}
+void ApplyCommandProcessorPlacement() {}
+void ApplyHotThreadPlacement(HotThread) {}
+void ApplyCriticalThreadPriority(HotThread) {}
+void SampleCommandProcessorCore() {}
+const bool g_thread_stats = false;
+void SampleThreadPlacementSlow(const char*, unsigned) {}
+u32 CurrentProcessor() {
+    return 0;
+}
+bool IsPerformanceProcessor(u32) {
+    return true;
+}
+u32 ClockProbe() {
+    return 0;
+}
+#endif
+
+std::string GetCurrentThreadName() {
+    // port: guest thread names are kept by the C runtime.
+#ifdef _WIN32
+    PWSTR name = nullptr;
+    if (FAILED(GetThreadDescription(GetCurrentThread(), &name)) || !name) {
         return "<unknown name>";
     }
-    const auto result = Common::UTF16ToUTF8(name);
+    std::string result = Common::UTF16ToUTF8(name);
     LocalFree(name);
     return result;
 #else
@@ -257,6 +760,16 @@ std::string GetCurrentThreadName() {
         return "<unknown name>";
     }
     return std::string{name};
+#endif
+}
+
+u64 CurrentThreadCycles() {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    return 0;
 #endif
 }
 

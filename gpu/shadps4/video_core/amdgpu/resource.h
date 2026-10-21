@@ -3,14 +3,10 @@
 
 #pragma once
 
-#include <cstdlib>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/issn_bc_tiny.h"
-#include "video_core/amdgpu/issn_block1d.h"
-#include "video_core/amdgpu/issn_msaa.h"
 #include "video_core/amdgpu/tiling.h"
 
 namespace AmdGpu {
@@ -229,11 +225,10 @@ struct Image {
     [[nodiscard]] u32 NumLayers() const noexcept {
         // Depth is the number of layers for Array images.
         u32 slices = depth + 1;
-        const auto image_type = GetType();
-        if (image_type == ImageType::Color3D) {
+        if (GetType() == ImageType::Color3D) {
             // Depth is the actual texture depth for 3D images.
             slices = 1;
-        } else if (image_type == ImageType::Cube) {
+        } else if (IsCube()) {
             // Depth is the number of full cubes for Cube images.
             slices *= 6;
         }
@@ -243,34 +238,26 @@ struct Image {
         return slices;
     }
 
-    /// The guest's multisampled types: their last_level holds the sample count.
-    bool IsGuestMsaa() const noexcept {
-        return static_cast<ImageType>(type) == ImageType::Color2DMsaa ||
-               static_cast<ImageType>(type) == ImageType::Color2DMsaaArray;
-    }
-
     u32 NumLevels() const {
-        if (IsGuestMsaa()) {
+        if (GetType() == ImageType::Color2DMsaa || GetType() == ImageType::Color2DMsaaArray) {
             return 1;
         }
         return last_level + 1;
     }
 
-    u32 GuestNumSamples() const {
-        return IsGuestMsaa() ? 1u << last_level : 1;
+    u32 NumSamples() const {
+        if (GetType() == ImageType::Color2DMsaa || GetType() == ImageType::Color2DMsaaArray) {
+            return 1u << last_level;
+        }
+        return 1;
     }
 
-    u32 NumSamples() const {
-        return NoMsaa() ? 1 : GuestNumSamples();
+    bool IsCube() const noexcept {
+        return static_cast<ImageType>(type) == ImageType::Cube;
     }
 
     ImageType GetType() const noexcept {
-        if (NoMsaa() && IsGuestMsaa()) {
-            // port: see issn_msaa.h; shaders then fetch it without a sample index.
-            return static_cast<ImageType>(type) == ImageType::Color2DMsaa ? ImageType::Color2D
-                                                                          : ImageType::Color2DArray;
-        }
-        return static_cast<ImageType>(type);
+        return IsCube() ? ImageType::Color2DArray : static_cast<ImageType>(type);
     }
 
     DataFormat GetDataFmt() const noexcept {
@@ -302,7 +289,7 @@ struct Image {
             return 0;
         }
         const u32 bpp = NumBitsPerElement(dfmt);
-        const auto macro_tile_mode = CalculateMacrotileMode(tile_mode, bpp, GuestNumSamples());
+        const auto macro_tile_mode = CalculateMacrotileMode(tile_mode, bpp, NumSamples());
         const u32 banks = GetAltNumBanks(macro_tile_mode);
         return (((banks - 1) << 4) & base_address) >> 4;
     }
@@ -312,45 +299,30 @@ struct Image {
         if (base_type == ImageType::Color1DArray) {
             return ImageType::Color1D;
         }
-        if (base_type == ImageType::Color2DArray || base_type == ImageType::Color2DMsaa ||
-            base_type == ImageType::Color2DMsaaArray || base_type == ImageType::Cube) {
+        if (base_type == ImageType::Color2DArray) {
+            return ImageType::Color2D;
+        }
+        if (base_type == ImageType::Color2DMsaa || base_type == ImageType::Color2DMsaaArray) {
             return ImageType::Color2D;
         }
         return base_type;
     }
 
-    /// port: Vulkan has no block-compressed 1D images (inFAMOUS binds BC1/BC4/BC5 1D textures),
-    /// so these are 2D images of height 1 on the host, sampled at the middle row.
-    bool IsBlock1D() const noexcept {
-        // On for drivers that refuse BC 1D, except NVIDIA (issn_block1d.h); ISSN_BLOCK1D=0/1.
-        // ISSN_BC_TINY decodes BC1-BC5 1D textures to plain 1D images instead (issn_bc_tiny.h).
-        const auto type = GetType();
-        const auto dfmt = GetDataFmt();
-        const bool is_1d = type == ImageType::Color1D || type == ImageType::Color1DArray;
-        // port: BP09, every 1D image (not only block-coded ones) is 2D of height 1 on the host.
-        if (is_1d && All1DAs2D()) {
-            return true;
-        }
-        return Block1DAs2D() && is_1d && IsBlockCoded(dfmt) &&
-               !(BcTinyDecode() && IsBcTinyDecodable(dfmt));
-    }
-
-    /// port: BC formats the ISSN_BC_TINY CPU decoder handles (texture_cache/issn_bc_decode.h).
-    static constexpr bool IsBcTinyDecodable(DataFormat dfmt) noexcept {
-        return dfmt >= DataFormat::FormatBc1 && dfmt <= DataFormat::FormatBc5;
-    }
-
-    /// The view type of the host image: GetViewType, with block-compressed 1D as 2D.
-    ImageType GetHostViewType(const bool is_array) const noexcept {
-        const auto view = GetViewType(is_array);
-        if (IsBlock1D()) {
-            return view == ImageType::Color1DArray ? ImageType::Color2DArray : ImageType::Color2D;
-        }
-        return view;
+    /// Block-compressed 1D images are legal on GCN but not on Vulkan hosts, which require a
+    /// compressed image to be 2D or 3D. They are emulated as 2D images a single block row tall,
+    /// which is a faithful representation: a 1D BC texture is one row of 4x4 blocks.
+    bool IsBlockCoded1D() const noexcept {
+        const auto base_type = GetType();
+        return (base_type == ImageType::Color1D || base_type == ImageType::Color1DArray) &&
+               IsBlockCoded(GetDataFmt());
     }
 
     ImageType GetViewType(const bool is_array) const noexcept {
         const auto base_type = GetType();
+        if (IsCube()) {
+            // Cube needs to remain array type regardless of instruction array specifier.
+            return base_type;
+        }
         if (base_type == ImageType::Color1DArray && !is_array) {
             return ImageType::Color1D;
         }
@@ -361,6 +333,33 @@ struct Image {
             return ImageType::Color2DMsaa;
         }
         return base_type;
+    }
+
+    /// GetBaseType/GetViewType describe the guest image, and are what the shader recompiler must
+    /// use to decode address VGPRs. The Host variants below describe the resource actually created
+    /// on the host, and must be used by anything that talks to Vulkan: the image, the image view,
+    /// and the SPIR-V image declaration. All three have to agree.
+    ImageType GetHostBaseType() const noexcept {
+        const auto base_type = GetBaseType();
+        if (base_type == ImageType::Color1D && IsBlockCoded(GetDataFmt())) {
+            return ImageType::Color2D;
+        }
+        return base_type;
+    }
+
+    ImageType GetHostViewType(const bool is_array) const noexcept {
+        const auto view_type = GetViewType(is_array);
+        if (!IsBlockCoded(GetDataFmt())) {
+            return view_type;
+        }
+        switch (view_type) {
+        case ImageType::Color1D:
+            return ImageType::Color2D;
+        case ImageType::Color1DArray:
+            return ImageType::Color2DArray;
+        default:
+            return view_type;
+        }
     }
 
     [[nodiscard]] u32 NumViewLevels(const bool is_array) const noexcept {
@@ -495,9 +494,7 @@ struct Sampler {
     }
 
     bool Valid() const {
-        // issn: shadPS4 1a0f5be8 (S# with undefined fields get a default sampler).
-        return max_aniso.Value() <= AnisoRatio::Sixteen && filter_mode.Value() <= FilterMode::Max &&
-               mip_filter.Value() <= MipFilter::Linear;
+        return true;
     }
 
     bool operator==(const Sampler& other) const noexcept {

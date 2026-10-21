@@ -68,5 +68,17 @@ public:
     bool IsVkValidationEnabled() { static const auto value = Flag("ISSN_VK_VALIDATION", false); return value; }
     bool IsVkValidationGpuEnabled() { return false; }
     bool IsVkValidationSyncEnabled() { static const auto value = Flag("ISSN_VK_VALIDATION_SYNC", false); return value; }
+    // issn-axy: the new core's presenter reads shadPS4's FSR 1 / RCAS settings (off / on, 0.25).
+    bool IsFsrEnabled() { static const auto value = Flag("ISSN_FSR1", false); return value; }
+    bool IsRcasEnabled() { static const auto value = Flag("ISSN_RCAS", true); return value; }
+    int GetRcasAttenuation() { static const auto value = int(Number("ISSN_RCAS_ATTENUATION", 250)); return value; }
 };
 #define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+
+/// issn-axy: the Vulkan device index; SHADPS4_GPU_ID (axylpup's flag) wins over ISSN_GPU_ID.
+inline s32 EffectiveGpuId() {
+    if (const char* v = std::getenv("SHADPS4_GPU_ID"); v && *v) {
+        return static_cast<s32>(std::strtol(v, nullptr, 10));
+    }
+    return EmulatorSettings.GetGpuId();
+}

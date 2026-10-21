@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
@@ -10,18 +10,7 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/tile_manager.h"
 
-#include "video_core/host_shaders/tiling_macro_128_comp.h"
-#include "video_core/host_shaders/tiling_macro_16_comp.h"
-#include "video_core/host_shaders/tiling_macro_32_comp.h"
-#include "video_core/host_shaders/tiling_macro_64_comp.h"
-#include "video_core/host_shaders/tiling_macro_8_comp.h"
-#include "video_core/host_shaders/tiling_macro_96_comp.h"
-#include "video_core/host_shaders/tiling_micro_128_comp.h"
-#include "video_core/host_shaders/tiling_micro_16_comp.h"
-#include "video_core/host_shaders/tiling_micro_32_comp.h"
-#include "video_core/host_shaders/tiling_micro_64_comp.h"
-#include "video_core/host_shaders/tiling_micro_8_comp.h"
-#include "video_core/host_shaders/tiling_micro_96_comp.h"
+#include "video_core/host_shaders/tiling_comp.h"
 
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
@@ -35,9 +24,9 @@ struct TilingInfo {
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
-TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-                         Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
+TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                         StreamBuffer& stream_buffer_)
+    : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_} {
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -86,154 +75,102 @@ TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 TileManager::~TileManager() = default;
 
-vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
-    const TilingKey key{
-        .tile_mode = info.tile_mode,
-        .num_bits = info.num_bits,
-        .num_samples = info.num_samples,
-        .is_tiler = is_tiler,
+TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
+    constexpr auto usage =
+        vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+
+    const vk::BufferCreateInfo buffer_ci = {
+        .size = size,
+        .usage = usage,
     };
-    if (const auto it = tiling_pipelines.find(key); it != tiling_pipelines.end()) {
-        return *it->second;
+
+    const VmaAllocationCreateInfo alloc_info{
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    const auto buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
+    const auto result = vmaCreateBuffer(instance.GetAllocator(), &buffer_ci_unsafe, &alloc_info,
+                                        &buffer, &allocation, nullptr);
+    ASSERT(result == VK_SUCCESS);
+    return {buffer, allocation};
+}
+
+vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
+    const u32 pl_id = u32(info.tile_mode) * NUM_BPPS + std::bit_width(info.num_bits) - 4;
+    auto& tiling_pipelines = is_tiler ? tilers : detilers;
+    if (auto pipeline = *tiling_pipelines[pl_id]; pipeline != VK_NULL_HANDLE) {
+        return pipeline;
     }
 
     const auto device = instance.GetDevice();
     const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
-    const bool is_macro = AmdGpu::IsMacroTiled(info.array_mode);
-    std::array<u32, 12> spec_data{
-        info.num_samples,
-        u32(micro_tile_mode),
-        AmdGpu::GetMicroTileThickness(info.array_mode),
-        u32(is_tiler),
+    std::vector<std::string> defines = {
+        fmt::format("BITS_PER_PIXEL={}", info.num_bits),
+        fmt::format("NUM_SAMPLES={}", info.num_samples),
+        fmt::format("ARRAY_MODE={}", u32(info.array_mode)),
+        fmt::format("MICRO_TILE_MODE={}", u32(micro_tile_mode)),
+        fmt::format("MICRO_TILE_THICKNESS={}", AmdGpu::GetMicroTileThickness(info.array_mode)),
     };
-    if (is_macro) {
+    if (AmdGpu::IsMacroTiled(info.array_mode)) {
         const auto macro_tile_mode =
             AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
-        spec_data[4] = u32(info.array_mode);
-        spec_data[5] = u32(AmdGpu::GetPipeConfig(info.tile_mode));
-        spec_data[6] = AmdGpu::GetBankWidth(macro_tile_mode);
-        spec_data[7] = AmdGpu::GetBankHeight(macro_tile_mode);
-        spec_data[8] = AmdGpu::GetNumBanks(macro_tile_mode);
-        spec_data[9] = std::bit_width(spec_data[8]) - 1;
-        spec_data[10] = AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode, micro_tile_mode,
-                                                   info.num_bits);
-        spec_data[11] = AmdGpu::GetMacrotileAspect(macro_tile_mode);
+        const u32 num_banks = AmdGpu::GetNumBanks(macro_tile_mode);
+        defines.emplace_back(
+            fmt::format("PIPE_CONFIG={}", u32(AmdGpu::GetPipeConfig(info.tile_mode))));
+        defines.emplace_back(fmt::format("BANK_WIDTH={}", AmdGpu::GetBankWidth(macro_tile_mode)));
+        defines.emplace_back(fmt::format("BANK_HEIGHT={}", AmdGpu::GetBankHeight(macro_tile_mode)));
+        defines.emplace_back(fmt::format("NUM_BANKS={}", num_banks));
+        defines.emplace_back(fmt::format("NUM_BANK_BITS={}", std::bit_width(num_banks) - 1));
+        defines.emplace_back(fmt::format(
+            "TILE_SPLIT_BYTES={}", AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode,
+                                                              micro_tile_mode, info.num_bits)));
+        defines.emplace_back(
+            fmt::format("MACRO_TILE_ASPECT={}", AmdGpu::GetMacrotileAspect(macro_tile_mode)));
+    }
+    if (is_tiler) {
+        defines.emplace_back(fmt::format("IS_TILER=1"));
     }
 
-    std::span<const u32> code;
-    switch (info.num_bits) {
-    case 8:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_8_COMP}
-                        : std::span<const u32>{TILING_MICRO_8_COMP};
-        break;
-    case 16:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_16_COMP}
-                        : std::span<const u32>{TILING_MICRO_16_COMP};
-        break;
-    case 32:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_32_COMP}
-                        : std::span<const u32>{TILING_MICRO_32_COMP};
-        break;
-    case 64:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_64_COMP}
-                        : std::span<const u32>{TILING_MICRO_64_COMP};
-        break;
-    case 96:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_96_COMP}
-                        : std::span<const u32>{TILING_MICRO_96_COMP};
-        break;
-    case 128:
-        code = is_macro ? std::span<const u32>{TILING_MACRO_128_COMP}
-                        : std::span<const u32>{TILING_MICRO_128_COMP};
-        break;
-    default:
-        UNREACHABLE_MSG("Unsupported tiling pixel width {}", info.num_bits);
-    }
-
-    const auto module = Vulkan::CompileSPV(code, device);
-    static constexpr auto spec_entries = [] {
-        std::array<vk::SpecializationMapEntry, 12> entries{};
-        for (u32 i = 0; i < entries.size(); ++i) {
-            entries[i] = vk::SpecializationMapEntry{i, i * u32(sizeof(u32)), sizeof(u32)};
-        }
-        return entries;
-    }();
-
-    const u32 spec_count = is_macro ? 12 : 4;
-    const vk::SpecializationInfo specialization{
-        .mapEntryCount = spec_count,
-        .pMapEntries = spec_entries.data(),
-        .dataSize = spec_count * sizeof(u32),
-        .pData = spec_data.data(),
-    };
-
+    const auto& module = Vulkan::Compile(HostShaders::TILING_COMP,
+                                         vk::ShaderStageFlagBits::eCompute, device, defines);
     const auto module_name = fmt::format("{}_{} {}", magic_enum::enum_name(info.tile_mode),
                                          info.num_bits, is_tiler ? "tiler" : "detiler");
-    LOG_INFO(Render_Vulkan, "Creating tiling pipeline {}", module_name);
+    LOG_INFO(Render_Vulkan, "Compiling shader {}", module_name);
+    for (const auto& def : defines) {
+        LOG_INFO(Render_Vulkan, "#define {}", def);
+    }
     Vulkan::SetObjectName(device, module, module_name);
-
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",
-        .pSpecializationInfo = &specialization,
     };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
         .layout = *pl_layout,
     };
-
     auto [result, pipeline] =
         device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
     ASSERT_MSG(result == vk::Result::eSuccess, "Detiler pipeline creation failed {}",
                vk::to_string(result));
-    const auto handle = *pipeline;
-    tiling_pipelines.emplace(key, std::move(pipeline));
+    tiling_pipelines[pl_id] = std::move(pipeline);
     device.destroyShaderModule(module);
-    return handle;
+    return *tiling_pipelines[pl_id];
 }
 
-void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
-                                       const vk::DescriptorBufferInfo& linear,
-                                       const vk::DescriptorBufferInfo& params, u32 dim_x) {
-    scheduler.Record([pipeline, layout = *pl_layout, tiled, linear, params,
-                      dim_x](vk::CommandBuffer cmdbuf) {
-        if (Vulkan::Scheduler::FullBarriers()) { // port: ISSN_FULL_BARRIERS=1
-            Vulkan::Scheduler::RecordFullBarrier(cmdbuf);
-        }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-        const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
-            {
-                .dstBinding = 0,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                .pBufferInfo = &tiled,
-            },
-            {
-                .dstBinding = 1,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
-                .pBufferInfo = &linear,
-            },
-            {
-                .dstBinding = 2,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eUniformBuffer,
-                .pBufferInfo = &params,
-            },
-        }};
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
-        cmdbuf.dispatch(dim_x, 1, 1);
-        if (Vulkan::Scheduler::FullBarriers()) {
-            Vulkan::Scheduler::RecordFullBarrier(cmdbuf);
-        }
-    });
-}
-
-std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
-                                                       u64 in_offset, const ImageInfo& info) {
+TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset,
+                                             const ImageInfo& info) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
+    }
+    if (Vulkan::Scheduler::t_lane_mode) [[unlikely]] {
+        static u64 n = 0; // q12g: a detile recorded while the back is in lane mode
+        if (++n <= 8 || (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Vulkan, "q12g: DetileImage in lane mode #{} ({} B)", n, info.guest_size);
+        }
     }
 
     TilingInfo params{};
@@ -255,41 +192,109 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    const auto [out_buffer, out_allocation] = GetScratchBuffer(info.guest_size);
+    scheduler.DeferOperation([this, out_buffer, out_allocation]() {
+        vmaDestroyBuffer(instance.GetAllocator(), out_buffer, out_allocation);
+    });
 
     scheduler.EndRendering();
-    runtime.FlushBarriers();
+
+    const vk::Pipeline detile_pipeline = GetTilingPipeline(info, false);
+    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (AsyncUploadRecord()) {
+        // Same commands as below, queued in order on the recording worker.
+        const vk::DescriptorBufferInfo tiled_info{
+            .buffer = in_buffer, .offset = in_offset, .range = info.guest_size};
+        const vk::DescriptorBufferInfo linear_info{
+            .buffer = out_buffer, .offset = 0, .range = info.guest_size};
+        scheduler.Record([detile_pipeline, layout = *pl_layout, tiled_info, linear_info,
+                          params_info = params_buffer_info, dim_x](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
+            const std::array<vk::WriteDescriptorSet, 3> writes = {{
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 0,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &tiled_info},
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 1,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer,
+                 .pBufferInfo = &linear_info},
+                {.dstSet = VK_NULL_HANDLE,
+                 .dstBinding = 2,
+                 .dstArrayElement = 0,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eUniformBuffer,
+                 .pBufferInfo = &params_info},
+            }};
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+            cmdbuf.dispatch(dim_x, 1, 1);
+        });
+        // As the borrow of the synchronous path does (CommandBufferAccess): the push descriptor
+        // set above replaces descriptor heap binds (SHADPS4_NATIVE_BINDINGS; Opus 2026-09-30).
+        scheduler.InvalidateNativeHeaps();
+        return {out_buffer, 0};
+    }
+
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
-        .buffer = in_buffer->Handle(),
+        .buffer = in_buffer,
         .offset = in_offset,
         .range = info.guest_size,
     };
+
     const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = staging.buffer->Handle(),
-        .offset = staging.offset,
+        .buffer = out_buffer,
+        .offset = 0,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
-    // port: recorded with copies of the descriptor infos (threaded recording).
-    RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
 
-    runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
-                         vk::PipelineStageFlagBits2::eComputeShader,
-                         vk::AccessFlagBits2::eShaderWrite);
+    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &tiled_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &linear_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &params_buffer_info,
+        },
+    }};
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
-    return {staging.buffer, staging.offset};
+    cmdbuf.dispatch(dim_x, 1, 1);
+    return {out_buffer, 0};
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                            const VideoCore::Buffer* out_buffer, u64 out_offset) {
+                            vk::Buffer out_buffer, u32 out_offset, u32 copy_size) {
     const auto& info = in_image.info;
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
             copy.bufferOffset += out_offset;
         }
-        runtime.DownloadImage(&in_image, out_buffer, buffer_copies);
+        in_image.Download(buffer_copies, out_buffer, out_offset, copy_size);
         return;
     }
 
@@ -312,32 +317,88 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
-    for (auto& copy : buffer_copies) {
-        copy.bufferOffset += staging.offset;
-    }
+    const auto [temp_buffer, temp_allocation] = GetScratchBuffer(info.guest_size);
+    scheduler.DeferOperation([this, temp_buffer, temp_allocation]() {
+        vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
+    });
 
-    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
-    runtime.FlushBarriers();
+    auto command_access = scheduler.AcquireCommandBuffer();
+    const auto cmdbuf = command_access.Handle();
+    in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
+
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
-        .buffer = out_buffer->Handle(),
+        .buffer = out_buffer,
         .offset = out_offset,
         .range = info.guest_size,
     };
+
     const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = staging.buffer->Handle(),
-        .offset = staging.offset,
+        .buffer = temp_buffer,
+        .offset = 0,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
-    // port: recorded with copies of the descriptor infos (threaded recording).
-    RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
 
-    runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
-                         vk::PipelineStageFlagBits2::eComputeShader,
-                         vk::AccessFlagBits2::eShaderWrite);
+    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &tiled_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &linear_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &params_buffer_info,
+        },
+    }};
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+
+    // Order the tiling write of out_buffer against earlier and later work on it explicitly. The
+    // buffer's hazard state does not see this dispatch; with SHADPS4_GUEST_DISPATCH_ORDER a
+    // following same-run binding would otherwise get no barrier (Opus review 2026-09-27).
+    const vk::BufferMemoryBarrier2 tile_pre{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .buffer = out_buffer,
+        .offset = out_offset,
+        .size = info.guest_size,
+    };
+    const vk::BufferMemoryBarrier2 tile_post{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = out_buffer,
+        .offset = out_offset,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &tile_pre,
+    });
+    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    cmdbuf.dispatch(dim_x, 1, 1);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &tile_post,
+    });
 }
 
 } // namespace VideoCore

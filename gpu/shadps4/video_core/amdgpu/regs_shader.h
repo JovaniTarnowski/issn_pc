@@ -3,12 +3,10 @@
 
 #pragma once
 
-#include <algorithm>
+#include <array>
 #include <atomic>
-#include <optional>
-
+#include <cstdlib>
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "common/types.h"
 #include "shader_recompiler/params.h"
 
@@ -128,12 +126,6 @@ struct PsInput {
     bool operator==(const PsInput&) const = default;
 };
 
-struct BarycentricControl {
-    u32 : 24;
-    u32 front_face_all_bits : 1;
-};
-static_assert(sizeof(BarycentricControl) == sizeof(u32));
-
 enum class ShaderExportComp : u32 {
     None = 0,
     OneComp = 1,
@@ -187,20 +179,14 @@ struct ComputeProgram {
     u64 address : 40;
     std::array<u32, 4> pad1;
     struct {
-        u32 num_vgprs : 6;
-        u32 num_sgprs : 4;
-        u32 : 2;
-        FpRoundMode fp_round_mode32 : 2;
-        FpRoundMode fp_round_mode64 : 2;
-        FpDenormMode fp_denorm_mode32 : 2;
-        FpDenormMode fp_denorm_mode64 : 2;
-        u32 : 12;
-        u32 scratch_en : 1;
-        u32 num_user_regs : 5;
-        u32 : 1;
-        u32 tgid_enable : 3;
-        u32 : 5;
-        u32 lds_dwords : 9;
+        u64 num_vgprs : 6;
+        u64 num_sgprs : 4;
+        u64 : 23;
+        u64 num_user_regs : 5;
+        u64 : 1;
+        u64 tgid_enable : 3;
+        u64 : 5;
+        u64 lds_dwords : 9;
     } settings;
     u32 pad2;
     u32 resource_limits;
@@ -226,93 +212,77 @@ struct ComputeProgram {
     }
 };
 
-// port: nullptr when the code has no valid binary info within the search limit. inFAMOUS points
-// a stage at code it has not finished writing yet (next to the smoke ducts the game copies the
-// effect's shaders in with the GPU right before using them), and the old UNREACHABLE stopped the
-// game ("Shader binary info not found", exit 23). Callers skip that draw or dispatch instead;
-// the next frame normally finds the finished code.
-//
-// The scan is bounded (search_limit dwords from the code) and an info block only counts when it
-// is consistent with the code in front of it: a non-empty, dword-sized length whose code span
-// ends at or before the block (OrbShdr follows the code it describes, padding aside). Half-copied
-// memory can hold a stale OrbShdr of another shader further on; its length would then put the
-// code span past the block, or the block past the limit, and that stage is skipped instead of
-// translated from garbage.
-inline constexpr u32 BinaryInfoSearchLimit = 0x4000; // dwords (64 KiB)
+// Both flags are read per draw per stage; namespace-scope so a read is a plain load rather than
+// a function-local-static guard check.
+inline const bool g_bininfo_memo_enabled = [] {
+    const char* env = std::getenv("SHADPS4_BININFO_MEMO");
+    return env != nullptr && env[0] == '1';
+}();
 
-static inline bool BinaryInfoMatchesCode(const u32* code, const BinaryInfo* info) {
-    const auto offset_dwords =
-        static_cast<u64>(reinterpret_cast<const u32*>(info) - code);
-    return info->Valid() && info->length != 0 && info->length % sizeof(u32) == 0 &&
-           info->length / sizeof(u32) <= offset_dwords && offset_dwords < BinaryInfoSearchLimit;
+inline bool BinaryInfoMemoEnabled() {
+    return g_bininfo_memo_enabled;
 }
 
-static inline const BinaryInfo* FindBinaryInfo(const u32* code) {
+// SHADPS4_PGM_PREFETCH=1: when the command processor sees a PS/VS program address written, it
+// prefetches the code and the BinaryInfo last found for that address, so GetParams on the next
+// draw does not wait on cold guest lines. Hints are only prefetch targets, never dereferenced.
+inline const bool g_pgm_prefetch_enabled = [] {
+    const char* env = std::getenv("SHADPS4_PGM_PREFETCH");
+    return env != nullptr && env[0] == '1';
+}();
+
+inline bool PgmPrefetchEnabled() {
+    return g_pgm_prefetch_enabled;
+}
+inline std::array<std::atomic<const void*>, 512> g_bininfo_hints{};
+inline size_t BinaryInfoHintSlot(const void* code) {
+    return (reinterpret_cast<uintptr_t>(code) >> 8) % g_bininfo_hints.size();
+}
+inline void NoteBinaryInfoHint(const u32* code, const BinaryInfo* info) {
+    if (PgmPrefetchEnabled()) {
+        g_bininfo_hints[BinaryInfoHintSlot(code)].store(info, std::memory_order_relaxed);
+    }
+}
+
+inline const BinaryInfo& SearchBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    if (code[0] == token_mov_vcchi && code[1] < BinaryInfoSearchLimit / 2) {
+    if (code[0] == token_mov_vcchi) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
-        if (BinaryInfoMatchesCode(code, info)) {
-            return info;
+        if (info->Valid()) {
+            NoteBinaryInfoHint(code, info);
+            return *info;
         }
     }
-    const u32* end = code + BinaryInfoSearchLimit - sizeof(BinaryInfo) / sizeof(u32);
+    constexpr u32 search_limit = 0x4000;
+    // SHADPS4_BININFO_MEMO=1: the scan below ran per draw per stage for shaders without the
+    // leading token (measured 2026-09-24: 1.6% of CP wall time). Remember where it ended, per
+    // thread, and re-check the signature at that spot on every hit, so rewritten guest code
+    // simply misses.
+    struct Memo {
+        const u32* code;
+        const BinaryInfo* info;
+    };
+    static constexpr size_t MemoSize = 256;
+    thread_local std::array<Memo, MemoSize> memo{};
+    const bool use_memo = BinaryInfoMemoEnabled();
+    Memo& slot = memo[(reinterpret_cast<uintptr_t>(code) >> 4) % MemoSize];
+    if (use_memo && slot.code == code && slot.info->Valid()) {
+        return *slot.info;
+    }
+    const u32* end = code + search_limit;
     for (const u32* it = code; it < end; ++it) {
         if (const BinaryInfo* info = std::bit_cast<const BinaryInfo*>(it); info->Valid()) {
-            // The first OrbShdr after the code is this shader's; a bad one means the code is not
-            // there yet (do not keep scanning into whatever lies behind it).
-            return BinaryInfoMatchesCode(code, info) ? info : nullptr;
+            if (use_memo) {
+                slot = {code, info};
+            }
+            NoteBinaryInfoHint(code, info);
+            return *info;
         }
     }
-    return nullptr;
+    UNREACHABLE_MSG("Shader binary info not found.");
 }
 
-static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
-    const BinaryInfo* info = FindBinaryInfo(code);
-    if (!info) {
-        UNREACHABLE_MSG("Shader binary info not found.");
-    }
-    return *info;
-}
-
-/// port: logs a stage without binary info once per code address (up to 64 addresses, then
-/// silently): several effects can be waiting for their code at the same time.
-inline void LogMissingBinaryInfo(const u32* code) {
-    static constexpr size_t MaxLogged = 64;
-    static std::atomic<uintptr_t> logged[MaxLogged]{};
-    static std::atomic<size_t> count{0};
-    const auto address = reinterpret_cast<uintptr_t>(code);
-    const size_t n = std::min(count.load(std::memory_order_relaxed), MaxLogged);
-    for (size_t i = 0; i < n; ++i) {
-        if (logged[i].load(std::memory_order_relaxed) == address) {
-            return;
-        }
-    }
-    const size_t slot = count.fetch_add(1, std::memory_order_relaxed);
-    if (slot >= MaxLogged) {
-        return;
-    }
-    logged[slot].store(address, std::memory_order_relaxed);
-    LOG_WARNING(Render, "port: shader at {} has no binary info yet; draw skipped{}",
-                fmt::ptr(code), slot + 1 == MaxLogged ? " (no more of these are logged)" : "");
-}
-
-/// port: the stage's parameters, or nothing when its code has no valid binary info yet; the
-/// caller then treats the stage as missing (the draw or dispatch is skipped).
-static std::optional<Shader::ShaderParams> TryGetParams(const auto& sh) {
-    const auto* code = sh.template Address<const u32*>();
-    const BinaryInfo* bininfo = code ? FindBinaryInfo(code) : nullptr;
-    if (!bininfo) {
-        LogMissingBinaryInfo(code);
-        return std::nullopt;
-    }
-    return Shader::ShaderParams{
-        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{sh.user_data},
-        .code = std::span<const u32>{code, bininfo->length / sizeof(u32)},
-        .hash = bininfo->shader_hash,
-    };
-}
-
-static constexpr Shader::ShaderParams GetParams(const auto& sh) {
+inline Shader::ShaderParams GetParams(const auto& sh) {
     const auto* code = sh.template Address<u32*>();
     const auto& bininfo = SearchBinaryInfo(code);
     return {

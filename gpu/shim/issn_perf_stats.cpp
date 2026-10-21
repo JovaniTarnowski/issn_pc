@@ -113,7 +113,7 @@ void Run(const Vulkan::Instance* instance) {
         }
         if (instance->CanReportMemoryUsage()) {
             s.vram_used_gb = double(instance->GetDeviceMemoryUsage()) / GiB;
-            s.vram_total_gb = double(instance->GetDeviceMemoryBudgetNow()) / GiB;
+            s.vram_total_gb = double(instance->GetTotalMemoryBudget()) / GiB;
         }
         s.gpu_percent = gpu.Percent();
         {
@@ -204,7 +204,7 @@ void Run(const Vulkan::Instance* instance) {
         if (sysinfo(&info) == 0) s.ram_total_gb = double(info.totalram) * double(info.mem_unit) / GiB;
         if (instance->CanReportMemoryUsage()) {
             s.vram_used_gb = double(instance->GetDeviceMemoryUsage()) / GiB;
-            s.vram_total_gb = double(instance->GetDeviceMemoryBudgetNow()) / GiB;
+            s.vram_total_gb = double(instance->GetTotalMemoryBudget()) / GiB;
         }
         s.gpu_percent = gpu.Percent();
         {

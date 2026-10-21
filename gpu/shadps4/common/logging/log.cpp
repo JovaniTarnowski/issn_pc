@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -17,11 +18,40 @@
 #include "common/types.h"
 #include "core/emulator_settings.h"
 
+// return codes above 'standard'
+// https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes
+enum class ShadPs4ReturnCode : u32 {
+    TERMINATE_WITHOUT_EXCEPTION = 20'000,
+    TERMINATE_WITH_EXCEPTION = 20'001,
+    TERMINATE_WITH_UNKNOWN_EXCEPTION = 20'002,
+};
+
 namespace Common::Log {
 bool g_should_append = false;
 
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
+
+/// v1.0.2 (PERF-PLAN 14.5): Critical lines go straight to stderr as well - in release mode that is
+/// user/log/fatal.txt - before the asynchronous log writes them: an assert or a lost device ends
+/// the process right after its Critical line, and players often send only fatal.txt (two reports
+/// on 10-19 said "FATAL-ASSERT-IMPL" and nothing else).
+class FatalStderrSink final : public spdlog::sinks::sink {
+public:
+    void log(const spdlog::details::log_msg& msg) override {
+        if (msg.log_level < spdlog::level::critical) {
+            return;
+        }
+        std::fprintf(stderr, "%.*s\n", static_cast<int>(msg.payload.size()), msg.payload.data());
+        std::fflush(stderr);
+    }
+    void flush() override {
+        std::fflush(stderr);
+    }
+    void set_pattern(const std::string&) override {}
+    void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
+};
+static std::shared_ptr<FatalStderrSink> g_fatal_sink = std::make_shared<FatalStderrSink>();
 
 std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS{
     {Class::Common, nullptr},
@@ -91,7 +121,6 @@ std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGER
     {Class::Lib_NpSnsFacebookDialog, nullptr},
     {Class::Lib_NpTrophy, nullptr},
     {Class::Lib_NpTus, nullptr},
-    {Class::Lib_NpUtility, nullptr},
     {Class::Lib_NpWebApi, nullptr},
     {Class::Lib_NpWebApi2, nullptr},
     {Class::Lib_Pad, nullptr},
@@ -116,7 +145,6 @@ std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGER
     {Class::Lib_Usbd, nullptr},
     {Class::Lib_UserService, nullptr},
     {Class::Lib_Vdec2, nullptr},
-    {Class::Lib_Vdecsw, nullptr},
     {Class::Lib_VideoOut, nullptr},
     {Class::Lib_Videodec, nullptr},
     {Class::Lib_VideoRecording, nullptr},
@@ -176,6 +204,7 @@ void Setup(std::string_view shadps4_filename) {
     std::call_once(already_registered, []() {
         std::atexit(Shutdown);
         std::at_quick_exit(Flush);
+        std::set_terminate(Terminate);
     });
 
     for (auto& [name, logger] : ALL_LOGGERS) {
@@ -237,6 +266,32 @@ void Flush() {
     }
 }
 
+void Terminate() {
+    try {
+        if (std::exception_ptr eptr{std::current_exception()}) {
+            std::rethrow_exception(eptr);
+        }
+
+        std::fprintf(stderr, "FATAL-TERMINATE without exception\n");
+        std::fflush(stderr);
+        LOG_CRITICAL(Debug, "Exiting without exception");
+
+        std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITHOUT_EXCEPTION));
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "FATAL-TERMINATE exception: %s\n", exception.what());
+        std::fflush(stderr);
+        LOG_CRITICAL(Debug, "Exception: {}", exception);
+
+        std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_EXCEPTION));
+    } catch (...) {
+        std::fprintf(stderr, "FATAL-TERMINATE unknown exception\n");
+        std::fflush(stderr);
+        LOG_CRITICAL(Debug, "Unknown exception caught");
+
+        std::quick_exit(std::to_underlying(ShadPs4ReturnCode::TERMINATE_WITH_UNKNOWN_EXCEPTION));
+    }
+}
+
 void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
 
@@ -252,6 +307,7 @@ void UpdateSinks() {
         logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
                               ? dup_filter
                               : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+        logger->sinks().push_back(g_fatal_sink);
     }
 }
 

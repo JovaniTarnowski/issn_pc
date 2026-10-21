@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/amdgpu/issn_amd_1d.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -16,12 +15,13 @@ namespace VideoCore {
 vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
+        return vk::ImageViewType::e1D;
+    case AmdGpu::ImageType::Color1DArray:
+        return vk::ImageViewType::e1DArray;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
         return vk::ImageViewType::e2D;
-    case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
         return vk::ImageViewType::e2DArray;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
@@ -34,13 +34,12 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     switch (view_type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
+        return image_type == AmdGpu::ImageType::Color1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DArray:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DMsaaArray:
-    case AmdGpu::ImageType::Cube:
-        return image_type == AmdGpu::ImageType::Color1D ||
-               image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
+        return image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
     case AmdGpu::ImageType::Color3D:
         return image_type == AmdGpu::ImageType::Color3D;
     default:
@@ -61,10 +60,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     }
 
     range.base.level = image.base_level;
-    range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
+    range.base.layer = image.base_array;
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
+    type = image.GetHostViewType(desc.is_array);
     min_lod = static_cast<u32>(image.min_lod);
 
     if (!is_storage) {
@@ -84,6 +83,10 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
                              AmdGpu::DepthControl ctl) {
     format = Vulkan::LiverpoolToVK::DepthFormat(depth_buffer.z_info.format,
                                                 depth_buffer.stencil_info.format);
+    if (Vulkan::LiverpoolToVK::PromoteDepthToStencil(depth_buffer.z_info.format,
+                                                     depth_buffer.stencil_info.format)) {
+        format = vk::Format::eD32SfloatS8Uint;
+    }
     is_storage = ctl.depth_write_enable;
     range.base.layer = view.slice_start;
     range.extent.layers = view.NumSlices() - range.base.layer;
@@ -118,46 +121,10 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
-    // port: ISSN_BC_TINY: the image holds the decoded texels; a BC view reads them through the
-    // matching plain format (sRGB and snorm kept), anything else through the image's own.
-    if (image.info.props.is_bc_decoded) {
-        const vk::Format decoded = BcTinyDecodedFormat(format);
-        format = decoded != vk::Format::eUndefined ? decoded : image.info.pixel_format;
-    }
-
-    // port: storage writes never convert to sRGB and sRGB formats cannot be storage images
-    // (AMD's driver loses the device on such a view; NVIDIA tolerates it): write through the
-    // UNORM format, which stores the same bytes.
-    if (info.is_storage) {
-        switch (format) {
-        case vk::Format::eR8G8B8A8Srgb:
-            format = vk::Format::eR8G8B8A8Unorm;
-            break;
-        case vk::Format::eB8G8R8A8Srgb:
-            format = vk::Format::eB8G8R8A8Unorm;
-            break;
-        case vk::Format::eA8B8G8R8SrgbPack32:
-            format = vk::Format::eA8B8G8R8UnormPack32;
-            break;
-        case vk::Format::eR8Srgb:
-            format = vk::Format::eR8Unorm;
-            break;
-        case vk::Format::eR8G8Srgb:
-            format = vk::Format::eR8G8Unorm;
-            break;
-        default:
-            break;
-        }
-    }
-
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
-        // port: views of a block-compressed 1D image are 2D (the image is 2D in Vulkan).
-        .viewType = image.info.props.is_host_2d
-                        ? (info.type == AmdGpu::ImageType::Color1DArray ? vk::ImageViewType::e2DArray
-                                                                         : vk::ImageViewType::e2D)
-                        : ConvertImageViewType(info.type),
+        .viewType = ConvertImageViewType(info.type),
         .format = instance.GetSupportedFormat(format, image.format_features),
         .components = info.mapping,
         .subresourceRange{
@@ -173,22 +140,22 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
                   magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
     }
 
-    const bool trace_1d = AmdGpu::ImgTrace() && (image_view_ci.viewType == vk::ImageViewType::e1D ||
-                                                 image_view_ci.viewType == vk::ImageViewType::e1DArray);
-    if (trace_1d) {
-        ISSN_IMG_TRACE("create 1D view %s of image %p %s mips %u+%u layers %u+%u usage %s\n",
-                      vk::to_string(image_view_ci.viewType).c_str(), (void*)VkImage(image_view_ci.image),
-                      vk::to_string(image_view_ci.format).c_str(), info.range.base.level,
-                      info.range.extent.levels, info.range.base.layer, info.range.extent.layers,
-                      vk::to_string(usage_ci.usage).c_str());
-    }
     auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
-    if (trace_1d) {
-        ISSN_IMG_TRACE("created 1D view: %s\n", vk::to_string(view_result).c_str());
-    }
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
                vk::to_string(view_result));
     image_view = std::move(view);
+
+    if (instance.IsNativeBindingsActive()) {
+        // The heap encodes a view from its creation parameters, so keep exactly the ones
+        // used above: subresource range, swizzle, usage restriction and minLod.
+        native.view_ci = image_view_ci;
+        native.view_ci.pNext = nullptr;
+        native.usage_ci = usage_ci;
+        native.usage_ci.pNext = nullptr;
+        native.min_lod_ci = min_lod_ci;
+        native.has_min_lod = usage_ci.pNext != nullptr;
+        native.armed = true;
+    }
 
     const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
                              : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"

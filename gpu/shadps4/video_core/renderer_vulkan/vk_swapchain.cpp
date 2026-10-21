@@ -2,18 +2,74 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdio>
+#include <array>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
-#include "issn_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1 (2026-10-15, the F11 crash): before a swapchain is destroyed, wait
+/// for the queues that touch its images (the presenter's blits on the graphics queue, the present
+/// queue) under Scheduler::submit_mutex, which every graphics-queue submitter holds - instead of
+/// vkDeviceWaitIdle, which needs EVERY queue of the device externally synchronized while the
+/// readback / ASC / retry queues are submitted from guest and worker threads at any time (10-14
+/// 22:58 play session: device lost at the swapchain rebuild after leaving fullscreen). The caller
+/// must not hold submit_mutex.
+bool SwapchainSafeWait() {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_SWAPCHAIN_SAFE_WAIT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+static vk::Result WaitForSwapchainIdle(const Instance& instance) {
+    if (!SwapchainSafeWait()) {
+        return instance.GetDevice().waitIdle();
+    }
+    // Review RISK 1 (10-15): draining the queue while holding submit_mutex would hang if a queued
+    // batch waited on a semaphore that only a later, lock-taking submit signals (LANE_RECORDER /
+    // LANE_DEFER_UPLOAD modes). Mark the drain point with an empty fenced submit under the lock (a
+    // vkQueueSubmit fence covers every command earlier in submission order) and wait outside it.
+    const vk::Device device = instance.GetDevice();
+    const vk::Queue present_queue = instance.GetPresentQueue();
+    const vk::Queue graphics_queue = instance.GetGraphicsQueue();
+    const u32 num_queues = graphics_queue != present_queue ? 2 : 1;
+    std::array<vk::Fence, 2> fences{};
+    vk::Result result = vk::Result::eSuccess;
+    for (u32 i = 0; i < num_queues && result == vk::Result::eSuccess; ++i) {
+        auto created = device.createFence({});
+        result = created.result;
+        fences[i] = created.value;
+    }
+    if (result == vk::Result::eSuccess) {
+        std::scoped_lock lk{Scheduler::submit_mutex};
+        result = present_queue.submit(nullptr, fences[0]);
+        if (result == vk::Result::eSuccess && num_queues == 2) {
+            result = graphics_queue.submit(nullptr, fences[1]);
+        }
+    }
+    if (result == vk::Result::eSuccess) {
+        result = device.waitForFences({num_queues, fences.data()}, true,
+                                      std::numeric_limits<u64>::max());
+    }
+    for (const vk::Fence fence : fences) {
+        if (fence) {
+            device.destroyFence(fence);
+        }
+    }
+    return result;
+}
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -92,7 +148,7 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
+    auto result = WaitForSwapchainIdle(instance);
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
                     vk::to_string(result));
@@ -130,6 +186,7 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
@@ -138,7 +195,16 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    // SHADPS4_DLSS=1: through Streamline's proxy, which runs its per-frame bookkeeping and
+    // forwards (vk_dlss.h); otherwise as usual.
+    vk::Result result;
+    if (const auto dlss_present = Dlss::PresentFunction()) [[unlikely]] {
+        const VkPresentInfoKHR raw = present_info;
+        result = static_cast<vk::Result>(
+            dlss_present(static_cast<VkQueue>(instance.GetPresentQueue()), &raw));
+    } else {
+        result = instance.GetPresentQueue().presentKHR(present_info);
+    }
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -200,27 +266,26 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
-    // port: VSync on is Fifo (no tearing, waits for the display); off is Mailbox when the
-    // driver has it, else Immediate (tearing allowed), else Fifo.
-    vsync = IssnSettings::Get().vsync;
-    const auto has = [&](vk::PresentModeKHR mode) { return std::ranges::find(modes, mode) != modes.cend(); };
-    present_mode = vsync ? vk::PresentModeKHR::eFifo
-                   : has(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
-                   : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
-                                                         : vk::PresentModeKHR::eFifo;
-    std::printf("Swapchain: VSync %s (%s)\n", vsync ? "on" : "off", vk::to_string(present_mode).c_str());
-}
+    const auto requested_mode = EmulatorSettings.GetPresentMode();
+    if (requested_mode == "Mailbox") {
+        present_mode = vk::PresentModeKHR::eMailbox;
+    } else if (requested_mode == "Fifo") {
+        present_mode = vk::PresentModeKHR::eFifo;
+    } else if (requested_mode == "Immediate") {
+        present_mode = vk::PresentModeKHR::eImmediate;
+    } else {
+        LOG_ERROR(Render_Vulkan, "Unknown present mode {}, defaulting to Mailbox.",
+                  EmulatorSettings.GetPresentMode());
+        present_mode = vk::PresentModeKHR::eMailbox;
+    }
 
-void Swapchain::UpdateVsync() {
-    if (IssnSettings::Get().vsync == vsync) {
-        return;
+    if (std::ranges::find(modes, present_mode) == modes.cend()) {
+        // FIFO is guaranteed to be supported by the Vulkan spec.
+        constexpr auto fallback = vk::PresentModeKHR::eFifo;
+        LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
+                    vk::to_string(present_mode), vk::to_string(fallback));
+        present_mode = fallback;
     }
-    if (const auto result = instance.GetDevice().waitIdle(); result != vk::Result::eSuccess) {
-        LOG_WARNING(Render_Vulkan, "Failed to wait for the device before a VSync change: {}",
-                    vk::to_string(result));
-    }
-    FindPresentMode();
-    Recreate(width, height);
 }
 
 void Swapchain::SetSurfaceProperties() {
@@ -237,11 +302,18 @@ void Swapchain::SetSurfaceProperties() {
                                  std::min(capabilities.maxImageExtent.height, height));
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
+    // Select number of images in swap chain, we prefer one buffer in the background to work on.
+    //
+    // Tested on the infamous branch: raising this to minImageCount + 3 (3 -> 5 images here) had
+    // no effect at all on the Precise-readbacks decay. Swapchain image starvation is not the
+    // mechanism, so this stays at upstream's value. The log line below is kept - knowing the
+    // driver's actual min/max was worth having.
     image_count = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
+    LOG_INFO(Render_Vulkan, "Swapchain: minImageCount={} maxImageCount={} using image_count={}",
+             capabilities.minImageCount, capabilities.maxImageCount, image_count);
 
     // Prefer identity transform if possible
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
@@ -258,7 +330,7 @@ void Swapchain::SetSurfaceProperties() {
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
+    const auto wait_result = WaitForSwapchainIdle(instance);
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));

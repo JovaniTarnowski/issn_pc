@@ -49,4 +49,57 @@ public:
 
 std::string GetCurrentThreadName();
 
+/// SHADPS4_CP_QOS=1: turn off process power throttling (EcoQoS) and raise this thread to
+/// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
+/// set efficiency class). Default off. Windows only; call on the thread itself.
+void ApplyCommandProcessorPlacement();
+/// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
+/// JobWorker* threads, bit 1 Game:Main get every performance logical processor (minus reserved
+/// cores) as selected CPU sets and power throttling off. Called with the thread's handle and name.
+void ApplyGuestThreadPlacement(void* handle, const char* name);
+/// SHADPS4_POOL_AUTO=1 (2026-10-15): worker pools sized from the logical processors in the process
+/// affinity mask (CPU-shape matrix: 6c/12t and 6c/6t gained ~25% with smaller pools). 0 = off.
+u32 AutoPoolWorkers(bool lean);
+/// SHADPS4_HELPER_PLACE=<n> (2026-10-15): emulator helper threads (lean / A2 workers); 1 = the
+/// efficiency cores as selected CPU sets, 2 = THREAD_PRIORITY_BELOW_NORMAL. Call on the thread.
+void ApplyHelperThreadPlacement(const char* name);
+/// SHADPS4_HOT_CORES=<mask> (default 0): bit 0 gives the Vulkan recording worker, bit 1 the CP
+/// front thread a whole performance core each (the two before the one SHADPS4_CP_QOS=3 gives the
+/// CP back); the rest of the process is kept off those cores. Measured 2026-10-01 without it: the
+/// recorder (80-87% busy) changes logical processor at ~20% of its chunk boundaries and spends
+/// 2-15% of them on efficiency cores. Windows only; call on the thread itself.
+enum class HotThread { Recorder, Front, GameMain };
+void ApplyHotThreadPlacement(HotThread which);
+/// SHADPS4_CRIT_PRIO (bit 1 recorders + front, bit 2 Game:Main): above-normal priority for the
+/// calling thread; ApplyHotThreadPlacement calls it, recorder lanes past lane 0 call it directly.
+void ApplyCriticalThreadPriority(HotThread which);
+/// SHADPS4_CP_CORE_STATS=1: sample the logical CPU this thread runs on (call often, it is cheap)
+/// and periodically log the share on performance vs efficiency cores. Diagnostic only.
+void SampleCommandProcessorCore();
+/// SHADPS4_THREAD_STATS=1 (diagnostic, default off): call at a natural point of a hot thread's
+/// loop. Every 2^stride_log2-th call notes the logical processor the thread is on; four times a
+/// second it times a fixed dependent-operation loop with rdtsc (loop iterations per TSC tick
+/// follow the core's real clock, which the invariant TSC does not); every ~10 s the thread logs
+/// its processor histogram, migrations, CPU time and the clock probe (median and minimum).
+/// Explains run-to-run speed modes: placement and frequency versus extra work.
+/// Cost, measured 2026-10-01 on a41 in fire: -3.3% FPS with the flag on (117.75 vs 121.3 / 122.0;
+/// the per-record call on the CP back, not the sampled work). Attribution runs only, never in
+/// an FPS comparison. Off: one inline test of a global per call site.
+extern const bool g_thread_stats;
+/// The logical processor the calling thread runs on (cheap), whether a logical processor is on a
+/// performance core (hybrid parts; true elsewhere), and the clock probe of SampleThreadPlacement
+/// (best of four TSC tick counts of a fixed 4096-step dependent chain, ~2 cycles a step).
+u32 CurrentProcessor();
+bool IsPerformanceProcessor(u32 cpu);
+u32 ClockProbe();
+void SampleThreadPlacementSlow(const char* role, unsigned stride_log2);
+inline void SampleThreadPlacement(const char* role, unsigned stride_log2 = 6) {
+    if (g_thread_stats) [[unlikely]] {
+        SampleThreadPlacementSlow(role, stride_log2);
+    }
+}
+
+/// CPU cycles the calling thread has run (QueryThreadCycleTime; 0 elsewhere). Diagnostics.
+u64 CurrentThreadCycles();
+
 } // namespace Common

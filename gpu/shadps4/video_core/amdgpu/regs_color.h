@@ -4,7 +4,6 @@
 #pragma once
 
 #include "video_core/amdgpu/pixel_format.h"
-#include "video_core/amdgpu/issn_msaa.h"
 #include "video_core/amdgpu/tiling.h"
 
 namespace AmdGpu {
@@ -74,7 +73,6 @@ struct ColorControl {
         CopyInverted = 0x33,
         AndReverse = 0x44,
         Invert = 0x55,
-        BrushXor = 0x5a,
         Xor = 0x66,
         Nand = 0x77,
         And = 0x88,
@@ -221,12 +219,8 @@ struct ColorBuffer {
         return VAddr(fmask_base_address) << 8;
     }
 
-    u32 GuestNumSamples() const {
-        return 1 << attrib.num_fragments_log2;
-    }
-
     u32 NumSamples() const {
-        return NoMsaa() ? 1 : GuestNumSamples();
+        return 1 << attrib.num_fragments_log2;
     }
 
     u32 BaseSlice() const {
@@ -239,8 +233,7 @@ struct ColorBuffer {
 
     u32 GetColorSliceSize() const {
         const auto num_bytes_per_element = NumBitsPerBlock(DataFormat(info.format)) / 8u;
-        const auto slice_size =
-            num_bytes_per_element * (slice.tile_max + 1) * 64u * GuestNumSamples();
+        const auto slice_size = num_bytes_per_element * (slice.tile_max + 1) * 64u * NumSamples();
         return slice_size;
     }
 

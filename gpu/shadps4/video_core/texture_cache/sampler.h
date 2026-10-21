@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/regs_texture.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_native_bindings.h"
 
 namespace Vulkan {
 class Instance;
@@ -16,8 +17,7 @@ namespace VideoCore {
 class Sampler {
 public:
     explicit Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
-                     const AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
-                     float extra_lod_bias = 0.0f);
+                     const AmdGpu::BorderColorBuffer border_color_base);
     ~Sampler();
 
     Sampler(const Sampler&) = delete;
@@ -31,6 +31,9 @@ public:
     }
 
     size_t lru_id{};
+    /// Descriptor heap slot, retained create info and border colour registration; inert in
+    /// legacy mode.
+    Vulkan::NativeSamplerState native;
 
 private:
     vk::UniqueSampler handle;

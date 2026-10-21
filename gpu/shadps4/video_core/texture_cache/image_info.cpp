@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <set>
-#include <mutex>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -11,6 +9,8 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/tile.h"
+
+#include <magic_enum/magic_enum.hpp>
 
 namespace VideoCore {
 
@@ -61,7 +61,6 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
     array_mode = AmdGpu::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
     num_samples = buffer.NumSamples();
-    guest_samples = buffer.GuestNumSamples();
     num_bits = NumBitsPerBlock(buffer.GetDataFmt());
     type = AmdGpu::ImageType::Color2D;
     size.width = hint.Valid() ? hint.width : buffer.Pitch();
@@ -78,7 +77,7 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
         mips_layout[0] = MipInfo(guest_size, pitch, buffer.Height(), 0);
     } else {
         std::tie(std::ignore, std::ignore, guest_size) =
-            ImageSizeLinearAligned(pitch, size.height, num_bits, guest_samples);
+            ImageSizeLinearAligned(pitch, size.height, num_bits, num_samples);
         guest_size *= resources.layers;
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
@@ -94,8 +93,11 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     props.is_tiled = buffer.IsTiled();
     props.is_depth = true;
     props.has_stencil = buffer.stencil_info.format != AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    if (LiverpoolToVK::PromoteDepthToStencil(buffer.z_info.format, buffer.stencil_info.format)) {
+        pixel_format = vk::Format::eD32SfloatS8Uint;
+        props.has_stencil = true;
+    }
     num_samples = buffer.NumSamples();
-    guest_samples = buffer.GuestNumSamples();
     num_bits = buffer.NumBits();
     size.width = hint.Valid() ? hint.width : buffer.Pitch();
     size.height = hint.Valid() ? hint.height : buffer.Height();
@@ -113,7 +115,7 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
         mips_layout[0] = MipInfo(guest_size, pitch, buffer.Height(), 0);
     } else {
         std::tie(std::ignore, std::ignore, guest_size) =
-            ImageSizeLinearAligned(pitch, size.height, num_bits, guest_samples);
+            ImageSizeLinearAligned(pitch, size.height, num_bits, num_samples);
         guest_size *= resources.layers;
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
@@ -127,26 +129,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
         pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
         props.is_depth = true;
     }
-    type = image.GetBaseType();
-    props.is_host_2d = image.IsBlock1D();
-    if (AmdGpu::All1DAs2D() && props.is_host_2d && type == AmdGpu::ImageType::Color1D) {
-        // port: BP09, as a 2D image from here on, so that it matches the 2D render target it is
-        // sampled from (the colour-grading LUT) instead of being a separate, stale image.
-        type = AmdGpu::ImageType::Color2D;
-    }
-    if (image.IsBlock1D()) {
-        // port: diagnostics for the BC 1D -> 2D promotion (one line per distinct shape).
-        static std::mutex seen_mutex;
-        static std::set<u64> seen;
-        const u64 key = (u64(image.width) << 40) | (u64(image.height) << 24) |
-                        (u64(image.GetDataFmt()) << 16) | u64(image.GetType());
-        std::scoped_lock lock{seen_mutex};
-        if (seen.insert(key).second && seen.size() < 64) {
-            LOG_WARNING(Render_Vulkan, "port: BC 1D image {}x{} format {} type {} at {:#x} -> 2D",
-                        image.width + 1, image.height + 1, u32(image.GetDataFmt()),
-                        u32(image.GetType()), image.Address());
-        }
-    }
+    type = image.GetHostBaseType();
     props.is_tiled = image.IsTiled();
     props.is_volume = type == AmdGpu::ImageType::Color3D;
     props.is_pow2 = image.pow2pad;
@@ -158,7 +141,6 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     resources.levels = image.NumLevels();
     resources.layers = image.NumLayers();
     num_samples = image.NumSamples();
-    guest_samples = image.GuestNumSamples();
     num_bits = NumBitsPerBlock(image.GetDataFmt());
     bank_swizzle = image.GetBankSwizzle();
 
@@ -166,89 +148,10 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
     UpdateSize();
-
-    // port: ISSN_BC_TINY (video_core/amdgpu/issn_bc_tiny.h): BC1-BC5 images that are 1D or smaller
-    // than a block in either dimension become plain images decoded on the CPU.
-    const auto guest_type = image.GetType();
-    const bool is_1d = guest_type == AmdGpu::ImageType::Color1D ||
-                       guest_type == AmdGpu::ImageType::Color1DArray;
-    const vk::Format decoded = BcTinyDecodedFormat(pixel_format);
-    if (AmdGpu::BcTinyDecode() && props.is_block && !props.is_depth && !props.is_volume &&
-        !props.is_host_2d && num_samples == 1 && decoded != vk::Format::eUndefined &&
-        !AmdGpu::IsMacroTiled(array_mode) && (is_1d || size.width < 4 || size.height < 4)) {
-        static std::mutex seen_mutex;
-        static std::set<u64> seen;
-        const u64 key = (u64(size.width) << 40) | (u64(size.height) << 24) |
-                        (u64(pixel_format) << 8) | u64(guest_type);
-        std::scoped_lock lock{seen_mutex};
-        if (seen.insert(key).second && seen.size() < 64) {
-            LOG_WARNING(Render_Vulkan,
-                        "port: BC image {}x{} {} type {} tile {} layers {} mips {} at {:#x} -> {} "
-                        "(CPU decode, ISSN_BC_TINY)",
-                        size.width, size.height, vk::to_string(pixel_format), u32(guest_type),
-                        AmdGpu::NameOf(tile_mode), resources.layers, resources.levels,
-                        guest_address, vk::to_string(decoded));
-        }
-        props.is_bc_decoded = true;
-        bc_format = pixel_format;
-        pixel_format = decoded;
-    }
-}
-
-vk::Format BcTinyDecodedFormat(vk::Format format) noexcept {
-    switch (format) {
-    case vk::Format::eBc1RgbUnormBlock:
-    case vk::Format::eBc1RgbaUnormBlock:
-    case vk::Format::eBc2UnormBlock:
-    case vk::Format::eBc3UnormBlock:
-        return vk::Format::eR8G8B8A8Unorm;
-    case vk::Format::eBc1RgbSrgbBlock:
-    case vk::Format::eBc1RgbaSrgbBlock:
-    case vk::Format::eBc2SrgbBlock:
-    case vk::Format::eBc3SrgbBlock:
-        return vk::Format::eR8G8B8A8Srgb;
-    case vk::Format::eBc4UnormBlock:
-        return vk::Format::eR8Unorm;
-    case vk::Format::eBc4SnormBlock:
-        return vk::Format::eR8Snorm;
-    case vk::Format::eBc5UnormBlock:
-        return vk::Format::eR8G8Unorm;
-    case vk::Format::eBc5SnormBlock:
-        return vk::Format::eR8G8Snorm;
-    default:
-        return vk::Format::eUndefined;
-    }
-}
-
-std::optional<BcDecode::Kind> BcTinyDecodeKind(vk::Format format) noexcept {
-    switch (format) {
-    case vk::Format::eBc1RgbUnormBlock:
-    case vk::Format::eBc1RgbaUnormBlock:
-    case vk::Format::eBc1RgbSrgbBlock:
-    case vk::Format::eBc1RgbaSrgbBlock:
-        return BcDecode::Kind::Bc1;
-    case vk::Format::eBc2UnormBlock:
-    case vk::Format::eBc2SrgbBlock:
-        return BcDecode::Kind::Bc2;
-    case vk::Format::eBc3UnormBlock:
-    case vk::Format::eBc3SrgbBlock:
-        return BcDecode::Kind::Bc3;
-    case vk::Format::eBc4UnormBlock:
-        return BcDecode::Kind::Bc4Unorm;
-    case vk::Format::eBc4SnormBlock:
-        return BcDecode::Kind::Bc4Snorm;
-    case vk::Format::eBc5UnormBlock:
-        return BcDecode::Kind::Bc5Unorm;
-    case vk::Format::eBc5SnormBlock:
-        return BcDecode::Kind::Bc5Snorm;
-    default:
-        return std::nullopt;
-    }
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
-    return props.is_bc_decoded == info.props.is_bc_decoded &&
-           (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
+    return (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
             IsVulkanFormatCompatible(info.pixel_format, pixel_format)) &&
            num_samples == info.num_samples && num_bits == info.num_bits;
 }
@@ -265,6 +168,7 @@ void ImageInfo::UpdateSize() {
         mip_w = std::max(mip_w, 1u);
         mip_h = std::max(mip_h, 1u);
         u32 mip_d = std::max(size.depth >> mip, 1u);
+        u32 thickness = 1;
 
         if (props.is_pow2) {
             mip_w = std::bit_ceil(mip_w);
@@ -273,25 +177,34 @@ void ImageInfo::UpdateSize() {
         }
 
         auto& mip_info = mips_layout[mip];
-        if (array_mode == AmdGpu::ArrayMode::ArrayLinearAligned) {
+        switch (array_mode) {
+        case AmdGpu::ArrayMode::ArrayLinearAligned: {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
-                ImageSizeLinearAligned(mip_w, mip_h, num_bits, guest_samples);
-        } else if (array_mode == AmdGpu::ArrayMode::ArrayLinearGeneral) {
-            UNREACHABLE_MSG("Unhandled array mode: ArrayLinearGeneral");
-        } else {
-            // Every tiled array mode (1D/2D/3D, thin/thick/xthick, PRT or not) groups
-            // GetMicroTileThickness() consecutive depth slices per tile; round mip_d up
-            // to a full group so it's counted correctly in mip_info.size below.
-            const u32 thickness = AmdGpu::GetMicroTileThickness(array_mode);
+                ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
+            break;
+        }
+        case AmdGpu::ArrayMode::Array1DTiledThick:
+            thickness = 4;
             mip_d += (-mip_d) & (thickness - 1);
-            if (AmdGpu::IsMacroTiled(array_mode)) {
-                ASSERT(!props.is_block);
-                std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
-                    mip_w, mip_h, thickness, num_bits, guest_samples, tile_mode, mip, alt_tile);
-            } else {
-                std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
-                    ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, guest_samples);
-            }
+            [[fallthrough]];
+        case AmdGpu::ArrayMode::Array1DTiledThin1: {
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
+            break;
+        }
+        case AmdGpu::ArrayMode::Array2DTiledThick:
+            thickness = 4;
+            mip_d += (-mip_d) & (thickness - 1);
+            [[fallthrough]];
+        case AmdGpu::ArrayMode::Array2DTiledThin1: {
+            ASSERT(!props.is_block);
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
+                mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
+            break;
+        }
+        default: {
+            UNREACHABLE_MSG("Unknown array mode {}", magic_enum::enum_name(array_mode));
+        }
         }
         if (props.is_block) {
             mip_info.pitch = std::max(mip_info.pitch * 4, 32u);

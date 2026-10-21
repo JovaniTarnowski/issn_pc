@@ -28,7 +28,6 @@ extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -976,14 +975,6 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        static const bool capture_key = [] {
-            const char* env = std::getenv("ISSN_FRAME_CAPTURE_KEY");
-            return env && *env == '1';
-        }();
-        if (down && !event.key.repeat && capture_key && event.key.key == SDLK_F11) {
-            Vulkan::FrameCapture::Request();
-            return true;
-        }
         if (down && !event.key.repeat &&
             (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);

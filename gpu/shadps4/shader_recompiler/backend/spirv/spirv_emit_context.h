@@ -11,6 +11,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/spirv_variants.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -193,8 +194,8 @@ public:
     Info& info;
     const RuntimeInfo& runtime_info;
     const Profile& profile;
-    HwStage hw_stage;
-    SwStage sw_stage{};
+    Stage stage;
+    LogicalStage l_stage{};
 
     Id last_label{};
 
@@ -250,30 +251,64 @@ public:
     Id output_viewport_index{};
     Id primitive_id{};
     Id vertex_index{};
+    Id NativeRecordLoad(u32 dword);
+    Id NativeTableLoad(u32 dword);
+    Id NativeTableLoad(Id dword);
+    bool native_bindless{};
+    u32 bindless_smp_base{}; ///< q3: the VS's samplers follow the FS's slot words
+    Id draw_index{};          // SHADPS4_NATIVE_PASS: DrawIndex built-in (native variant VS)
+    Id native_records{};      // SHADPS4_NATIVE_PASS: records SSBO (uint data[])
+    Id native_records_ptr{};  // pointer type to one u32 of it
+    Id native_rec_base{};     // records index of this draw's first dword
+    Id native_table{};        // SHADPS4_NATIVE_GPU_DIRECT: the per-batch table (uint data[])
+    bool native_ring{};
+    bool native{};
+    std::array<Id, NUM_BUFFERS> native_size_dw{}; // per buffer handle (native variant)
+    std::array<Id, NUM_BUFFERS> native_size_bytes{}; // the same bound in bytes (8 / 16-bit loads)
+    // SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3)
+    bool native_colour{};      // the PS is native too: draw index through a flat varying
+    bool native_pull{};        // the VS pulls its fetch attributes from native_vbuf
+    Id native_draw_out{};      // VS: flat uint output at NativeDrawIndexLocation
+    Id native_draw_in{};       // PS: the matching flat input
+    Id native_vbuf{};          // VS: the whole vertex storage buffer (uint data[])
+    Id native_vbuf2{};         // q53: the second vertex storage buffer (SHADPS4_A2_VBUF2)
+    Id native_dbg{};           // VS, compare diagnostic: writable uint data[]
+    Id native_dbg_ptr{};
+    void NativeCompareAttribute(u32 location, Id vertex_index_value, Id draw);
+    // SHADPS4_NATIVE_PT (notes/native-path-2026-10-09.md sec. 18): Guest bindings are read
+    // through the buffer cache's GPU page table and PhysicalStorageBuffer pointers.
+    bool native_pt{};
+    bool native_pt_compare{};
+    // The page table (uint64 per page) is read by pointer at the table's fallback address.
+    Id native_pt_dbg{};        // compare diagnostic: writable uint data[]
+    Id native_draw{};          // this draw's index (compare entries)
+    std::array<Id, NUM_BUFFERS> native_dev_base{}; // per buffer handle: the binding's device address
+    std::array<Id, NUM_BUFFERS> native_pt_miss{};  // the binding's page is not cached (loads read 0)
+    std::array<Id, NUM_BUFFERS> native_guest_lo{}; // the guest address (compare entries)
+    std::array<Id, NUM_BUFFERS> native_guest_hi{};
+    void NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited);
+    void NativePtMismatch(u32 handle, Id rel_index, Id pt_bits, Id desc_bits, u32 width,
+                          bool scalar = false);
+    // SHADPS4_NATIVE_SEG (sec. 20 brick A): the record is read by pointer (NativeRecordLoad)
+    // from the batch's list entry; =2 every word is also read the SSBO way and compared.
+    bool native_seg{};
+    bool native_seg_compare{};
+    Id native_rec_ptr{};   // u64 device address of this draw's record
+    Id native_seg_entry{}; // the list entry (compare entries)
+    Id native_seg_slot_ptr{}; // u64 address of this draw's 32 bindless slot words (item 4)
+    Id NativeSegSlotLoad(u32 word);
+    void NativeSegRecordPointer(Id draw);
+    std::array<Id, IR::NumParams> native_attr_value{}; // VS: pulled vec4 per fetch semantic
+    Id NativeVbufLoad(Id dword_index, Id buffer = {});
+    Id NativePullAttribute(u32 location, Id vertex_index_value);
     Id instance_id{};
     Id push_data_block{};
-    // port: object motion vectors (runtime_info.h, MotionVectors).
-    Id motion_out_cur{};
-    Id motion_out_prev{};
-    Id motion_in_cur{};
-    Id motion_in_prev{};
-    Id motion_frag_out{};
-    [[nodiscard]] bool VertexMotion() const {
-        return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
-               runtime_info.hw.vs.motion_vectors && MotionVectors::positions_address != 0;
-    }
-    [[nodiscard]] bool FragmentMotion() const {
-        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
-    }
     Id base_vertex{};
-    Id base_instance{};
     Id frag_coord{};
     Id front_facing{};
     Id frag_depth{};
     Id stencil_ref{};
     Id sample_mask{};
-    Id sample_mask_in{};
-    Id helper_invocation{};
     Id sample_index{};
     Id clip_distances{};
     Id cull_distances{};
@@ -288,10 +323,8 @@ public:
     Id num_workgroups_id{};
     Id workgroup_index_id{};
     Id local_invocation_id{};
-    Id local_invocation_index{};
     Id invocation_id{};
     Id subgroup_local_invocation_id{};
-    Id subgroup_lt_mask{};
     Id image_u32{};
     Id image_f32{};
 
@@ -303,11 +336,9 @@ public:
     Id shared_memory_u32_type{};
     Id shared_memory_u64_type{};
 
-    Id bary_coord{};
     Id bary_coord_smooth{};
     Id bary_coord_smooth_centroid{};
     Id bary_coord_smooth_sample{};
-    Id bary_coord_pull_model{};
     Id bary_coord_nopersp{};
     Id bary_coord_nopersp_sample{};
 
@@ -320,6 +351,8 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        bool bindless = false; ///< SHADPS4_NATIVE_BINDLESS: `id` is a runtime array (set 1)
+        u32 bindless_index = 0;
     };
 
     enum class PointerType : u32 {
@@ -367,12 +400,17 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
+    /// The image / sampler value to use (SHADPS4_NATIVE_BINDLESS: from the global arrays at
+    /// this draw's slot).
+    Id LoadImage(const TextureDefinition& texture);
+    Id LoadSampler(u32 index);
     std::unordered_map<u32, Id> first_to_last_label_map;
 
     size_t flatbuf_index{};
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
     Id physical_pointer_type_u32;
+    Id physical_pointer_type_u64; // SHADPS4_NATIVE_PT: page-table entries
 
     Id sampler_type{};
     Id sampler_pointer_type{};
@@ -401,6 +439,9 @@ public:
     Id f32_to_uf10{};
 
     Id get_bda_pointer{};
+    Id native_pt_report{}; // SHADPS4_NATIVE_PT=2: void(binding, rel, pt, desc, draw, lo, hi, tag)
+    Id native_pt_fault{};  // SHADPS4_NATIVE_PT: void(fault_lo, fault_hi, first_page, count)
+    Id native_seg_report{}; // SHADPS4_NATIVE_SEG=2: void(word, entry, ptr, ssbo, draw, lo, hi, tag)
 
     Id read_const{};
     Id read_const_dynamic{};
@@ -420,13 +461,15 @@ private:
     SpirvAttribute GetAttributeInfo(AmdGpu::NumberFormat fmt, Id id, u32 num_components,
                                     bool output, bool loaded = false, bool array = false);
 
-    BufferSpv DefineBuffer(bool is_written, bool is_coherent, u32 elem_shift,
-                           BufferType buffer_type, Id data_type);
+    BufferSpv DefineBuffer(bool is_storage, bool is_written, u32 elem_shift, BufferType buffer_type,
+                           Id data_type, bool is_coherent = false);
 
     Id DefineFloat32ToUfloatM5(u32 mantissa_bits, std::string_view name);
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
+    Id DefineNativePtReport(std::string_view name, u32 counter_dword, u32 entries_dword);
+    Id DefineNativePtFault();
 
     Id DefineReadConst(bool dynamic);
 

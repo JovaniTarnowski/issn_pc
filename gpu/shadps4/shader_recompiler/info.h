@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
+#include <optional>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -62,14 +65,13 @@ struct InfoPersistent {
     };
     UserDataMask ud_mask{};
     u32 fetch_shader_sgpr_base{};
-    u32 shared_memory_scratch_size{};
 
     u64 pgm_hash{};
 
     s32 tess_consts_dword_offset = -1;
     IR::ScalarReg tess_consts_ptr_base = IR::ScalarReg::Max;
-    HwStage hw_stage;
-    SwStage sw_stage;
+    Stage stage;
+    LogicalStage l_stage;
 
     u8 mrt_mask{};
     bool has_fetch_shader{};
@@ -77,9 +79,27 @@ struct InfoPersistent {
     bool uses_dma{};
 
     InfoPersistent() = default;
-    InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)
-        : hw_stage{hw_stage_}, sw_stage{sw_stage_}, pgm_hash{pgm_hash_} {}
+    InfoPersistent(Stage stage_, LogicalStage l_stage_, u64 pgm_hash_)
+        : stage{stage_}, l_stage{l_stage_}, pgm_hash{pgm_hash_} {}
 };
+
+/// SHADPS4_PRECOMPILE (video_core/renderer_vulkan/vk_pipeline_precompile.cpp): while set,
+/// RefreshFlatBuf takes the flattened user data from this image instead of walking the guest
+/// pointers in user data. Set only by WarmUp, before the game runs; thread_local (study sec. 5
+/// finding 6) so a rebuild on a boot thread never leaks into another thread's translation.
+inline thread_local const std::vector<u32>* g_synthetic_flat = nullptr;
+
+/// q9b: SHADPS4_ASC_NODMA=1 (see Info::nodma_pinned).
+inline bool NoDmaMode() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_ASC_NODMA");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+/// q9b: program hashes translated with the pin (RegisterShaderBinary skips them).
+bool NoDmaPinnedHash(u64 pgm_hash);
+void NoteNoDmaPinned(u64 pgm_hash);
 
 struct Info : InfoPersistent {
     struct AttributeFlags {
@@ -125,6 +145,9 @@ struct Info : InfoPersistent {
     AttributeFlags stores{};
 
     ReadConstType readconst_types{};
+    /// q9b (SHADPS4_ASC_NODMA=1): a compute program whose ReadConsts are all Immediate was translated
+    /// without DMA (flatbuf reads); its meta / binary are never written to the shader cache.
+    bool nodma_pinned{};
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
 
@@ -133,13 +156,10 @@ struct Info : InfoPersistent {
     bool has_discard{};
     bool has_image_gather{};
     bool has_image_query{};
-    bool has_readconst{};
     bool uses_buffer_atomic_float_min_max{};
     bool uses_image_atomic_float_min_max{};
     bool uses_lane_id{};
-    bool uses_shader_clock{};
     bool uses_group_quad{};
-    bool uses_group_shuffle{};
     bool uses_group_ballot{};
     IR::Type shared_types{};
     bool uses_fp16{};
@@ -151,69 +171,28 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
+    // Set before translating a later permutation: forces uses_dma to the program's value so the
+    // permutation's bindings match the shared Info the pipeline layout is built from.
+    std::optional<bool> pinned_uses_dma{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
     Info() = default;
-    Info(HwStage stage_, SwStage l_stage_, ShaderParams params)
+    Info(Stage stage_, LogicalStage l_stage_, ShaderParams params)
         : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
           user_data{params.user_data} {}
 
-    /// port: user data of this stage as a draw saw it. The GPU command thread refreshes
-    /// user_data/flattened_ud_buf for every draw it decodes, while the draw recording thread
-    /// (vk_draw_pipe.h) may still work on an earlier draw: that thread installs snapshots here.
-    struct UdSnapshot {
-        const Info* info;
-        const u32* user_data;
-        u32 user_data_size;
-        const u32* flat;
-        u32 flat_size;
-        VAddr pgm_base;
-    };
-    static constexpr u32 MaxUdSnapshots = 6;
-    static inline thread_local UdSnapshot ud_snapshots[MaxUdSnapshots];
-    static inline thread_local u32 num_ud_snapshots = 0;
-
-    const UdSnapshot* Snapshot() const noexcept {
-        for (u32 i = 0; i < num_ud_snapshots; ++i) {
-            if (ud_snapshots[i].info == this) {
-                return &ud_snapshots[i];
-            }
-        }
-        return nullptr;
-    }
-    std::span<const u32> UserData() const noexcept {
-        if (const auto* snapshot = Snapshot()) [[unlikely]] {
-            return {snapshot->user_data, snapshot->user_data_size};
-        }
-        return user_data;
-    }
-    std::span<const u32> FlatUserData() const noexcept {
-        if (const auto* snapshot = Snapshot()) [[unlikely]] {
-            return {snapshot->flat, snapshot->flat_size};
-        }
-        return flattened_ud_buf;
-    }
-
-    VAddr ProgramBase() const noexcept {
-        if (const auto* snapshot = Snapshot()) [[unlikely]] {
-            return snapshot->pgm_base;
-        }
-        return pgm_base;
-    }
-
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&FlatUserData()[sharp_idx]);
+        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const auto ud = UserData();
-        const u32* base = ud.data();
+        const u32* base = user_data.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &ud[ptr_index], sizeof(base));
+            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
@@ -221,13 +200,12 @@ struct Info : InfoPersistent {
     }
 
     void PushUd(Backend::Bindings& bnd, PushData& push) const {
-        const auto ud = UserData();
         u32 mask = ud_mask.mask;
         while (mask) {
             const u32 index = std::countr_zero(mask);
             ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
             mask &= ~(1U << index);
-            push.ud_regs[bnd.user_data++] = ud[index];
+            push.ud_regs[bnd.user_data++] = user_data[index];
         }
     }
 
@@ -239,6 +217,13 @@ struct Info : InfoPersistent {
 
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        if (g_synthetic_flat) [[unlikely]] {
+            // Pre-compile: a recorded or synthesized image, no guest pointers to walk.
+            std::fill(flattened_ud_buf.begin(), flattened_ud_buf.end(), 0u);
+            std::memcpy(flattened_ud_buf.data(), g_synthetic_flat->data(),
+                        std::min(flattened_ud_buf.size(), g_synthetic_flat->size()) * sizeof(u32));
+            return;
+        }
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
@@ -260,5 +245,52 @@ struct Info : InfoPersistent {
     bool Deserialize(Serialization::Archive& ar);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
+
+/// One stage's user data as bound for a single draw or dispatch (CP front/back split,
+/// notes/cp-split-inventory-2026-09-25.md). The back path reads user data, the flattened buffer
+/// and pgm_base only through this, never through the shared Info, whose fields the next pipeline
+/// lookup rewrites. Today it aliases the Info's fields, so building one copies no data.
+struct BoundStage {
+    const Info* info{};
+    std::span<const u32> user_data;
+    std::span<const u32> flattened_ud_buf;
+    VAddr pgm_base{};
+
+    BoundStage() = default;
+    explicit BoundStage(const Info* info_) noexcept : info{info_} {
+        if (info) {
+            user_data = info->user_data;
+            flattened_ud_buf = info->flattened_ud_buf;
+            pgm_base = info->pgm_base;
+        }
+    }
+
+    template <typename T>
+    inline T ReadUdSharp(u32 sharp_idx) const noexcept {
+        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+    }
+
+    template <typename T>
+    T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
+        T data;
+        const u32* base = user_data.data();
+        if (ptr_index != IR::NumScalarRegs) {
+            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+        }
+        std::memcpy(&data, base + dword_offset, sizeof(T));
+        return data;
+    }
+
+    void PushUd(Backend::Bindings& bnd, PushData& push) const {
+        u32 mask = info->ud_mask.mask;
+        while (mask) {
+            const u32 index = std::countr_zero(mask);
+            ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
+            mask &= ~(1U << index);
+            push.ud_regs[bnd.user_data++] = user_data[index];
+        }
+    }
+};
 
 } // namespace Shader

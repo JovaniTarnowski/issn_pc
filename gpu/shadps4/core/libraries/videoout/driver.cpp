@@ -1,28 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <cmath>
-#include <vector>
+#include <cstdlib>
+
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
-#include "common/backports.h"
 #include "common/assert.h"
-#include "issn_toggles.h"
-#include "issn_freeze.h"
-#include "issn_settings.h"
-#include "issn_graphics.h"
-#include "video_core/renderer_vulkan/vk_frame_capture.h"
-#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/debug.h"
+#include "common/fault_monitor.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -32,20 +17,9 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
-
-namespace Vulkan {
-extern std::atomic<u64> g_issn_compile_ns;
-extern std::atomic<u32> g_issn_compiles;
-extern std::atomic<u64> g_issn_capture_ns, g_issn_async_ns, g_issn_compile_wait_ns;
-extern std::atomic<u64> g_issn_snapshot_ns, g_issn_guest_wait_ns;
-extern std::atomic<u32> g_issn_pending_draws;
-} // namespace Vulkan
 
 namespace Libraries::VideoOut {
 
@@ -76,45 +50,7 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
-    const char* separate = std::getenv("ISSN_PRESENT_THREAD");
-    separate_swap = !(separate && separate[0] == '0');
-    if (separate_swap) {
-        swap_thread = std::jthread([&](std::stop_token token) { SwapThread(token); });
-    }
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
-}
-
-void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
-    if (!separate_swap) {
-        work();
-        return;
-    }
-    {
-        std::scoped_lock lock{swap_mutex};
-        if (if_idle && (swap_busy || !swap_queue.empty())) {
-            return; // a redraw of the last frame is pointless while frames are queued
-        }
-        swap_queue.push_back(std::move(work));
-    }
-    swap_cv.notify_one();
-}
-
-void VideoOutDriver::SwapThread(std::stop_token token) {
-    Common::SetCurrentThreadName("port:Present");
-    while (true) {
-        std::function<void()> work;
-        {
-            std::unique_lock lock{swap_mutex};
-            swap_busy = false;
-            if (!swap_cv.wait(lock, token, [this] { return !swap_queue.empty(); })) {
-                return;
-            }
-            work = std::move(swap_queue.front());
-            swap_queue.pop_front();
-            swap_busy = true;
-        }
-        work();
-    }
 }
 
 VideoOutDriver::~VideoOutDriver() = default;
@@ -233,7 +169,6 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
             .address_left = address,
             .address_right = 0,
         };
-        Vulkan::FrameCapture::AddDisplayBuffer(address);
 
         // Reset flip label also when registering buffer
         port->buffer_labels[startIndex + i] = 0;
@@ -303,257 +238,30 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
-void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting, then present the frame (port: on the swap thread).
-    IssnFreeze::flips_shown.fetch_add(1, std::memory_order_relaxed);
-    RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
-        presenter->SetHDR(hdr);
-        presenter->Present(frame);
-        IssnFreeze::presents.fetch_add(1, std::memory_order_relaxed);
-    });
-    Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
-                                                : 0);
+/// SHADPS4_VO_EARLY_RELEASE=1 (see SubmitFlipInternal).
+static bool VoEarlyRelease() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_VO_EARLY_RELEASE");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
 
-    // port: ISSN_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
-    static const bool frame_stats = EmulatorSettingsImpl::Flag("ISSN_FRAME_STATS", false);
-    if (frame_stats) {
-        using Clock = std::chrono::steady_clock;
-        static Clock::time_point window_start = Clock::now(), last = window_start;
-        static u32 frames;
-        static double worst_ms;
-        const auto now = Clock::now();
-        const double frame_ms = std::chrono::duration<double, std::milli>(now - last).count();
-        worst_ms = std::max(worst_ms, frame_ms);
-        static std::vector<double> intervals;
-        intervals.push_back(frame_ms);
-        last = now;
-        // Stall diagnostics: what happened during a long frame.
-        static u64 last_gpu_ns, last_images, last_image_bytes, last_buffer_bytes;
-        static u64 last_t[6], last_minflt, last_sigf, last_pc, last_pp, last_rc, last_rp;
-        const u64 pc = IssnStats::protect_calls.load(), pp = IssnStats::protect_pages.load(),
-                  rc = IssnStats::protect_revoke_calls.load(), rp = IssnStats::protect_revoke_pages.load();
-        const u64 minflt = IssnStats::gpu_minor_faults.load(), sigf = IssnStats::gpu_signal_faults.load();
-        static u64 last_copy_cpu, last_copy_sys, last_copy_flt;
-        const u64 copy_cpu = IssnStats::t_copy_cpu.load(), copy_sys = IssnStats::copy_sys_us.load(),
-                  copy_flt = IssnStats::copy_minflt.load();
-        static u64 last_proc_flt, last_copy_ns, last_copy_bytes, last_rf, last_trf, last_twf;
-        const u64 rf = IssnStats::read_faults.load(), trf = IssnStats::t_read_faults.load(),
-                  twf = IssnStats::t_write_faults.load();
-        // port: every frame over 40 ms after the first, at most 10 per 5 s window.
-        static bool primed = false;
-        static u32 stalls_shown = 0;
-        const bool stall = primed && frame_ms > 40.0 && stalls_shown < 10;
-        stalls_shown += stall;
-        primed = true;
-        // Waits and work inside the long frame (window counters are reset every 5 s, so the
-        // previous values are reset with them).
-        static u64 last_wait[7];
-        const u64 wait_now[7] = {IssnStats::t_readback_wait.load(), IssnStats::tick_wait_ns.load(),
-                                 IssnStats::sync_recording_ns.load(), IssnStats::host_copies_wait_ns.load(),
-                                 u64(Vulkan::g_issn_compile_ns.load()), u64(Vulkan::g_issn_compiles.load()),
-                                 IssnStats::t_gc.load()};
-        if (stall) {
-            std::printf("Stall: %.1f ms frame; waits: readback %.1f ms, GPU ticks %.1f ms, "
-                        "recorder %.1f ms, host copies %.1f ms; %llu compiles %.1f ms; GC %.1f ms\n",
-                        frame_ms, (wait_now[0] - last_wait[0]) / 1e6, (wait_now[1] - last_wait[1]) / 1e6,
-                        (wait_now[2] - last_wait[2]) / 1e6, (wait_now[3] - last_wait[3]) / 1e6,
-                        static_cast<unsigned long long>(wait_now[5] - last_wait[5]),
-                        (wait_now[4] - last_wait[4]) / 1e6, (wait_now[6] - last_wait[6]) / 1e6);
-        }
-        std::copy(std::begin(wait_now), std::end(wait_now), std::begin(last_wait));
-        if (stall) {
-            std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms\n",
-                        static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
-                        (twf - last_twf) / 1e6);
-        }
-        last_rf = rf;
-        last_trf = trf;
-        last_twf = twf;
-        const u64 copy_ns = IssnStats::t_copy.load(), copy_bytes = IssnStats::copy_bytes.load();
-        u64 proc_flt = 0;
-#ifndef _WIN32
-        if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
-            proc_flt = usage.ru_minflt;
-        }
-#endif
-        const u64 t_now[6] = {IssnStats::t_resident.load(), IssnStats::t_protect.load(),
-                              IssnStats::t_image_create.load(), IssnStats::t_refresh.load(),
-                              IssnStats::t_staging.load(), IssnStats::t_host_wait.load()};
-        static u64 last_draws, last_dispatches, last_subs, last_sys, last_user, last_invol, last_vol;
-        const u64 draws = IssnStats::draws.load(), dispatches = IssnStats::dispatches.load(),
-                  subs = IssnStats::submissions.load(), sys_us = IssnStats::gpu_sys_us.load(),
-                  user_us = IssnStats::gpu_user_us.load(), invol = IssnStats::gpu_invol_switches.load(),
-                  vol = IssnStats::gpu_vol_switches.load();
-        u64 gpu_ns = 0;
-#ifdef _WIN32
-        // port: Windows has no per-thread clock id; the thread's user + kernel time instead.
-        static HANDLE gpu_thread = nullptr;
-        if (!gpu_thread) {
-            if (const unsigned long id = IssnStats::gpu_thread_id.load()) {
-                gpu_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);
-            }
-        }
-        if (FILETIME created, exited, kernel, user;
-            gpu_thread && GetThreadTimes(gpu_thread, &created, &exited, &kernel, &user)) {
-            const auto ns = [](const FILETIME& t) {
-                return ((u64(t.dwHighDateTime) << 32) | t.dwLowDateTime) * 100;
-            };
-            gpu_ns = ns(kernel) + ns(user);
-        }
-#else
-        if (const int clock = IssnStats::gpu_thread_clock.load(); clock != -1) {
-            timespec ts{};
-            clock_gettime(static_cast<clockid_t>(clock), &ts);
-            gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
-        }
-#endif
-        const u64 images = IssnStats::images_registered.load();
-        const u64 image_bytes = IssnStats::image_upload_bytes.load();
-        const u64 buffer_bytes = IssnStats::buffer_upload_bytes.load();
-        if (stall) {
-            std::printf("       GPU thread on CPU %.1f ms; %llu images registered, "
-                        "%.1f MB image uploads, %.1f MB buffer uploads\n",
-                        (gpu_ns - last_gpu_ns) / 1e6,
-                        static_cast<unsigned long long>(images - last_images),
-                        (image_bytes - last_image_bytes) / 1e6,
-                        (buffer_bytes - last_buffer_bytes) / 1e6);
-            std::printf("       %llu draws, %llu dispatches, %llu submissions; GPU thread user %.1f ms, "
-                        "kernel %.1f ms, %llu preempted, %llu waits\n",
-                        static_cast<unsigned long long>(draws - last_draws),
-                        static_cast<unsigned long long>(dispatches - last_dispatches),
-                        static_cast<unsigned long long>(subs - last_subs), (user_us - last_user) / 1e3,
-                        (sys_us - last_sys) / 1e3, static_cast<unsigned long long>(invol - last_invol),
-                        static_cast<unsigned long long>(vol - last_vol));
-        }
-        if (stall) {
-            std::printf("       ms in: resident %.1f, protect %.1f, image create %.1f, "
-                        "image refresh %.1f, staging %.1f, waiting for host copies %.1f\n",
-                        (t_now[0] - last_t[0]) / 1e6, (t_now[1] - last_t[1]) / 1e6,
-                        (t_now[2] - last_t[2]) / 1e6, (t_now[3] - last_t[3]) / 1e6,
-                        (t_now[4] - last_t[4]) / 1e6, (t_now[5] - last_t[5]) / 1e6);
-            std::printf("       GPU thread page faults %llu (process %llu), protection faults %llu; "
-                        "protect calls %llu (%llu pages), of which write-revoking %llu (%llu pages)\n",
-                        static_cast<unsigned long long>(minflt - last_minflt),
-                        static_cast<unsigned long long>(proc_flt - last_proc_flt),
-                        static_cast<unsigned long long>(sigf - last_sigf),
-                        static_cast<unsigned long long>(pc - last_pc),
-                        static_cast<unsigned long long>(pp - last_pp),
-                        static_cast<unsigned long long>(rc - last_rc),
-                        static_cast<unsigned long long>(rp - last_rp));
-        }
-        last_pc = pc;
-        last_pp = pp;
-        last_rc = rc;
-        last_rp = rp;
-        last_minflt = minflt;
-        if (stall && copy_ns > last_copy_ns) {
-            std::printf("       guest copies %.1f MB in %.1f thread-ms, %.1f ms on CPU (kernel %.1f ms, "
-                        "%llu page faults in large copies) (%.2f GB/s per thread)\n",
-                        (copy_bytes - last_copy_bytes) / 1e6, (copy_ns - last_copy_ns) / 1e6,
-                        (copy_cpu - last_copy_cpu) / 1e6, (copy_sys - last_copy_sys) / 1e3,
-                        static_cast<unsigned long long>(copy_flt - last_copy_flt),
-                        double(copy_bytes - last_copy_bytes) / double(copy_ns - last_copy_ns));
-        }
-        last_copy_ns = copy_ns;
-        last_copy_cpu = copy_cpu;
-        last_copy_sys = copy_sys;
-        last_copy_flt = copy_flt;
-        last_copy_bytes = copy_bytes;
-        last_proc_flt = proc_flt;
-        last_sigf = sigf;
-        std::copy(std::begin(t_now), std::end(t_now), std::begin(last_t));
-        last_draws = draws;
-        last_dispatches = dispatches;
-        last_subs = subs;
-        last_sys = sys_us;
-        last_user = user_us;
-        last_invol = invol;
-        last_vol = vol;
-        last_gpu_ns = gpu_ns;
-        last_images = images;
-        last_image_bytes = image_bytes;
-        last_buffer_bytes = buffer_bytes;
-        ++frames;
-        const double window = std::chrono::duration<double>(now - window_start).count();
-        if (window >= 5.0) {
-            const u32 compiles = Vulkan::g_issn_compiles.exchange(0);
-            const u64 compile_ns = Vulkan::g_issn_compile_ns.exchange(0);
-            const double capture_ms = Vulkan::g_issn_capture_ns.exchange(0) / 1e6;
-            const double async_ms = Vulkan::g_issn_async_ns.exchange(0) / 1e6;
-            const double wait_ms = Vulkan::g_issn_compile_wait_ns.exchange(0) / 1e6;
-            const double snapshot_ms = Vulkan::g_issn_snapshot_ns.exchange(0) / 1e6;
-            const double guest_wait_ms = Vulkan::g_issn_guest_wait_ns.exchange(0) / 1e6;
-            const u32 pending_draws = Vulkan::g_issn_pending_draws.exchange(0);
-            const u64 direct = Vulkan::Scheduler::direct_recordings.exchange(0);
-            const u64 faults = IssnStats::tracker_faults.exchange(0);
-            // GPU command thread CPU time per draw: comparable between builds even when the scene
-            // (and so the frame rate) differs a little.
-            static u64 window_draws = 0, window_gpu_us = 0;
-            const u64 all_draws = IssnStats::draws.load();
-            const u64 gpu_us = IssnStats::gpu_user_us.load() + IssnStats::gpu_sys_us.load();
-            const double us_per_draw = all_draws > window_draws
-                                           ? double(gpu_us - window_gpu_us) / (all_draws - window_draws)
-                                           : 0.0;
-            const double draws_per_frame = frames ? double(all_draws - window_draws) / frames : 0.0;
-            window_draws = all_draws;
-            window_gpu_us = gpu_us;
-            std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
-                        "%u shader/pipeline compiles, %.1f ms; async: capture %.1f ms, workers "
-                        "%.1f ms, sync wait %.1f ms, snapshots %.1f ms, GPU capture wait %.1f ms, "
-                        "%u pending draws; %llu recorder syncs; "
-                        "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "
-                        "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, host copies "
-                        "%.1f%% (%.0f/frame), copy threads %.1f%%, GPU ticks %.1f%%; "
-                        "reduced-size draws %.0f/frame of %.0f in the scene\n",
-                        frames / window, worst_ms, EmulatorSettings.GetVblankFrequency(), compiles,
-                        compile_ns / 1e6, capture_ms, async_ms, wait_ms, snapshot_ms, guest_wait_ms,
-                        pending_draws,
-                        static_cast<unsigned long long>(direct),
-                        faults / window, static_cast<long long>(IssnStats::hot_pages.load()),
-                        us_per_draw, draws_per_frame,
-                        IssnStats::gpu_idle_ns.exchange(0) / (window * 1e7),
-                        IssnStats::sync_recording_ns.exchange(0) / (window * 1e7),
-                        IssnStats::host_copies_wait_ns.exchange(0) / (window * 1e7),
-                        frames ? double(IssnStats::host_copy_waits.exchange(0)) / frames : 0.0,
-                        IssnStats::copy_threads_wait_ns.exchange(0) / (window * 1e7),
-                        IssnStats::tick_wait_ns.exchange(0) / (window * 1e7),
-                        frames ? double(IssnStats::reduced_draws.exchange(0)) / frames : 0.0,
-                        frames ? double(IssnStats::scene_draws.exchange(0)) / frames : 0.0);
-            presenter->GetRasterizer().GetPipelineCache().ReportCompilerStats();
-            Vulkan::WaitDiagnostics::Report();
-            Common::Backports::LogHits();
-            // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
-            if (intervals.size() > 2) {
-                std::vector<double> sorted = intervals;
-                std::sort(sorted.begin(), sorted.end());
-                const double median = sorted[sorted.size() / 2];
-                double sum = 0, sq = 0;
-                u32 spikes = 0;
-                for (const double ms : intervals) {
-                    sum += ms;
-                    sq += ms * ms;
-                    spikes += ms > 1.5 * median;
-                }
-                const double mean = sum / intervals.size();
-                std::printf("Frame pacing: median %.2f ms, stddev %.2f ms, p99 %.2f ms, "
-                            "%u frames over 1.5x median\n",
-                            median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
-                            sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
-            }
-            intervals.clear();
-            window_start = now;
-            frames = 0;
-            worst_ms = 0;
-            stalls_shown = 0;
-            std::fill(std::begin(last_wait) + 1, std::begin(last_wait) + 6, 0);
-        }
-    }
+void VideoOutDriver::Flip(const Request& req) {
+    // Update HDR status before presenting.
+    presenter->SetHDR(req.port->is_hdr);
+
+    // Present the frame.
+    const auto present_start = Common::FaultMonitor::Now();
+    presenter->Present(req.frame);
+    const auto present_ns = Common::FaultMonitor::SinceNs(present_start);
 
     // Update flip status.
     auto* port = req.port;
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
+        Common::FaultMonitor::CountPresent(present_ns, flip_status.flip_pending_num);
         flip_status.count++;
         flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
@@ -577,29 +285,56 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
-    // Reset prev flip label
-    if (port->prev_index != -1) {
+    // Reset prev flip label. With VO_EARLY_RELEASE it was released at submission, and the guest
+    // may already have re-armed it for its next frame (label = 1 before that flip's IRQ):
+    // resetting it here would trip the "Out of order flip IRQ" assert.
+    if (!VoEarlyRelease() && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
     // save to prev buf index
     port->prev_index = req.index;
+
+    // port: ISSN_FRAME_STATS=1 prints the frame rate every 5 s to stdout (the benchmark logs).
+    static const bool frame_stats = [] {
+        const char* v = std::getenv("ISSN_FRAME_STATS");
+        return v && v[0] == '1';
+    }();
+    if (frame_stats) {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point window_start = Clock::now(), last = window_start;
+        static u32 frames = 0;
+        static double worst_ms = 0.0;
+        static u32 over_33 = 0;
+        const auto now = Clock::now();
+        const double frame_ms = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+        worst_ms = std::max(worst_ms, frame_ms);
+        over_33 += frame_ms > 33.4 ? 1 : 0;
+        ++frames;
+        const double window_s = std::chrono::duration<double>(now - window_start).count();
+        if (window_s >= 5.0) {
+            std::printf("Frame stats: %.1f FPS, worst frame %.1f ms, %u frames over 33 ms\n",
+                        frames / window_s, worst_ms, over_33);
+            std::fflush(stdout);
+            window_start = now;
+            frames = 0;
+            worst_ms = 0.0;
+            over_33 = 0;
+        }
+    }
 }
 
 void VideoOutDriver::DrawBlankFrame() {
-    RunPresenter([this] {
-        const auto empty_frame = presenter->PrepareBlankFrame(true);
-        presenter->Present(empty_frame, false, false);
-    }, true);
+    const auto empty_frame = presenter->PrepareBlankFrame(false);
+    presenter->Present(empty_frame);
 }
 
 void VideoOutDriver::DrawLastFrame() {
-    RunPresenter([this] {
-        const auto frame = presenter->PrepareLastFrame();
-        if (frame != nullptr) {
-            presenter->Present(frame, true);
-        }
-    }, true);
+    const auto frame = presenter->PrepareLastFrame();
+    if (frame != nullptr) {
+        presenter->Present(frame, true);
+    }
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
@@ -614,7 +349,6 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
         }
-        IssnFreeze::flips_submitted.fetch_add(1, std::memory_order_relaxed);
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
@@ -630,10 +364,6 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
-    // port: frame boundaries of ISSN_FRAME_RECORD_TRIGGER, in stream order on the GPU thread.
-    Vulkan::FrameRecord::OnFlip(index >= 0 ? port->buffer_slots[index].address_left : 0,
-                                std::this_thread::get_id() ==
-                                    liverpool->GetGpuCommandProcessorThread());
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -642,19 +372,27 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+        // SHADPS4_VO_EARLY_RELEASE=1: the presenter shows its own copy of the guest display
+        // buffer, and PrepareFrame has just recorded that copy on the draw scheduler, ahead of
+        // any later guest rendering into the buffer. So the buffer is free for the guest now,
+        // not when the next flip is presented: its label (which the guest's command buffers wait
+        // on before rendering into it) is released here. With the title's two display buffers
+        // this turns "frame N+2 waits until N+1 is presented" into no wait. Flip status, flip
+        // and vblank events are unchanged.
+        if (VoEarlyRelease()) {
+            port->buffer_labels[index] = 0;
+            port->SignalVoLabel();
+        }
     }
 
-    {
-        std::scoped_lock lock{mutex};
-        requests.push({
-            .frame = frame,
-            .port = port,
-            .flip_arg = flip_arg,
-            .index = index,
-            .eop = is_eop,
-        });
-    }
-    request_cv.notify_one();
+    std::scoped_lock lock{mutex};
+    requests.push({
+        .frame = frame,
+        .port = port,
+        .flip_arg = flip_arg,
+        .index = index,
+        .eop = is_eop,
+    });
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -666,23 +404,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::AccurateTimer timer{vblank_period};
 
-    // port: frame limit (see EmulatorSettings::GetFrameLimit). A request waits in the queue
-    // until its slot; slots advance by one period (no drift) but never lag behind by more.
-    // port: the in-game menu changes the limit live (IssnSettings::fps_limit); ISSN_FPS_LIMIT
-    // and the uncapped presets keep their fixed limit.
-    const bool fixed_limit = std::getenv("ISSN_FPS_LIMIT") || EmulatorSettings.GetVblankFrequency() == 480;
-    const auto current_limit = [&] {
-        const auto& s = IssnSettings::Get();
-        return fixed_limit ? EmulatorSettings.GetFrameLimit()
-                           : u32(IssnGraphics::PresentLimit(s.fps_limit, s.applied_engine_fps));
-    };
-    u32 frame_limit = current_limit();
-    auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
-                                    : std::chrono::nanoseconds(0);
-    auto next_flip = std::chrono::steady_clock::now();
-    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
-
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -693,20 +414,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
-    // port: with a frame limit (uncapped presets) a queued flip is presented as soon as it
-    // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    bool immediate_flips = frame_limit != 0;
-
     while (!token.stop_requested()) {
-        if (const u32 limit = current_limit(); limit != frame_limit) {
-            frame_limit = limit;
-            frame_period = limit ? std::chrono::nanoseconds(1000000000 / limit) : std::chrono::nanoseconds(0);
-            immediate_flips = limit != 0;
-            next_flip = std::chrono::steady_clock::now();
-            std::printf("VideoOut: frame limit %u FPS\n", limit);
-        }
         timer.Start();
-        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -716,13 +425,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || now >= next_flip;
-        if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
-            if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
-            }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
@@ -756,39 +460,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
             // Update vblank status
             vblank_status.count++;
-            IssnFreeze::vblanks.fetch_add(1, std::memory_order_relaxed);
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
         }
 
-        if (!immediate_flips || main_port.flip_rate != 0) {
-            timer.End();
-            continue;
-        }
-        while (!token.stop_requested()) {
-            {
-                std::unique_lock lk{mutex};
-                if (!request_cv.wait_until(lk, tick_deadline,
-                                           [&] { return !requests.empty(); })) {
-                    break; // next vblank
-                }
-            }
-            if (std::chrono::steady_clock::now() < next_flip) {
-                if (next_flip >= tick_deadline) {
-                    break;
-                }
-                std::this_thread::sleep_until(next_flip);
-            }
-            const auto now = std::chrono::steady_clock::now();
-            const auto request = receive_request();
-            if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
-                Flip(request);
-                FRAME_END;
-            }
-        }
-        std::this_thread::sleep_until(tick_deadline);
+        timer.End();
     }
 }
 

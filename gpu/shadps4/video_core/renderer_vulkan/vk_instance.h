@@ -6,6 +6,7 @@
 #include <span>
 #include <unordered_map>
 
+#include "video_core/renderer_vulkan/vk_native_bindings_api.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -13,10 +14,10 @@
 
 namespace Frontend {
 class WindowSDL;
-struct WindowSystemInfo;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan {
 
@@ -25,8 +26,6 @@ public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
-    /// Headless logical device for renderer regression tests (no window or game).
-    explicit Instance(s32 physical_device_index, bool enable_validation);
     ~Instance();
 
     /// Returns a formatted string for the driver version
@@ -42,22 +41,6 @@ public:
     }
 
     /// Returns the current physical device
-    /// port: device features the temporal upscaler reports as enabled.
-    bool IsStorageImageWriteWithoutFormatEnabled() const {
-        return features.shaderStorageImageWriteWithoutFormat;
-    }
-    bool IsShaderFloat16Enabled() const {
-        return vk12_features.shaderFloat16;
-    }
-    bool IsSubgroupSizeControlEnabled() const {
-        return vk13_features.subgroupSizeControl;
-    }
-
-    /// Largest VkBuffer the driver allows (2 GiB on AMD's Windows driver).
-    u64 GetMaxBufferSize() const {
-        return vk13_props.maxBufferSize;
-    }
-
     vk::PhysicalDevice GetPhysicalDevice() const {
         return physical_device;
     }
@@ -65,10 +48,6 @@ public:
     /// Returns the Vulkan device
     vk::Device GetDevice() const {
         return *device;
-    }
-
-    const vk::PipelineBinaryKeyKHR& GetPipelineBinaryGlobalKey() const {
-        return pipeline_binary_global_key;
     }
 
     /// Returns the VMA allocator handle
@@ -98,6 +77,43 @@ public:
         return present_queue;
     }
 
+    /// Second queue of the graphics family, when SHADPS4_READBACK_QUEUE=1 and available.
+    bool HasReadbackQueue() const {
+        return has_readback_queue;
+    }
+
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
+    /// SHADPS4_READBACK_QUEUE=3: the readback queue is in another family, so buffers are
+    /// created VK_SHARING_MODE_CONCURRENT between the graphics and readback families.
+    /// SHADPS4_ASC_STREAM: second queue of the compute-only family for guest async compute.
+    bool HasAscQueue() const {
+        return has_asc_queue;
+    }
+    /// SHADPS4_ASC_LANE: queue 1 of the compute-only family for the back's compute lane.
+    bool HasAscLaneQueue() const {
+        return has_asc_lane;
+    }
+    vk::Queue GetAscQueue() const {
+        return asc_queue;
+    }
+    /// SHADPS4_ARENA_RETRY_QUEUE=1 (r18): one more queue of the compute-only family for the
+    /// arena prefetch retry copies, so a copy waiting for its producer never blocks fault copies.
+    bool HasRetryQueue() const {
+        return has_retry_queue;
+    }
+    vk::Queue GetRetryQueue() const {
+        return retry_queue;
+    }
+    bool BuffersShareReadbackFamily() const {
+        return readback_family_concurrent;
+    }
+    u32 GetReadbackQueueFamilyIndex() const {
+        return readback_queue_family;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -107,9 +123,23 @@ public:
         return features.samplerAnisotropy;
     }
 
+    /// SHADPS4_DEVICE_FAULT=1: logs the driver's VK_EXT_device_fault report (call on a device
+    /// loss, before asserting). Says so when the extension is not enabled.
+    void LogDeviceFault() const;
+
     /// Returns true if depth bounds testing is supported
     bool IsDepthBoundsSupported() const {
         return features.depthBounds;
+    }
+
+    /// Occlusion queries that return the exact sample count (SHADPS4_OCCLUSION_QUERIES).
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// vkResetQueryPool from the host (SHADPS4_OCCLUSION_QUERIES).
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
     }
 
     /// Returns true if 16-bit floats are supported in shaders
@@ -140,6 +170,9 @@ public:
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
+    }
+    bool IsMaintenance7Supported() const {
+        return maintenance_7;
     }
 
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
@@ -256,23 +289,6 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
-    /// port: true if creating a pipeline can be told to fail instead of compiling it
-    /// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
-    bool IsPipelineCreationCacheControlSupported() const {
-        return vk13_features.pipelineCreationCacheControl;
-    }
-
-    /// port: VK_KHR_pipeline_executable_properties is on (ISSN_WAVE_STATS=1, vk_wave_stats.h).
-    bool IsPipelineExecutableInfoEnabled() const {
-        return pipeline_executable_properties &&
-               pipeline_executable_features.pipelineExecutableInfo;
-    }
-
-    /// port: VK_AMD_shader_info is on (statistics and ISA per stage, ISSN_WAVE_STATS=1).
-    bool IsAmdShaderInfoEnabled() const {
-        return amd_shader_info;
-    }
-
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
     bool IsWorkgroupMemoryExplicitLayoutSupported() const {
         return workgroup_memory_explicit_layout &&
@@ -298,26 +314,6 @@ public:
     /// Returns true when tessellation is supported by the device
     bool IsTessellationSupported() const {
         return features.tessellationShader;
-    }
-
-    /// Returns true when the shaderSubgroupClock feature of
-    /// port: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
-    /// products, linear compute derivatives, extended storage image formats).
-    bool IsFsr4Int8Supported() const {
-        return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
-               vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
-               compute_shader_derivatives_features.computeDerivativeGroupLinear &&
-               features.shaderStorageImageExtendedFormats;
-    }
-
-    /// port: FSR 4.1.1 (INT8 model passes and VK_VALVE_shader_mixed_float_dot_product).
-    bool IsFsr411Supported() const {
-        return IsFsr4Int8Supported() && mixed_float_dot_product;
-    }
-
-    /// VK_KHR_shader_clock is supported.
-    bool IsShaderSubgroupClockSupported() const {
-        return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
     /// Returns the vendor ID of the physical device
@@ -375,12 +371,17 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
+    ///  Returns the maximum size of uniform buffers.
+    vk::DeviceSize UniformMaxSize() const {
+        return properties.limits.maxUniformBufferRange;
+    }
+
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
         return properties.limits.minStorageBufferOffsetAlignment;
     }
 
-    /// Returns the minimum alignment required for accessing host-mapped device memory
+    /// Returns the minimum alignemt required for accessing host-mapped device memory
     vk::DeviceSize NonCoherentAtomSize() const {
         return properties.limits.nonCoherentAtomSize;
     }
@@ -388,6 +389,11 @@ public:
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
         return vk11_props.subgroupSize;
+    }
+
+    /// Returns the largest single memory allocation the device reports (Vulkan 1.1).
+    vk::DeviceSize MaxMemoryAllocationSize() const {
+        return vk11_props.maxMemoryAllocationSize;
     }
 
     /// Returns the maximum size of compute shared memory.
@@ -410,17 +416,17 @@ public:
         return push_descriptor_props.maxPushDescriptors;
     }
 
-    /// Returns the maximum size of a single VkDeviceMemory
-    vk::DeviceSize MaxMemoryAllocationSize() const {
-        return vk11_props.maxMemoryAllocationSize;
-    }
-
     /// Returns the vulkan 1.2 physical device properties.
     const vk::PhysicalDeviceVulkan12Properties& GetVk12Properties() const noexcept {
         return vk12_props;
     }
 
     /// Returns the memory properties of the physical device.
+    /// SHADPS4_HOST_MIRROR: VK_EXT_external_memory_host enabled on the device.
+    bool IsExternalMemoryHostEnabled() const noexcept {
+        return external_memory_host;
+    }
+
     const vk::PhysicalDeviceMemoryProperties& GetMemoryProperties() const noexcept {
         return memory_properties;
     }
@@ -489,11 +495,6 @@ public:
                image_2d_view_of_3d_features.sampler2DViewOf3D;
     }
 
-    /// port: BP06. True only when the backport is on and the device enabled the extension + feature.
-    bool IsMaximalReconvergenceSupported() const {
-        return maximal_reconvergence;
-    }
-
     /// Returns whether VK_EXT_image_view_min_lod is supported.
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
@@ -504,32 +505,69 @@ public:
         return supports_memory_budget;
     }
 
+    /// SHADPS4_NATIVE_BINDLESS=1 and the device has the descriptor-indexing features the global
+    /// sampled-image / sampler arrays need (enabled at device creation; sec. 12).
+    bool IsBindlessSupported() const {
+        return bindless_supported;
+    }
+
+    /// Returns true when the opt-in VK_EXT_descriptor_heap guest binding model is in use.
+    /// Fixed before any guest pipeline, buffer, image view or sampler is created.
+    bool IsNativeBindingsActive() const {
+        return native_bindings_active;
+    }
+
+    /// Startup fallback to the legacy model when the heaps themselves cannot be set up.
+    void DeactivateNativeBindings() const {
+        native_bindings_active = false;
+    }
+
+    const NativeBindingLayout& GetNativeBindingLayout() const {
+        return native_binding_layout;
+    }
+
+    const NativeApi::Functions& GetNativeApi() const {
+        return native_api;
+    }
+
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
-
-    /// port: the driver's current budget of the heaps GetDeviceMemoryUsage counts
-    /// (VK_EXT_memory_budget: what this process can use now, other processes included).
-    [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
     }
 
+    /// SHADPS4_SIM_VRAM_MB (test switch, v1.0.2): the video memory size this run pretends to have
+    /// (0 = off). The BIG_GROW size choice reads it in place of the real heap size.
+    [[nodiscard]] u64 SimVramBytes() const {
+        return sim_vram_bytes;
+    }
+
+    /// The ballast buffers of SHADPS4_SIM_VRAM_MB; the buffer cache fills them once on the GPU so
+    /// the driver makes them resident.
+    [[nodiscard]] const std::vector<vk::Buffer>& SimBallastBuffers() const {
+        return sim_ballast_buffers;
+    }
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
 private:
-    Instance(const Frontend::WindowSystemInfo&, s32, bool, bool);
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
 
+    /// Checks SHADPS4_NATIVE_BINDINGS and the device's descriptor heap capabilities, and
+    /// derives the heap layout. Returns false, with the reason logged, to stay legacy.
+    bool QueryNativeBindings();
+
     /// Collects various information from the device.
     void CollectDeviceParameters();
     void CollectPhysicalMemoryInfo();
+    void CreateSimBallast();
     void CollectImageFormatInfo();
     void CollectToolingInfo() const;
 
@@ -542,12 +580,14 @@ private:
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;
     vk::PhysicalDeviceMemoryProperties memory_properties;
+    bool external_memory_host{};
     vk::PhysicalDeviceVulkan11Properties vk11_props;
     vk::PhysicalDeviceVulkan12Properties vk12_props;
     vk::PhysicalDeviceVulkan13Properties vk13_props;
     vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
     vk::PhysicalDeviceFeatures features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
+    bool bindless_supported{};
     vk::PhysicalDeviceVulkan13Features vk13_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
@@ -555,15 +595,22 @@ private:
         workgroup_memory_explicit_layout_features;
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
-    vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
-    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features;
-    vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    vk::UniqueDebugUtilsMessengerEXT addr_bind_callback{}; ///< SHADPS4_ADDR_BIND_REPORT=1
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    bool has_readback_queue{};
+    bool readback_family_concurrent{};
+    bool has_asc_queue{};
+    bool has_asc_lane{};
+    vk::Queue asc_queue{};
+    bool has_retry_queue{};
+    vk::Queue retry_queue{};
+    u32 readback_queue_family{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -588,24 +635,23 @@ private:
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
-    bool maintenance_5{};
-    bool pipeline_binaries{};
-    vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};
     bool maintenance_8{};
+    bool maintenance_7{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
-    bool maximal_reconvergence{};
-    bool shader_clock{};
-    bool pipeline_executable_properties{}; // port: ISSN_WAVE_STATS=1 (vk_wave_stats.h)
-    bool amd_shader_info{};                // port: with it, VK_AMD_shader_info when present
-    bool compute_shader_derivatives{};
-    bool mixed_float_dot_product{}; // port: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool supports_memory_budget{};
-    bool pageable_device_local_memory{};
+    bool device_fault{}; ///< SHADPS4_DEVICE_FAULT=1 and VK_EXT_device_fault enabled
+    bool addr_bind_report{}; ///< SHADPS4_ADDR_BIND_REPORT=1 and the extension enabled
     bool supports_block_texel_view{};
+    mutable bool native_bindings_active{};
+    NativeBindingLayout native_binding_layout{};
+    NativeApi::Functions native_api{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
+    u64 sim_vram_bytes{};
+    std::vector<vk::Buffer> sim_ballast_buffers;
+    std::vector<VmaAllocation> sim_ballast_allocations;
 };
 
 } // namespace Vulkan

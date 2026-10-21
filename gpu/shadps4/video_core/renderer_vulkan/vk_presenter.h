@@ -3,15 +3,13 @@
 
 #pragma once
 
-#include <deque>
-
+#include <algorithm>
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -83,7 +81,11 @@ public:
 
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
-        vo_buffers_addr.emplace_back(cpu_address);
+        // Registering the same address twice would grow this vector without bound; it is only
+        // ever linear-scanned by IsVideoOutSurface and nothing removes entries from it.
+        if (std::ranges::find(vo_buffers_addr, cpu_address) == vo_buffers_addr.cend()) {
+            vo_buffers_addr.emplace_back(cpu_address);
+        }
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
@@ -98,10 +100,13 @@ public:
 
     Frame* PrepareBlankFrame(bool present_thread);
 
-    void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
-    /// port: a black frame with the loading screen (IssnOverlay::SetLoading) only.
-    void PresentLoadingFrame();
+    void Present(Frame* frame, bool is_reusing_frame = false);
     Frame* PrepareLastFrame();
+
+    /// SHADPS4_BOOT_SCREEN: one overlay-only frame during WarmUp (inside this constructor, main
+    /// thread); uses only the members built before the rasterizer. Waits for it on the GPU.
+    void DrawBootScreen(std::string_view headline, std::string_view detail, float fraction,
+                        bool one_time);
 
 private:
     Frame* GetRenderFrame();
@@ -123,11 +128,9 @@ private:
     HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
-    std::deque<u64> recent_frame_ticks; ///< port: ISSN_FRAMES_AHEAD bound (PrepareFrame)
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
     Swapchain swapchain;
-    Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;

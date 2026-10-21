@@ -3,9 +3,7 @@
 
 #pragma once
 
-#include <vector>
 #include "shader_recompiler/ir/basic_block.h"
-#include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
 
 namespace Shader {
@@ -15,29 +13,13 @@ void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_inf
 
 namespace Shader::Optimization {
 
-void SsaRewritePass(IR::Program& program);
-void SsaRepairPass(IR::Program& program);
-void PhiSimplificationPass(IR::Program& program);
-void InverseBallotEliminationPass(IR::Program& program);
-void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
-                           const Profile& profile);
-/// Blocks outside divergent control flow (the ones whose wave64 lane operations are lowered).
-std::vector<IR::Block*> FindWave64UniformBlocks(const IR::Program& program);
-/// port: an instruction whose value differs between the lanes of one wave no matter its inputs
-/// (LocalInvocationId; with ISSN_LANE_DIVERGENCE also LocalInvocationIndex, LaneId, the v_mbcnt
-/// lane mask and atomic results). Divergence searches stop there.
-bool IsLaneVaryingSource(const IR::Inst& inst);
-void LowerHardwareIntrinsics(IR::Program& program);
-void LowerPhisToRegsPass(IR::Program& program);
+void SsaRewritePass(IR::BlockList& program);
+void IdentityRemovalPass(IR::BlockList& program);
 void DeadCodeEliminationPass(IR::Program& program);
-/// port: exact integers from interpolated float varyings on GPUs without manual interpolation.
-void InterpolatedIntegerPass(IR::Program& program);
 void ConstantPropagationPass(IR::BlockList& program);
 void FlattenExtendedUserdataPass(IR::Program& program);
 void ReadLaneEliminationPass(IR::Program& program);
-ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& profile);
-void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& sharp_usages,
-                          const Profile& profile);
+void ResourceTrackingPass(IR::Program& program, const Profile& profile);
 void CollectShaderInfoPass(IR::Program& program, const Profile& profile);
 void LowerBufferFormatToRaw(IR::Program& program);
 void LowerUserClipPlanes(IR::Program& program, const RuntimeInfo& runtime_info);
@@ -48,8 +30,6 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info);
 void DomainShaderTransform(const IR::Program& program, const RuntimeInfo& runtime_info);
 void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_info,
                              const Profile& profile);
-void WaveMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_info,
-                           const Profile& profile);
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile);
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile);

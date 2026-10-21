@@ -7,10 +7,7 @@
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/vk_common.h"
-#include "video_core/texture_cache/issn_bc_decode.h"
 #include "video_core/texture_cache/types.h"
-
-#include <optional>
 
 namespace AmdGpu {
 struct ColorBuffer;
@@ -36,11 +33,6 @@ struct ImageProperties {
     u32 is_block : 1;
     u32 is_depth : 1;
     u32 has_stencil : 1;
-    /// port: block-compressed 1D image: still 1D for the cache, a 2D image of height 1 in Vulkan.
-    u32 is_host_2d : 1;
-    /// port: tiny BC1-BC5 image (ISSN_BC_TINY): guest layout stays block-compressed (is_block),
-    /// the host image is the plain pixel_format, filled from a CPU decode (issn_bc_decode.h).
-    u32 is_bc_decoded : 1;
 };
 
 struct ImageInfo {
@@ -75,16 +67,11 @@ struct ImageInfo {
 
     ImageProperties props{};
     vk::Format pixel_format = vk::Format::eUndefined;
-    /// port: the guest's BC format of an is_bc_decoded image (pixel_format is the decoded one).
-    vk::Format bc_format = vk::Format::eUndefined;
     AmdGpu::ImageType type;
     SubresourceExtent resources;
     Extent3D size{1, 1, 1};
     u32 num_bits{};
     u32 num_samples = 1;
-    /// port: the guest's sample count, for sizes in guest memory (ISSN_NO_MSAA makes
-    /// num_samples 1; see video_core/amdgpu/issn_msaa.h).
-    u32 guest_samples = 1;
     u32 pitch{};
     AmdGpu::TileMode tile_mode = AmdGpu::TileMode::DisplayLinearAligned;
     AmdGpu::ArrayMode array_mode = AmdGpu::ArrayMode::ArrayLinearAligned;
@@ -103,12 +90,5 @@ struct ImageInfo {
     VAddr stencil_addr{};
     u32 stencil_size{};
 };
-
-/// port: ISSN_BC_TINY: the plain format a tiny image of this BC format is decoded to (sRGB and
-/// snorm kept), or eUndefined when the CPU decoder does not handle it.
-vk::Format BcTinyDecodedFormat(vk::Format format) noexcept;
-
-/// port: ISSN_BC_TINY: the decoder for a BC format, if it has one.
-std::optional<BcDecode::Kind> BcTinyDecodeKind(vk::Format format) noexcept;
 
 } // namespace VideoCore

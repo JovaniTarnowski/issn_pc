@@ -1,11 +1,9 @@
 //  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "issn_graphics.h"
 #include "common/assert.h"
 #include "core/emulator_settings.h"
-#include "video_core/host_shaders/fsr_easu_comp.h"
-#include "video_core/host_shaders/fsr_rcas_comp.h"
+#include "video_core/host_shaders/fsr_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -78,11 +76,19 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
         .size = sizeof(FSRConstants),
     };
 
-    const auto& cs_easu_module = CompileSPV(FSR_EASU_COMP, device);
+    const auto& cs_easu_module =
+        Compile(HostShaders::FSR_COMP, vk::ShaderStageFlagBits::eCompute, device,
+                {
+                    "SAMPLE_EASU=1",
+                });
     ASSERT(cs_easu_module);
     SetObjectName(device, cs_easu_module, "fsr.comp [EASU]");
 
-    const auto& cs_rcas_module = CompileSPV(FSR_RCAS_COMP, device);
+    const auto& cs_rcas_module =
+        Compile(HostShaders::FSR_COMP, vk::ShaderStageFlagBits::eCompute, device,
+                {
+                    "SAMPLE_RCAS=1",
+                });
     ASSERT(cs_rcas_module);
     SetObjectName(device, cs_rcas_module, "fsr.comp [RCAS]");
 
@@ -133,10 +139,11 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
 vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                               vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
                               bool hdr) {
-    // port: FSR 1 upscales when the window is larger; RCAS alone also runs at the same size.
-    if (!IssnGraphics::FsrPassRuns(settings.enable, settings.use_rcas, int(input_size.width),
-                                   int(input_size.height), int(output_size.width),
-                                   int(output_size.height))) {
+    if (!settings.enable) {
+        DebugState.is_using_fsr = false;
+        return input;
+    }
+    if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
         DebugState.is_using_fsr = false;
         return input;
     }

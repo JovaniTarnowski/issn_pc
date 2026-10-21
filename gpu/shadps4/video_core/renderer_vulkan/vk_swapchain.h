@@ -14,6 +14,11 @@ class WindowSDL;
 
 namespace Vulkan {
 
+/// SHADPS4_SWAPCHAIN_SAFE_WAIT=1: swapchain rebuilds wait on an empty fenced submit to the present /
+/// graphics queue (submitted under Scheduler::submit_mutex, waited outside it) instead of
+/// vkDeviceWaitIdle (vk_swapchain.cpp); ImGui texture destroys wait for their queue only.
+bool SwapchainSafeWait();
+
 class Instance;
 class Scheduler;
 
@@ -88,10 +93,6 @@ public:
 
     void SetHDR(bool hdr);
 
-    /// port: VSync from the in-game menu (IssnSettings::vsync); recreates the swapchain when it
-    /// changed. Present thread only.
-    void UpdateVsync();
-
     bool GetHDR() const {
         return needs_hdr;
     }
@@ -123,7 +124,6 @@ private:
     vk::SurfaceFormatKHR surface_format;
     vk::Format view_format;
     vk::PresentModeKHR present_mode;
-    bool vsync = true; ///< the setting present_mode was chosen for
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;

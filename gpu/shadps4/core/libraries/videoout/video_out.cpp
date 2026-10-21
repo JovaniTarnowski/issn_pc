@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
-#include <cstdlib>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -14,7 +12,6 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
-#include "issn_freeze.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
@@ -143,19 +140,7 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    // issn: inFAMOUS Second Son asks for 30 Hz flips (rate 1) in game; ISSN_FLIP_RATE=0 keeps
-    // 60 Hz so a PC that renders faster than 30 FPS shows it (the game runs on real time).
-    static const char* forced = std::getenv("ISSN_FLIP_RATE");
-    const s32 applied = forced && *forced ? std::atoi(forced) : rate;
-    static s32 last_logged = -1;
-    if (rate != last_logged) {
-        last_logged = rate;
-        std::printf("VideoOut: the game asks for flip rate %d (%s)%s\n", rate,
-                    rate == 0 ? "60 Hz" : rate == 1 ? "30 Hz" : "20 Hz",
-                    applied != rate ? "; ISSN_FLIP_RATE overrides it" : "");
-        std::fflush(stdout);
-    }
-    driver->GetPort(handle)->flip_rate = applied;
+    driver->GetPort(handle)->flip_rate = rate;
     return ORBIS_OK;
 }
 
@@ -392,8 +377,6 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    IssnFreeze::WaitScope wait{"vblank", nullptr, nullptr,
-                              reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0))};
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
@@ -495,10 +478,6 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVideoOutSetBufferAttribute);
     LIB_FUNCTION("6kPnj51T62Y", "libSceVideoOut", 1, "libSceVideoOut",
                  sceVideoOutGetResolutionStatus);
-    LIB_FUNCTION("8XGijEoThE0", "libSceVideoOut", 1, "libSceVideoOut",
-                 sceVideoOutGetResolutionStatus); // sceVideoOutSysGetResolutionStatus
-    LIB_FUNCTION("Ek+VR4lcJQI", "libSceVideoOut", 1, "libSceVideoOut",
-                 sceVideoOutAddVblankEvent); // sceVideoOutSysAddVblankEvent
     LIB_FUNCTION("Up36PTk687E", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutOpen);
     LIB_FUNCTION("zgXifHT9ErY", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutIsFlipPending);
     LIB_FUNCTION("N5KDtkIjjJ4", "libSceVideoOut", 1, "libSceVideoOut",
@@ -507,7 +486,6 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVideoOutGetBufferLabelAddress);
     LIB_FUNCTION("uquVH4-Du78", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutClose);
     LIB_FUNCTION("1FZBKy8HeNU", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetVblankStatus);
-    LIB_FUNCTION("d1AjT2uZJn0", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetVblankStatus);
     LIB_FUNCTION("kGVLc3htQE8", "libSceVideoOut", 1, "libSceVideoOut",
                  sceVideoOutGetDeviceCapabilityInfo);
     LIB_FUNCTION("j6RaAUlaLv0", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutWaitVblank);

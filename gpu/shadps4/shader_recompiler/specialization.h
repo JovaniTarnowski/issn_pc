@@ -23,18 +23,25 @@ struct VsAttribSpecialization {
 
 struct BufferSpecialization {
     u32 stride : 14;
+    u32 is_storage : 1;
     u32 is_formatted : 1;
     u32 swizzle_enable : 1;
     u32 data_format : 6;
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    // The V#'s add_tid_enable changes the address math (CalculateBufferAddress adds the lane id
+    // to the index). Keyed since 2026-10-07 (SHADPS4_PRECOMPILE review finding 3) in the spare
+    // bit, so the struct (serialized raw in the shader meta) keeps its size; every older meta has
+    // it 0 (value-initialized), as had every cached sharp counted (0 of 4,371).
+    u32 add_tid_enable : 1;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
-        return stride == other.stride && is_formatted == other.is_formatted &&
-               swizzle_enable == other.swizzle_enable &&
+        return stride == other.stride && is_storage == other.is_storage &&
+               is_formatted == other.is_formatted && swizzle_enable == other.swizzle_enable &&
+               add_tid_enable == other.add_tid_enable &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
                  dst_select == other.dst_select && num_conversion == other.num_conversion)) &&
@@ -42,12 +49,18 @@ struct BufferSpecialization {
                 (index_stride == other.index_stride && element_size == other.element_size));
     }
 };
+// Serialized raw in every shader meta: a size change would invalidate the whole cache.
+static_assert(sizeof(BufferSpecialization) == 12);
 
 struct ImageSpecialization {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
     bool is_integer = false;
     bool is_storage = false;
+    bool is_cube = false;
     bool is_srgb = false;
+    // Guest type stays in `type` because it decides address VGPR decoding; this decides the host
+    // image dimensionality, which differs for block-compressed 1D. Both are part of the key.
+    bool is_block_1d = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
@@ -95,7 +108,7 @@ struct StageSpecialization {
                         Backend::Bindings start_)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
         fetch_shader_data = Gcn::ParseFetchShader(info_);
-        if (info_.sw_stage == SwStage::Vertex && fetch_shader_data) {
+        if (info_.stage == Stage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data->attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
@@ -103,9 +116,9 @@ struct StageSpecialization {
                              if (const auto step_rate = desc.GetStepRate();
                                  step_rate != InstanceIdType::None) {
                                  spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.sw.vs.step_rate_0
+                                                    ? runtime_info.vs_info.step_rate_0
                                                     : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.sw.vs.step_rate_1
+                                                           ? runtime_info.vs_info.step_rate_1
                                                            : 1);
                              }
                              spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
@@ -116,8 +129,10 @@ struct StageSpecialization {
         ForEachSharp(binding, buffers, info->buffers,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
+                         spec.is_storage = desc.IsStorage(sharp);
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
+                         spec.add_tid_enable = sharp.add_tid_enable;
                          if (spec.is_formatted) {
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
@@ -131,9 +146,11 @@ struct StageSpecialization {
                      });
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.type = sharp.GetHostViewType(desc.is_array);
+                         spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
+                         spec.is_cube = sharp.IsCube();
+                         spec.is_block_1d = sharp.IsBlockCoded1D();
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
                          } else {
@@ -154,8 +171,8 @@ struct StageSpecialization {
                      });
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes
-        if (info->sw_stage == SwStage::TessellationControl ||
-            info->sw_stage == SwStage::TessellationEval) {
+        if (info->l_stage == LogicalStage::TessellationControl ||
+            info->l_stage == LogicalStage::TessellationEval) {
             TessellationDataConstantBuffer tess_constants{};
             info->ReadTessConstantBuffer(tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstring>
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -10,11 +12,20 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 
 #include <miniz.h>
 
+#include <atomic>
+#include <string>
+#include <unordered_map>
+#include <chrono>
 #include <condition_variable>
-#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <system_error>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -31,81 +42,21 @@ std::mutex m_request{};
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
 
-#ifdef ISSN_SHADER_CACHE_KEY
-// port: the GPU user folder used to be chosen at load time, before the probe set
-// ISSN_GPU_USER_DIR: ~/.local/share/shadPS4 on Linux (shadPS4's own folder) and <saves>/user on
-// Windows. On the first start with the port's folder, this game's cache for the current key is
-// moved here once, so nothing is recompiled. Only that <serial>-<key> folder is taken; nothing
-// else in the shadPS4 folder is touched (an installed shadPS4 emulator may own it).
-void MigrateLegacyCache(const std::filesystem::path& cache_path) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    if (fs::exists(cache_path, ec)) {
-        return;
-    }
-    const auto name = cache_path.filename();
-    std::vector<fs::path> sources{Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "user" /
-                                  "cache" / name};
-#ifndef _WIN32
-    if (const char* data = std::getenv("XDG_DATA_HOME"); data && data[0]) {
-        sources.push_back(fs::path{data} / "shadPS4" / "cache" / name);
-    } else if (const char* home = std::getenv("HOME"); home && home[0]) {
-        sources.push_back(fs::path{home} / ".local" / "share" / "shadPS4" / "cache" / name);
-    }
-#endif
-    for (const auto& source : sources) {
-        if (!fs::is_directory(source, ec)) {
-            continue;
-        }
-        fs::create_directories(cache_path.parent_path(), ec);
-        fs::rename(source, cache_path, ec);
-        if (ec) {
-            // Another file system: copy, then delete the old folder only if the copy is whole.
-            ec.clear();
-            fs::copy(source, cache_path, fs::copy_options::recursive, ec);
-            if (ec) {
-                LOG_WARNING(Render, "Shader cache: could not move {} here ({}); rebuilding it",
-                            source.string(), ec.message());
-                fs::remove_all(cache_path, ec);
-                return;
-            }
-            fs::remove_all(source, ec);
-        }
-        LOG_INFO(Render, "Shader cache moved from {} to {}", source.string(), cache_path.string());
-        return;
-    }
-}
+// SHADPS4_CACHE_PREFETCH=2 (2026-10-16): file name -> bytes of every .key / .meta read by the
+// prefetch, until FinishPreload. Opening a cache file costs ~3-8 ms while the antivirus has no
+// verdict cached for it (measured 10-16 on files made that day); WarmUp then opens none of them.
+std::unordered_map<std::string, std::vector<u8>> g_prefetched{};
 
-// port: shaders translated by an older recompiler are never reused: this game's folders of other
-// keys (and the unkeyed <serial>) are removed, in the port's own cache folder only.
-void PruneOtherRevisions(const std::filesystem::path& cache_path) {
-    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
-    const auto name = cache_path.filename().string();
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(cache_path.parent_path(), ec)) {
-        const auto other = entry.path().filename().string();
-        if (entry.is_directory(ec) && other != name &&
-            (other == serial || other.rfind(serial + "-", 0) == 0)) {
-            LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
-            std::filesystem::remove_all(entry.path(), ec);
-        }
-    }
+std::string BlobFileName(const std::string& name, std::string_view ext) {
+    std::string file_name;
+    file_name.reserve(name.size() + 1 + ext.size());
+    file_name.append(name).append(1, '.').append(ext);
+    return file_name;
 }
-#endif
 
 } // namespace
 
 namespace Storage {
-
-std::filesystem::path GameCacheDir() {
-    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
-#ifdef ISSN_SHADER_CACHE_KEY
-    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + ISSN_SHADER_CACHE_KEY);
-#else
-    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
-#endif
-}
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
@@ -160,19 +111,33 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
-void DataBase::Open() {
+void DataBase::Open(bool native_bindings) {
     if (opened) {
         return;
     }
 
     const auto& game_info = Common::ElfInfo::Instance();
+    // Keep experimental binding-model caches separate from the playable legacy cache.
+    // Shader metadata and permutation-indexed binaries must come from the same namespace.
+    // Builds on either side of the ShaderBinaryVersion 3 -> 4 bump share this folder: version 4
+    // accepts every version-3 entry except GDS shaders (LoadShaderMeta), so only those few
+    // recompile when the user alternates builds. (A per-version folder seeded by a copy was
+    // tried on 2026-10-07: the copy of ~38,000 files took 120 s at first launch.)
+    auto cache_name = std::string{game_info.GameSerial()} +
+                      (native_bindings ? "_native_bindings_v1" : "");
+    // SHADPS4_CACHE_NAME (2026-10-07): another folder / archive name, e.g. a copy for test runs
+    // that write entries the user's own cache should not get.
+    if (const char* name = std::getenv("SHADPS4_CACHE_NAME"); name && *name) {
+        cache_name = name;
+        LOG_INFO(Render, "Pipeline cache name from SHADPS4_CACHE_NAME: {}", cache_name);
+    }
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
-                     std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
+                     std::filesystem::path{cache_name}.replace_extension(".zip");
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -183,11 +148,7 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GameCacheDir();
-#ifdef ISSN_SHADER_CACHE_KEY
-        MigrateLegacyCache(cache_path);
-        PruneOtherRevisions(cache_path);
-#endif
+        cache_path = GetUserPath(PathType::CacheDir) / cache_name;
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
@@ -228,20 +189,9 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
-                // port: write beside and rename into place, so a game that ends during the
-                // write (the queue is not drained at exit) never leaves a truncated blob that
-                // the next start would load.
                 using namespace Common::FS;
-                auto temp{path};
-                temp += ".tmp";
-                {
-                    const auto file = IOFile{temp, FileAccessMode::Create};
-                    if (!file.IsOpen() || file.Write(v) != v.size()) {
-                        return;
-                    }
-                }
-                std::error_code error;
-                std::filesystem::rename(temp, path, error);
+                const auto file = IOFile{path, FileAccessMode::Create};
+                file.Write(v);
             }
         }};
         std::scoped_lock lock{m_request};
@@ -300,6 +250,13 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
     if (!opened) {
         return;
     }
+    if (!g_prefetched.empty()) {
+        if (const auto it = g_prefetched.find(BlobFileName(name, GetBlobFileExtension(type)));
+            it != g_prefetched.end()) {
+            data = it->second;
+            return;
+        }
+    }
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
@@ -310,37 +267,21 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     if (!opened) {
         return;
     }
+    if (!g_prefetched.empty()) {
+        if (const auto it = g_prefetched.find(BlobFileName(name, GetBlobFileExtension(type)));
+            it != g_prefetched.end()) {
+            data.resize(it->second.size() / sizeof(u32));
+            std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
+            return;
+        }
+    }
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
     return LoadVector(type, path, data);
 }
 
-size_t DataBase::CountBlobs(BlobType type) {
-    const auto& ext = GetBlobFileExtension(type);
-    size_t count = 0;
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
-        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
-        for (int index = 0; index < num_files; ++index) {
-            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
-            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
-            count += std::string{file_name.data()}.ends_with(ext);
-        }
-        return count;
-    }
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator{cache_path, error}) {
-        count += entry.path().extension().string().ends_with(ext);
-    }
-    return count;
-}
-
-bool DataBase::ConcurrentReads() const {
-    return !EmulatorSettings.IsPipelineCacheArchived();
-}
-
-void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func,
-                           const std::function<bool()>& stop) {
+void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
     const auto& ext = GetBlobFileExtension(type);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
@@ -358,10 +299,14 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
         }
     } else {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
-            if (stop && stop()) {
-                return;
-            }
             if (file_name.path().extension().string().ends_with(ext)) {
+                if (!g_prefetched.empty()) {
+                    if (const auto it = g_prefetched.find(file_name.path().filename().string());
+                        it != g_prefetched.end()) {
+                        func(std::vector<u8>(it->second));
+                        continue;
+                    }
+                }
                 using namespace Common::FS;
                 const auto& file = IOFile{file_name, FileAccessMode::Read};
                 if (file.IsOpen()) {
@@ -374,44 +319,128 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     }
 }
 
-void DataBase::ForEachBlobName(BlobType type,
-                               const std::function<void(std::string_view name)>& func) {
-    const auto ext = "." + GetBlobFileExtension(type);
-    const auto visit = [&](std::string_view name) {
-        if (name.ends_with(ext)) {
-            func(name.substr(0, name.size() - ext.size()));
-        }
-    };
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
-        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
-        for (int index = 0; index < num_files; ++index) {
-            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
-            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
-            visit(file_name.data());
-        }
+void DataBase::Prefetch(const std::function<void(u64 done, u64 total)>& progress) {
+    // The first open of a cache file is slow (~3.7 ms each on the user's PC, 2026-10-07: 38,368
+    // files took 141 s on one thread and 13.2 s on 16; a second pass 3.0 s). WarmUp opens every blob
+    // one by one, so a build's first launch, or any launch after the files' scan results expired,
+    // showed a black screen for minutes. Reading them once on many threads first makes that serial
+    // loop hit warm files.
+    const char* env = std::getenv("SHADPS4_CACHE_PREFETCH");
+    if (!opened || !env || (env[0] != '1' && env[0] != '2' && env[0] != '3') ||
+        EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator{cache_path, error}) {
-        visit(entry.path().filename().string());
+    const bool keep = env[0] == '2' || env[0] == '3';
+    const bool keep_spv = env[0] == '3';
+    const auto t_start = std::chrono::steady_clock::now();
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        if (entry.is_regular_file(ec)) {
+            files.push_back(entry.path());
+        }
     }
+    constexpr u32 NumThreads = 16;
+    std::atomic<size_t> next{0};
+    std::atomic<u64> bytes{0};
+    // =2: one slot per file, written only by the thread that took that index.
+    std::vector<std::vector<u8>> kept(keep ? files.size() : 0);
+    std::vector<char> keep_file(files.size(), 0);
+    if (keep) {
+        for (size_t i = 0; i < files.size(); ++i) {
+            const auto ext = files[i].extension();
+            keep_file[i] = ext == ".key" || ext == ".meta" || (keep_spv && ext == ".spv");
+        }
+    }
+    {
+        std::vector<std::jthread> threads;
+        for (u32 t = 0; t < NumThreads; ++t) {
+            threads.emplace_back([&] {
+                std::vector<char> buffer(64 * 1024);
+                for (size_t i = next.fetch_add(1); i < files.size(); i = next.fetch_add(1)) {
+                    if (keep_file[i]) {
+                        std::ifstream file(files[i], std::ios::binary | std::ios::ate);
+                        if (!file) {
+                            continue;
+                        }
+                        auto& out = kept[i];
+                        out.resize(static_cast<size_t>(file.tellg()));
+                        file.seekg(0);
+                        file.read(reinterpret_cast<char*>(out.data()),
+                                  static_cast<std::streamsize>(out.size()));
+                        if (!file) {
+                            out.clear();
+                            keep_file[i] = 0; // left to an ordinary load
+                            continue;
+                        }
+                        bytes.fetch_add(out.size(), std::memory_order_relaxed);
+                        continue;
+                    }
+                    std::ifstream file(files[i], std::ios::binary);
+                    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
+                        bytes.fetch_add(static_cast<u64>(file.gcount()), std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        // Boot screen (2026-10-17): the caller's thread reports progress while the readers work.
+        if (progress) {
+            for (size_t taken = next.load(); taken < files.size(); taken = next.load()) {
+                progress(taken, files.size());
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            }
+        }
+    } // joins
+    if (keep) {
+        g_prefetched.reserve(files.size());
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (keep_file[i]) {
+                g_prefetched.emplace(files[i].filename().string(), std::move(kept[i]));
+            }
+        }
+        LOG_INFO(Render, "Pipeline cache prefetch: {} files kept in memory ({})", g_prefetched.size(),
+                 keep_spv ? "keys, metas, SPIR-V" : "keys, metas");
+    }
+    LOG_INFO(Render, "Pipeline cache prefetch: {} files, {} MB read on {} threads in {} ms",
+             files.size(), bytes.load() >> 20, NumThreads,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t_start)
+                 .count());
 }
 
-void DataBase::Clear() {
+size_t DataBase::CountBlobs(BlobType type) const {
     if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
-        return;
+        return 0;
+    }
+    const auto ext = GetBlobFileExtension(type);
+    size_t count = 0;
+    if (!g_prefetched.empty() && (ext == "key" || ext == "meta")) {
+        for (const auto& [name, bytes] : g_prefetched) {
+            count += name.ends_with(ext) ? 1 : 0;
+        }
+        return count;
     }
     std::error_code ec;
-    u64 removed = 0;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
-        if (entry.is_regular_file(ec) && std::filesystem::remove(entry.path(), ec)) {
-            ++removed;
-        }
+        count += entry.path().extension().string().ends_with(ext) ? 1 : 0;
     }
-    LOG_WARNING(Render, "Pipeline cache cleared ({} files): it is rebuilt for this build", removed);
+    return count;
+}
+
+std::filesystem::path DataBase::SidecarPath(std::string_view file_name) const {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return {};
+    }
+    return cache_path / file_name;
+}
+
+const std::vector<u8>* DataBase::Prefetched(const std::string& file_name) const {
+    const auto it = g_prefetched.find(file_name);
+    return it != g_prefetched.end() ? &it->second : nullptr;
 }
 
 void DataBase::FinishPreload() {
+    std::unordered_map<std::string, std::vector<u8>>{}.swap(g_prefetched);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

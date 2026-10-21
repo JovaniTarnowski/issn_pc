@@ -9,7 +9,7 @@
 namespace VideoCore {
 
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
-                 const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth, float extra_lod_bias) {
+                 const AmdGpu::BorderColorBuffer border_color_base) {
     using namespace Vulkan;
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
                                    (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
@@ -24,7 +24,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         border_color = vk::BorderColor::eFloatOpaqueBlack;
     }
 
-    const auto custom_color = [&]() -> std::optional<vk::SamplerCustomBorderColorCreateInfoEXT> {
+    auto custom_color = [&]() -> std::optional<vk::SamplerCustomBorderColorCreateInfoEXT> {
         if (border_color == vk::BorderColor::eFloatCustomEXT) {
             const auto border_color_index = sampler.border_color_ptr.Value();
             const auto border_color_buffer = border_color_base.Address<std::array<float, 4>*>();
@@ -43,6 +43,22 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         }
     }();
 
+    // Descriptor heaps take custom border colours by registered index. Never substitute a
+    // different colour if registration fails: that would silently alter native-mode rendering.
+    auto* native_bindings = instance.IsNativeBindingsActive() ? NativeBindings::Get() : nullptr;
+    NativeApi::SamplerCustomBorderColorIndexCreateInfo border_index_ci = {
+        .sType = NativeApi::StructureTypeSamplerCustomBorderColorIndexCreateInfo,
+    };
+    if (native_bindings && custom_color) {
+        if (native_bindings->RegisterBorderColor(*custom_color, native.border_index)) {
+            native.border_registered = true;
+            border_index_ci.index = native.border_index;
+            custom_color->pNext = &border_index_ci;
+        } else {
+            UNREACHABLE_MSG("NativeBindings: custom border color registration failed");
+        }
+    }
+
     const vk::SamplerCreateInfo sampler_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
@@ -51,12 +67,10 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = std::clamp(sampler.LodBias() + extra_lod_bias, -instance.MaxSamplerLodBias(),
-                                 instance.MaxSamplerLodBias()),
+        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
-        // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.
-        .compareEnable = is_depth,
+        .compareEnable = sampler.depth_compare_func != AmdGpu::DepthCompare::Never,
         .compareOp = LiverpoolToVK::DepthCompare(sampler.depth_compare_func),
         .minLod = sampler.MinLod(),
         .maxLod = sampler.MaxLod(),
@@ -67,6 +81,17 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
     ASSERT_MSG(sampler_result == vk::Result::eSuccess, "Failed to create sampler: {}",
                vk::to_string(sampler_result));
     handle = std::move(smplr);
+
+    if (native_bindings) {
+        native.sampler_ci = sampler_ci;
+        native.sampler_ci.pNext = nullptr;
+        if (custom_color) {
+            native.custom_color = *custom_color;
+            native.custom_color.pNext = nullptr;
+            native.has_custom_color = true;
+        }
+        native.armed = true;
+    }
 }
 
 Sampler::~Sampler() = default;

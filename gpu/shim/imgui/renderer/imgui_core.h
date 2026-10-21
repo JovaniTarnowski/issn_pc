@@ -8,5 +8,9 @@ inline void Initialize(const Vulkan::Instance&, const Frontend::WindowSDL&, u32,
 inline void OnSurfaceFormatChange(vk::Format) {}
 inline void Shutdown(vk::Device) {}
 inline bool MustKeepDrawing() { return false; }
-struct TextureManager { static void Submit() {} };
+struct TextureManager {
+    static void Submit() {}
+    static bool HasPendingUploads() { return false; }
+    static void NotePresented() {}
+};
 } // namespace ImGui::Core

@@ -13,11 +13,18 @@ typedef struct {
     uint32_t sdk_version;       /* from the eboot's procparam */
     uint32_t psf_attributes;    /* param.sfo ATTRIBUTE */
     int32_t width, height;      /* initial window size */
+    uint64_t eboot_base;        /* where the eboot's first segment is mapped (axylpup's game patches) */
 } IssnGpuConfig;
 /* Registers kernel event queues (needed with or without graphics). */
 void issngpu_register_kernel(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int issngpu_init(const IssnGpuConfig *config);
+/* issn-axy: axylpup's Second Son code patches (particle readback one frame later, ...), applied by
+ * the loader to the linked image before its pages are protected. */
+void issngpu_apply_game_patches(void);
+/* issn-axy: called on the thread that enters the eboot (the game's main loop): axylpup's core keys
+ * its frame-end work (particle read-ahead) on it. */
+void issngpu_mark_game_main_thread(void);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t issngpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
