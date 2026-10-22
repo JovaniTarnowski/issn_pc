@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <stdexcept>
+
 #include "common/assert.h"
 #include "common/types.h"
 
@@ -102,11 +104,19 @@ struct Writer {
     Archive& ar;
 };
 
+/// issn-axy: a cache entry that ends early (a file cut off when the game closed while writing
+/// it, tester 2026-10-22: the game no longer started). Thrown instead of a fatal assertion, so
+/// the cache loader can skip that one entry.
+struct CorruptedEntry : std::runtime_error {
+    CorruptedEntry() : std::runtime_error{"corrupted shader cache entry"} {}
+};
+
 struct Reader {
     template <typename T>
     void Read(T* ptr, size_t size) {
-        ASSERT_MSG(ar.offset + size <= ar.container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (ar.offset + size > ar.container.size()) [[unlikely]] {
+            throw CorruptedEntry{};
+        }
         std::memcpy(reinterpret_cast<void*>(ptr), ar.CurrPtr(), size);
         ar.Advance(size);
     }

@@ -13,6 +13,7 @@
 #include <ranges>
 
 #include "shader_recompiler/spirv_variants.h"
+#include "common/serdes.h"
 #include "common/fault_monitor.h"
 #include "common/hash.h"
 #include "common/lean.h"
@@ -627,7 +628,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
+    // issn-axy: a damaged cache entry outside the per-pipeline loop (vk_pipeline_serialization.cpp)
+    // ends the warm-up early instead of the game: the rest compiles while playing.
+    try {
+        WarmUp();
+    } catch (const Serialization::CorruptedEntry&) {
+        LOG_WARNING(Render, "Shader cache: a damaged entry stopped the warm-up; the rest is "
+                            "built while playing");
+        std::printf("Shader cache: a damaged entry stopped the warm-up early\n");
+        std::fflush(stdout);
+    }
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",

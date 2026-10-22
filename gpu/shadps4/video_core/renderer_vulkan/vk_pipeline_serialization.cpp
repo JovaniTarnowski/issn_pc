@@ -1239,6 +1239,7 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    u32 num_corrupted_pipelines{};
 
     const auto t_warmup = std::chrono::steady_clock::now();
     std::vector<PreloadGraphicsJob> preload_jobs;
@@ -1299,27 +1300,38 @@ void PipelineCache::WarmUp() {
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
+            try {
+                u32 version{};
+                pldata.Read(version);
+                if (version != Serialization::PipelineKeyVersion) {
+                    return;
+                }
 
-            u32 version{};
-            pldata.Read(version);
-            if (version != Serialization::PipelineKeyVersion) {
-                return;
-            }
+                u32 is_compute{};
+                pldata.Read(is_compute);
 
-            u32 is_compute{};
-            pldata.Read(is_compute);
+                bool result{};
+                if (is_compute) {
+                    result = LoadComputePipeline(ar);
+                } else {
+                    result = LoadGraphicsPipeline(ar);
+                }
 
-            bool result{};
-            if (is_compute) {
-                result = LoadComputePipeline(ar);
-            } else {
-                result = LoadGraphicsPipeline(ar);
-            }
-
-            if (result) {
-                ++num_pipelines;
+                if (result) {
+                    ++num_pipelines;
+                }
+            } catch (const Serialization::CorruptedEntry&) {
+                // issn-axy: skipped; the game builds that pipeline again when it needs it.
+                ++num_corrupted_pipelines;
             }
         });
+    if (num_corrupted_pipelines != 0) {
+        LOG_WARNING(Render, "Shader cache: {} damaged entries skipped (rebuilt when needed)",
+                    num_corrupted_pipelines);
+        std::printf("Shader cache: %u damaged entries skipped (rebuilt when needed)\n",
+                    num_corrupted_pipelines);
+        std::fflush(stdout);
+    }
     defer_marked_compute = nullptr;
     // Fix A: guessed permutations after every live one (counted as loaded above).
     u32 deferred_failed = 0;
