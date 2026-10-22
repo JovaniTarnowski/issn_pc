@@ -313,10 +313,34 @@ static void play_swipe(PadData *d) {
     }
 }
 
+/* issn: what SDL sees, once 3 s after the first read and whenever the device count changes
+ * (tester 2026-10-22: "gamepad=none" with an 8BitDo Ultimate C plugged in). A joystick SDL has
+ * no gamepad mapping for (a pad in DirectInput mode) is listed as "not a gamepad". */
+static void log_joysticks(void) {
+    static uint64_t first;
+    static int last_count=-1;
+    const uint64_t now=now_us();
+    if (!first) first=now;
+    if (now-first<3000000) return;
+    int count=0;
+    SDL_JoystickID *ids=SDL_GetJoysticks(&count);
+    if (count!=last_count) {
+        last_count=count;
+        printf("Runtime: %d joystick(s) seen by SDL%s\n",count,count ? ":" : " (no controller connected or visible)");
+        for (int i=0;i<count;++i)
+            printf("Runtime:   %s, %04x:%04x, %s\n",SDL_GetJoystickNameForID(ids[i]) ? SDL_GetJoystickNameForID(ids[i]) : "?",
+                   SDL_GetJoystickVendorForID(ids[i]),SDL_GetJoystickProductForID(ids[i]),
+                   SDL_IsGamepad(ids[i]) ? "gamepad" : "not a gamepad (no SDL mapping)");
+        fflush(stdout);
+    }
+    SDL_free(ids);
+}
+
 /* Opens the first gamepad SDL knows about; called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
+    log_joysticks();
     if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
     if (!gamepad) {
         int count=0;
@@ -438,16 +462,104 @@ static void key_axis(uint8_t *axis, bool negative, bool positive) {
  * and, while the window holds the mouse (Y in the game, issn_overlay.cpp), to the right stick as
  * the camera. ISSN_MOUSE_SPEED (pixels per second for a full stick, default 900). */
 static float mouse_dx, mouse_dy; /* motion since the last read, for synth_motion */
+static int pad_tilted;           /* the last read's tilt (spray can): the mouse aims the can */
+
+/* issn: 1:1 mouse aim (src/mouse_hook.h, axylpup's src/core/mouse_aim.cpp). The loader patches
+ * the camera's pan / tilt store to add what this mailbox holds; the mouse writes radians here.
+ * ISSN_MOUSE_AIM_SENS: degrees per 100 px (default 5.12, axylpup's); - / = change it in play.
+ * ISSN_MOUSE_AIM_FLIP=x, y or xy flips an axis (the game's own invert options also apply). */
+#include "mouse_hook.h"
+static _Alignas(64) IssnMouseMailbox aim_box;
+static volatile unsigned char *aim_no_follow;
+static const volatile unsigned char *aim_invert_x, *aim_invert_y;
+static int aim_attached, aim_live;
+static uint64_t aim_last_motion;
+static float aim_sens=5.12f, aim_sign_x=-1.0f, aim_sign_y=1.0f;
+IssnMouseMailbox *runtime_mouse_aim_mailbox(void) { return &aim_box; }
+void runtime_mouse_aim_attach(volatile unsigned char *no_follow, const volatile unsigned char *invert_x,
+                              const volatile unsigned char *invert_y) {
+    aim_no_follow=no_follow; aim_invert_x=invert_x; aim_invert_y=invert_y;
+    const char *s=getenv("ISSN_MOUSE_AIM_SENS");
+    if (s && atof(s)>0.0) aim_sens=fmaxf(0.5f,fminf(100.0f,(float)atof(s)));
+    const char *flip=getenv("ISSN_MOUSE_AIM_FLIP");
+    if (flip && strchr(flip,'x')) aim_sign_x=-aim_sign_x;
+    if (flip && strchr(flip,'y')) aim_sign_y=-aim_sign_y;
+    aim_attached=1;
+}
+/* Every read: is the camera hook running (gameplay), and the follow byte. Motion parked while
+ * the camera does not update (menus, cut-scenes, loading) is dropped, so the view does not jump
+ * when play resumes. The game's auto-follow stays off for ISSN_MOUSE_AIM_FOLLOW_HOLD seconds
+ * (default 5, axylpup's) after the last mouse motion, as the right stick turns it off. */
+static void mouse_aim_tick(uint64_t now) {
+    if (!aim_attached) return;
+    static uint32_t last_frames;
+    static uint64_t last_change, hold_us=1;
+    static unsigned char written;
+    if (hold_us==1) { const char *v=getenv("ISSN_MOUSE_AIM_FOLLOW_HOLD"); const double s=v ? atof(v) : 5.0; hold_us=(uint64_t)(fmax(0.0,fmin(100000.0,s))*1e6); }
+    const uint32_t frames=__atomic_load_n(&aim_box.frames,__ATOMIC_RELAXED);
+    if (frames!=last_frames) {
+        if (!last_frames) { printf("Mouse aim: the camera hook runs\n"); fflush(stdout); }
+        last_frames=frames; last_change=now;
+    }
+    aim_live=last_change && now-last_change<=250000;
+    if (!aim_live) __atomic_store_n(&aim_box.delta,0,__ATOMIC_RELAXED);
+    if (aim_no_follow && hold_us) {
+        const unsigned char want=aim_last_motion && now-aim_last_motion<hold_us;
+        if (want!=written) { *aim_no_follow=want; written=want; }
+    }
+}
+static void mouse_aim_motion(float dx, float dy, uint64_t now) {
+    if (dx==0.0f && dy==0.0f) return;
+    aim_last_motion=now;
+    const float k=aim_sens*(3.14159265f/180.0f)/100.0f;
+    float yaw=dx*k*aim_sign_x, pitch=dy*k*aim_sign_y;
+    if (aim_invert_x && *aim_invert_x) yaw=-yaw;
+    if (aim_invert_y && *aim_invert_y) pitch=-pitch;
+    uint64_t old=__atomic_load_n(&aim_box.delta,__ATOMIC_RELAXED), next;
+    do {
+        float f[2];
+        memcpy(f,&old,sizeof(f));
+        f[0]=fmaxf(-0.75f,fminf(0.75f,f[0]+yaw));
+        f[1]=fmaxf(-0.75f,fminf(0.75f,f[1]+pitch));
+        memcpy(&next,f,sizeof(next));
+    } while (!__atomic_compare_exchange_n(&aim_box.delta,&old,next,true,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
+}
+
+/* issn: the mouse, as in axylpup's build: while it holds the camera (relative mode: a click in
+ * the window or Y), its motion turns the camera through the hook above (the right stick when the
+ * hook is not there, ISSN_MOUSE_SPEED px/s = full tilt) and its buttons are R2 (left, shoot) and
+ * L2 (right, aim); the click that takes the camera does not shoot. While the pad is tilted the
+ * mouse aims the spray can (synth_motion). - / = scale the sensitivity. */
 static void sample_mouse(PadData *d) {
     if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
     SDL_Window *window=SDL_GetMouseFocus();
     float dx=0.0f, dy=0.0f;
     const SDL_MouseButtonFlags buttons=SDL_GetRelativeMouseState(&dx,&dy);
-    if (!window) { mouse_dx=mouse_dy=0.0f; return; }
+    mouse_aim_tick(d->timestamp);
+    const bool relative=window && SDL_GetWindowRelativeMouseMode(window);
+    static bool was_relative, wait_release;
+    if (relative && !was_relative) wait_release=buttons!=0;
+    was_relative=relative;
+    if (!relative) { mouse_dx=mouse_dy=0.0f; return; }
+    if (wait_release && !buttons) wait_release=false;
+    if (!wait_release) {
+        if (buttons & SDL_BUTTON_LMASK) { d->buttons|=BTN_R2; d->r2=255; }
+        if (buttons & SDL_BUTTON_RMASK) { d->buttons|=BTN_L2; d->l2=255; }
+    }
+    {   /* - / = : sensitivity */
+        const bool *k=SDL_GetKeyboardState(NULL);
+        static bool minus_was, equals_was;
+        const bool minus=k && k[SDL_SCANCODE_MINUS], equals=k && k[SDL_SCANCODE_EQUALS];
+        if ((minus && !minus_was) || (equals && !equals_was)) {
+            aim_sens=fmaxf(0.5f,fminf(100.0f,aim_sens*(minus ? 0.8f : 1.25f)));
+            printf("Mouse aim: %.2f degrees per 100 px (- / =)\n",aim_sens);
+            fflush(stdout);
+        }
+        minus_was=minus; equals_was=equals;
+    }
     mouse_dx+=dx; mouse_dy+=dy;
-    if (buttons & SDL_BUTTON_LMASK) { d->buttons|=BTN_R2; d->r2=255; }
-    if (buttons & SDL_BUTTON_RMASK) { d->buttons|=BTN_L2; d->l2=255; }
-    if (!SDL_GetWindowRelativeMouseMode(window)) return;
+    if (pad_tilted) return; /* the spray can takes the mouse */
+    if (aim_attached && aim_live) { mouse_aim_motion(dx,dy,d->timestamp); return; }
     static float speed;
     if (speed==0.0f) { const char *e=getenv("ISSN_MOUSE_SPEED"); speed=e && atof(e)>50.0 ? (float)atof(e) : 900.0f; }
     static uint64_t last;
@@ -722,6 +834,7 @@ static void sample(PadData *d) {
     d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
     const bool tilt=z || synth.pose_toggle || rattle;
     const bool real_sensors=gamepad && (sensors & SENSOR_ACCEL) && motion_enabled;
+    pad_tilted=tilt;
     if (!real_sensors || tilt) { /* Z / X / L3+R3 also drive a pad that has sensors */
         const float ax=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_x-128.0f)/127.0f : 0.0f;
         const float ay=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_y-128.0f)/127.0f : 0.0f;

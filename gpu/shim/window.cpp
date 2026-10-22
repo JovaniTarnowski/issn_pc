@@ -23,6 +23,22 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
                            app_id && *app_id ? app_id : "tlg-pc");
         SDL_SetHint(SDL_HINT_APP_ID, app_id && *app_id ? app_id : "tlg-pc");
     }
+    // issn: started from Steam (a non-Steam shortcut to the launcher), the environment carries
+    // Steam Input's device filter: SDL is to hide the physical pad and use Steam's virtual one,
+    // which belongs to the launcher Steam started, not to this process. Tester 2026-10-22: an
+    // 8BitDo Ultimate C that worked before was "gamepad=none" once launched from Steam. The
+    // filter is dropped (ISSN_KEEP_STEAM_PAD_FILTER=1 keeps it).
+    for (const char* hint : {SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES,
+                             SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT}) {
+        const char* value = std::getenv(hint);
+        const char* keep = std::getenv("ISSN_KEEP_STEAM_PAD_FILTER");
+        if (value && *value && !(keep && keep[0] == '1')) {
+            std::printf("Window: %s=%s from Steam ignored (the pads stay visible)\n", hint, value);
+            SDL_SetHintWithPriority(hint, "", SDL_HINT_OVERRIDE);
+        }
+    }
+    // As axylpup's build: pads keep working while another window has the focus.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());

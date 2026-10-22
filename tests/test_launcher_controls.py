@@ -3,6 +3,7 @@ import queue
 import struct
 import sys
 import unittest
+import unittest.mock
 
 from paths import ROOT
 sys.path.insert(0, str(ROOT / 'launcher'))

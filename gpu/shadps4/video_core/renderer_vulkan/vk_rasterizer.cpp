@@ -1666,16 +1666,44 @@ void Rasterizer::DlssResolve() {
         return id ? &texture_cache.GetImage(id) : nullptr;
     };
     const bool fsr4_mode = Dlss::Mode() == 3;
+    // issn-axy: the colour and the motion vectors move together between game builds; where
+    // axylpup's addresses hold nothing, each R16G16 float image of the target's size is tried as
+    // the motion vectors, with the colour at the same offset (+0x2c0000 known first).
+    const auto colour_at = [&](s64 delta) {
+        return texture_cache.FindImageAtSize(Dlss::ColorInAddr + delta, out.info.size.width,
+                                             out.info.size.height, out.info.pixel_format);
+    };
+    if (!colour_at(dlss_addr_delta) && dlss_delta_searches++ % 30 == 0) {
+        std::vector<s64> deltas{0, 0x2c0000};
+        for (const VAddr motion_addr : texture_cache.FindAddressesOf(
+                 out.info.size.width, out.info.size.height, vk::Format::eR16G16Sfloat)) {
+            deltas.push_back(s64(motion_addr) - s64(Dlss::MotionAddr));
+        }
+        for (const s64 delta : deltas) {
+            if (delta != dlss_addr_delta && colour_at(delta) &&
+                texture_cache.FindImageAtSize(Dlss::MotionAddr + delta, out.info.size.width,
+                                              out.info.size.height)) {
+                LOG_WARNING(Render_Vulkan,
+                            "DLSS/FSR 4: inputs found at colour {:#x}, motion {:#x} (offset {:+#x} "
+                            "from axylpup's build)",
+                            Dlss::ColorInAddr + delta, Dlss::MotionAddr + delta, delta);
+                dlss_addr_delta = delta;
+                break;
+            }
+        }
+    }
+    const VAddr colour_addr = Dlss::ColorInAddr + dlss_addr_delta;
+    const VAddr motion_addr = Dlss::MotionAddr + dlss_addr_delta;
     // issn-axy: the colour input of the target's own format first; FSR 4 also takes another
     // colour format (it blits). Tester 2026-10-21: with FSR 4 on the picture was yellow and the
     // log had only the 8 "no matching input" lines - every resolve was skipped, so the target
     // kept what another pass had left in that memory.
     VideoCore::Image* in = nullptr;
     if (const VideoCore::ImageId id = texture_cache.FindImageAtSize(
-            Dlss::ColorInAddr, out.info.size.width, out.info.size.height, out.info.pixel_format)) {
+            colour_addr, out.info.size.width, out.info.size.height, out.info.pixel_format)) {
         in = &texture_cache.GetImage(id);
     } else if (fsr4_mode) {
-        in = find(Dlss::ColorInAddr);
+        in = find(colour_addr);
         if (in && (in->aspect_mask & vk::ImageAspectFlagBits::eDepth)) {
             in = nullptr;
         }
@@ -1692,9 +1720,9 @@ void Rasterizer::DlssResolve() {
                         "{:#x}: {}; motion {:#x}: {}; depth {:#x}: {}",
                         why, fsr4_misses, dlss_calls, regs.color_buffers[0].Address(),
                         vk::to_string(out.info.pixel_format), out.info.size.width,
-                        out.info.size.height, Dlss::ColorInAddr,
-                        texture_cache.DescribeImagesAt(Dlss::ColorInAddr), Dlss::MotionAddr,
-                        texture_cache.DescribeImagesAt(Dlss::MotionAddr), Dlss::DepthAddr,
+                        out.info.size.height, colour_addr,
+                        texture_cache.DescribeImagesAt(colour_addr), motion_addr,
+                        texture_cache.DescribeImagesAt(motion_addr), Dlss::DepthAddr,
                         texture_cache.DescribeImagesAt(Dlss::DepthAddr));
             if (fsr4_misses <= 2 || steady) {
                 LOG_WARNING(Render_Vulkan, "FSR 4: recent {}x{} images: {}", out.info.size.width,
@@ -1720,7 +1748,7 @@ void Rasterizer::DlssResolve() {
         } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
                                        "the resolve's target keeps last frame's picture",
-                        Dlss::ColorInAddr, regs.color_buffers[0].Address(), out.info.size.width,
+                        colour_addr, regs.color_buffers[0].Address(), out.info.size.width,
                         out.info.size.height);
         }
         return;
@@ -1730,7 +1758,7 @@ void Rasterizer::DlssResolve() {
     bool hud_layer = false;
     if (Dlss::Mode() == 3) {
         // issn-axy: ISSN_FSR4 - FSR 4 Native AA from the same inputs (issn_fsr4.h).
-        VideoCore::Image* motion = find(Dlss::MotionAddr);
+        VideoCore::Image* motion = find(motion_addr);
         VideoCore::Image* depth = find(Dlss::DepthAddr);
         if (motion && depth) [[likely]] {
             // FSR 4 copies them into images of its own (issn_fsr4.cpp CopyInputs).
@@ -1795,7 +1823,7 @@ void Rasterizer::DlssResolve() {
                                                                      : "FSR did not record"));
         }
     } else if (Dlss::Mode() == 1) {
-        VideoCore::Image* motion = find(Dlss::MotionAddr);
+        VideoCore::Image* motion = find(motion_addr);
         VideoCore::Image* depth = find(Dlss::DepthAddr);
         if (motion && depth) [[likely]] {
             in->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
@@ -1872,7 +1900,7 @@ void Rasterizer::DlssResolve() {
             scheduler.InvalidateNativeHeaps();
         } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: motion vectors {:#x} {} / depth {:#x} {} - copy this frame",
-                        Dlss::MotionAddr, motion ? "found" : "missing", Dlss::DepthAddr,
+                        motion_addr, motion ? "found" : "missing", Dlss::DepthAddr,
                         depth ? "found" : "missing");
         }
     }

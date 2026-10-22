@@ -59,13 +59,17 @@ Controller
   - Two fingers on the touchpad (lifting the tree): hold Select/Back + RB (R1).
   - Touchpad click: Select/Back.
 - Keyboard and mouse (axylpup's layout; launcher: Game > Controls changes the buttons):
-  - WASD moves, IJKL turns the camera, Y gives the camera to the mouse (Y again gives it back).
+  - WASD moves, IJKL turns the camera. Click in the game window and the mouse aims 1:1 (axylpup's
+    camera hook); Y or F7 lets the mouse go and takes it back; - / = change the mouse speed.
   - Space Cross, Left Shift Circle, C Square, F Triangle (numpad 2/6/4/8 too), Q L1, E R1,
     U L3, O R3, Enter Options, arrows d-pad.
-  - Left click R2 (shoot), right click L2 (aim); 1 / 3 also work.
+  - Left click R2 (shoot), right click L2 (aim) while the mouse aims; 1 / 3 also work.
   - R / G: left / right side of the touchpad click (G + IJKL: swipe).
   - Spray can: hold Z to tilt the pad, tap Z or hold X to rattle it, move the mouse to aim.
   - F12 screenshot, Insert the port's menu.
+- Started from Steam: the port ignores Steam Input's device filter so the controller is seen
+  (ISSN_KEEP_STEAM_PAD_FILTER=1 keeps it). If a pad still is not found, the log lists what SDL
+  sees ("joystick(s) seen by SDL").
 - Text and voices: launcher > Game > Game language (Automatic follows the launcher: Portuguese
   gives the Brazilian dub on the US release).
 

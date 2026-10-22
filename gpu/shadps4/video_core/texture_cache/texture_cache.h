@@ -124,6 +124,8 @@ public:
     [[nodiscard]] std::string DescribeImagesAt(VAddr address);
     /// issn-axy: the `count` most recently used images of that size anywhere (address, format).
     [[nodiscard]] std::string DescribeRecentImages(u32 width, u32 height, size_t count);
+    /// issn-axy: the guest addresses of the images of that size and format, most recent first.
+    [[nodiscard]] std::vector<VAddr> FindAddressesOf(u32 width, u32 height, vk::Format format);
 
     /// SHADPS4_DRAW_REPEAT_HEAP: any image whose guest address is exactly `address` (the
     /// candidates FindImageFromRange considers, without its size test or log).

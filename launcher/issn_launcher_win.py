@@ -1586,10 +1586,11 @@ class Launcher:
                    'Two fingers: hold Select/Back + RB. Spray can: L3 + R3 together tilts the pad, LB '
                    'rattles it, the right stick aims. Automatic turns it off on a DualShock 4 or DualSense.'),
                  restart=True)
-        self.note(f, _('Keyboard and mouse: WASD moves, IJKL turns the camera, Y gives the camera to the mouse '
-                       '(and back). Left click R2 (shoot), right click L2 (aim). Spray can: hold Z to tilt the '
-                       'pad, tap Z or hold X to rattle it, move the mouse to aim. R / G: left / right touchpad '
-                       '(G + IJKL: swipe). Arrows: d-pad. F12: screenshot. Insert: the port\'s menu.'), top=8)
+        self.note(f, _('Keyboard and mouse: WASD moves, IJKL turns the camera. Click in the game window and the '
+                       'mouse aims (1:1, as in axylpup\'s build); Y or F7 lets the mouse go and takes it back, '
+                       '- / = change its speed. Left click R2 (shoot), right click L2 (aim). Spray can: hold Z '
+                       'to tilt the pad, tap Z or hold X to rattle it, move the mouse to aim. R / G: left / right '
+                       'touchpad (G + IJKL: swipe). Arrows: d-pad. F12: screenshot. Insert: the port\'s menu.'), top=8)
         table = ttk.Frame(f)
         table.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(16, 0))
         for column, span, title in ((0, 2, _('GAME BUTTON')), (2, 1, _('KEYBOARD')), (3, 2, _('GAMEPAD'))):

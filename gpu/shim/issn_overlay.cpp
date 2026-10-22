@@ -63,6 +63,12 @@ std::mutex imgui_mutex; // the ImGui context: window thread (input) and present 
 bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool r3_down = false, l2_down = false;
+/// issn: the mouse camera (Y / F7 off and on); a click in the window turns it on while wanted.
+/// ISSN_MOUSE_CAMERA=0: only Y / F7 turn it on.
+bool mouse_camera_wanted = [] {
+    const char* v = std::getenv("ISSN_MOUSE_CAMERA");
+    return !(v && v[0] == '0');
+}();
 std::atomic<bool> loading{false};
 std::atomic<u32> loading_done{0}, loading_total{0};
 std::atomic<u32> background_done{0}, background_total{0};
@@ -964,11 +970,13 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat && event.key.key == SDLK_Y && !is_open) {
-            // issn: Y gives the camera to the mouse (runtime_pad.c sample_mouse) and back, as in
-            // axylpup's build.
+        if (down && !event.key.repeat && (event.key.key == SDLK_Y || event.key.key == SDLK_F7) &&
+            !is_open) {
+            // issn: Y (or F7, axylpup's key) gives the camera to the mouse (runtime_pad.c
+            // sample_mouse, the camera hook) and back. Off also stops the click-to-capture below.
             if (SDL_Window* window = SDL_GetWindowFromID(event.key.windowID)) {
                 const bool on = !SDL_GetWindowRelativeMouseMode(window);
+                mouse_camera_wanted = on;
                 SDL_SetWindowRelativeMouseMode(window, on);
                 std::printf("Mouse camera: %s (Y)\n", on ? "on" : "off");
                 std::fflush(stdout);
@@ -1054,6 +1062,16 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
         if (!is_open) {
+            // issn: a click in the game window gives the camera to the mouse, as in a PC game
+            // (tester 2026-10-22: the mouse should aim without a key first); Y lets it go.
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && mouse_camera_wanted) {
+                if (SDL_Window* window = SDL_GetWindowFromID(event.button.windowID);
+                    window && !SDL_GetWindowRelativeMouseMode(window)) {
+                    SDL_SetWindowRelativeMouseMode(window, true);
+                    std::printf("Mouse camera: on (click; Y lets the mouse go)\n");
+                    std::fflush(stdout);
+                }
+            }
             return false;
         }
         const int button = event.button.button == SDL_BUTTON_LEFT    ? 0

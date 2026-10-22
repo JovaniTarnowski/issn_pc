@@ -13,6 +13,7 @@
 #include "actor_hook.h"
 #include "damage_hook.h"
 #include "view_hook.h"
+#include "mouse_hook.h"
 #include "gpu/issngpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -657,6 +658,45 @@ static void install_view_tuning(Segment *segments, uint64_t count, uint64_t size
     printf("Draw distance: ready (LOD scale, LOD bands, region LOD_ADJUST and FADE_DISTANCE, near/far clip)\n");
 }
 
+extern IssnMouseMailbox *runtime_mouse_aim_mailbox(void);
+extern void runtime_mouse_aim_attach(volatile unsigned char *no_follow, const volatile unsigned char *invert_x,
+                                     const volatile unsigned char *invert_y);
+
+/* issn: 1:1 mouse aim (src/mouse_hook.h, axylpup's design): a cave at the camera's pan / tilt
+ * store adds the mouse motion that runtime_pad.c leaves in the mailbox. ISSN_MOUSE_AIM=0 leaves
+ * the camera alone (the mouse then drives the right stick). */
+static void install_mouse_aim(Segment *segments, uint64_t count, uint64_t size) {
+    const char *off = getenv("ISSN_MOUSE_AIM");
+    if (off && off[0] == '0') return;
+    if (!mapped(segments, count, ISSN_MOUSE_EXPECTED_AT, sizeof(issn_mouse_expected)) ||
+        !mapped(segments, count, ISSN_MOUSE_NO_FOLLOW, 1) ||
+        !mapped(segments, count, ISSN_MOUSE_OPTIONS + ISSN_MOUSE_INVERT_X, 2) ||
+        !issn_mouse_signature_match(image, size)) {
+        printf("Mouse aim: unavailable (the camera code is not the expected one)\n");
+        return;
+    }
+    const char *clamp = getenv("ISSN_MOUSE_AIM_CLAMP");
+    const int free_tilt = clamp && clamp[0] == '0';
+    const unsigned char *code = free_tilt ? issn_mouse_cave_free : issn_mouse_cave_clamp;
+    const size_t length = free_tilt ? sizeof(issn_mouse_cave_free) : sizeof(issn_mouse_cave_clamp);
+    unsigned char *cave = allocate(page_size);
+    const int64_t delta = (int64_t)(uintptr_t)cave - (int64_t)(uintptr_t)(image + ISSN_MOUSE_STORE + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        printf("Mouse aim: unavailable (cave outside relative-jump range)\n");
+        return;
+    }
+    memcpy(cave, code, length);
+    const uint64_t mailbox = (uint64_t)(uintptr_t)runtime_mouse_aim_mailbox();
+    const uint64_t resume = (uint64_t)(uintptr_t)(image + ISSN_MOUSE_STORE + ISSN_MOUSE_STORE_LENGTH);
+    memcpy(cave + ISSN_MOUSE_PATCH_MAILBOX, &mailbox, 8);
+    memcpy(cave + length - 8, &resume, 8);
+    protect(cave, page_size, 5);
+    install_jump(ISSN_MOUSE_STORE, ISSN_MOUSE_STORE_LENGTH, cave);
+    runtime_mouse_aim_attach(image + ISSN_MOUSE_NO_FOLLOW, image + ISSN_MOUSE_OPTIONS + ISSN_MOUSE_INVERT_X,
+                             image + ISSN_MOUSE_OPTIONS + ISSN_MOUSE_INVERT_Y);
+    printf("Mouse aim: camera hook ready (tilt clamp %s)\n", free_tilt ? "off" : "on");
+}
+
 /* Damage dealt/taken and green/blue/gold orb multipliers (src/damage_hook.h, src/orb_hook.h):
  * the stubs read the menu's floats directly, so changes apply on the next hit or pickup. */
 static void install_stat_multipliers(Segment *segments, uint64_t count, uint64_t size) {
@@ -1086,6 +1126,7 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_actor_watch(segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(segments, ns, size);
     if (gpu_enabled) install_view_tuning(segments, ns, size);
+    if (gpu_enabled) install_mouse_aim(segments, ns, size);
     if (gpu_enabled) issngpu_apply_game_patches();
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));

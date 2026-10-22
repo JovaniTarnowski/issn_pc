@@ -1367,6 +1367,24 @@ std::string TextureCache::DescribeRecentImages(u32 width, u32 height, size_t cou
     return text.empty() ? std::string{"none"} : text;
 }
 
+std::vector<VAddr> TextureCache::FindAddressesOf(u32 width, u32 height, vk::Format format) {
+    std::vector<const Image*> found;
+    for (const Image& image : slot_images) {
+        if (image.info.size.width == width && image.info.size.height == height &&
+            image.info.pixel_format == format && image.info.guest_address != 0) {
+            found.push_back(&image);
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const Image* a, const Image* b) {
+        return a->tick_accessed_last > b->tick_accessed_last;
+    });
+    std::vector<VAddr> addresses;
+    for (const Image* image : found) {
+        addresses.push_back(image->info.guest_address);
+    }
+    return addresses;
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
