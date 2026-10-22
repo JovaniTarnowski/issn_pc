@@ -488,7 +488,19 @@ void ApplyHelperThreadPlacement(const char* name) {
 
 void ApplyCommandProcessorPlacement() {
     const char* value = std::getenv("SHADPS4_CP_QOS");
-    const int mode = value ? value[0] - '0' : 0;
+    int mode = value ? value[0] - '0' : 0;
+    if (value && (value[0] == 'a' || value[0] == 'A')) {
+        // issn-axy: =auto from axylpup's 1.1 (src/common/thread.cpp): mode 3 only with enough
+        // logical processors, else off. A reserved P-core costs a CPU with few cores more than it
+        // gives: on 6 cores / 12 threads =0 beat =3 by 11.6%, on 16 threads by ~8% (his s1404,
+        // s1421). SHADPS4_CP_QOS_AUTO_MIN moves the line.
+        const char* min_value = std::getenv("SHADPS4_CP_QOS_AUTO_MIN");
+        const int min_logical = min_value ? std::atoi(min_value) : 20;
+        const int logical = std::popcount(ProcessMaskNow());
+        mode = logical >= min_logical ? 3 : 0;
+        LOG_WARNING(Common, "SHADPS4_CP_QOS=auto: {} logical processors (line {}) -> mode {}",
+                    logical, min_logical, mode);
+    }
     if (mode <= 0) {
         return;
     }

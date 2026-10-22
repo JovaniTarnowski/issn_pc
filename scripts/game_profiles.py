@@ -41,7 +41,7 @@ AXY_RELEASE_FLAGS = {
     'SHADPS4_CACHE_READBACKS_MODE': '1',
     'SHADPS4_CACHE_REBUILD': '1',
     'SHADPS4_CLAIM_WAKE': '1',
-    'SHADPS4_CP_QOS': '3',
+    'SHADPS4_CP_QOS': 'auto',  # axylpup 1.1: 3 from 20 logical processors, else 0 (+8-12% below)
     'SHADPS4_CP_SPLIT': '2',
     'SHADPS4_CP_SPLIT_DEPTH': '1024',
     'SHADPS4_CP_SPLIT_DISP_GUARD': '0',
