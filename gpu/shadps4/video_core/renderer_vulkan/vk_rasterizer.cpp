@@ -1683,8 +1683,10 @@ void Rasterizer::DlssResolve() {
         VideoCore::Image* motion = find(Dlss::MotionAddr);
         VideoCore::Image* depth = find(Dlss::DepthAddr);
         if (motion && depth) [[likely]] {
+            // FSR 4 copies them into images of its own (issn_fsr4.cpp CopyInputs).
             for (VideoCore::Image* image : {in, motion, depth}) {
-                image->Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {});
+                image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                               {});
             }
             out.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
                         {});

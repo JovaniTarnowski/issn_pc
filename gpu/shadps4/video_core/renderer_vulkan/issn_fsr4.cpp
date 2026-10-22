@@ -17,6 +17,7 @@
 #include "ffx_vk_fsr4_v07_assets.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/texture_cache/image.h"
 
 namespace Vulkan::Fsr4Aa {
@@ -77,12 +78,22 @@ struct Upscaler::Impl {
     bool fatal = false;
     u64 next_frame_id = 1;
     std::deque<std::pair<u64, u64>> in_flight; ///< provider frame id, scheduler tick
-    // FSR writes RGBA16F (the v07 post pass declares it); blitted into the game's RGBA8 target.
-    VideoCore::UniqueImage target;
-    vk::UniqueImageView target_view;
-    bool target_fresh = true;
-    std::deque<std::pair<u64, VideoCore::UniqueImage>> retired_images;
-    std::deque<std::pair<u64, vk::UniqueImageView>> retired_views;
+    // FSR works on images of its own (tester 2026-10-21: the game's own images gave a yellow
+    // picture and, through a depth+stencil view, a lost device): the colour and the motion
+    // vectors are blitted in, the depth goes through a buffer into R32F, and the RGBA16F result
+    // is blitted into the game's RGBA8 target.
+    struct Owned {
+        VideoCore::UniqueImage image;
+        vk::UniqueImageView view;
+        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        vk::Format format = vk::Format::eUndefined;
+        u32 width = 0, height = 0;
+    };
+    Owned color_in, motion_in, depth_in, target;
+    std::unique_ptr<VideoCore::UniqueBuffer> depth_buffer;
+    u64 depth_buffer_size = 0;
+    std::deque<std::pair<u64, Owned>> retired_images;
+    std::deque<std::pair<u64, std::unique_ptr<VideoCore::UniqueBuffer>>> retired_buffers;
 
     Impl(const Instance& instance_, Scheduler& scheduler_)
         : instance{instance_}, scheduler{scheduler_} {}
@@ -207,24 +218,24 @@ struct Upscaler::Impl {
         while (!retired_images.empty() && scheduler.IsFree(retired_images.front().first)) {
             retired_images.pop_front();
         }
-        while (!retired_views.empty() && scheduler.IsFree(retired_views.front().first)) {
-            retired_views.pop_front();
+        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
+            retired_buffers.pop_front();
         }
     }
 
-    void MakeTarget(u32 width, u32 height) {
-        const u64 tick = scheduler.CurrentTick();
-        if (target_view) {
-            retired_views.emplace_back(tick, std::move(target_view));
+    /// `owned` as a width x height image of `format` (made again when either changes).
+    void Ensure(Owned& owned, vk::Format format, u32 width, u32 height) {
+        if (owned.image && owned.format == format && owned.width == width && owned.height == height) {
+            return;
         }
-        if (target) {
-            retired_images.emplace_back(tick, std::move(target));
+        if (owned.image) {
+            retired_images.emplace_back(scheduler.CurrentTick(), std::move(owned));
         }
         const vk::Device device = instance.GetDevice();
-        target = VideoCore::UniqueImage(device, instance.GetAllocator());
-        target.Create(vk::ImageCreateInfo{
+        owned.image = VideoCore::UniqueImage(device, instance.GetAllocator());
+        owned.image.Create(vk::ImageCreateInfo{
             .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR16G16B16A16Sfloat,
+            .format = format,
             .extent{width, height, 1},
             .mipLevels = 1,
             .arrayLayers = 1,
@@ -234,13 +245,115 @@ struct Upscaler::Impl {
             .initialLayout = vk::ImageLayout::eUndefined,
         });
         auto [result, view] = device.createImageViewUnique({
-            .image = target,
+            .image = owned.image,
             .viewType = vk::ImageViewType::e2D,
-            .format = vk::Format::eR16G16B16A16Sfloat,
+            .format = format,
             .subresourceRange = ColorRange,
         });
-        target_view = std::move(view);
-        target_fresh = true;
+        owned.view = std::move(view);
+        owned.layout = vk::ImageLayout::eUndefined;
+        owned.format = format;
+        owned.width = width;
+        owned.height = height;
+    }
+
+    static void To(vk::CommandBuffer cmdbuf, Owned& owned, vk::ImageLayout layout) {
+        cmdbuf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader, {},
+            {}, {},
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite |
+                                 vk::AccessFlagBits::eTransferRead |
+                                 vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite |
+                                 vk::AccessFlagBits::eTransferRead |
+                                 vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead,
+                .oldLayout = owned.layout,
+                .newLayout = layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = owned.image,
+                .subresourceRange = ColorRange,
+            });
+        owned.layout = layout;
+    }
+
+    static void Blit(vk::CommandBuffer cmdbuf, vk::Image source, u32 sw, u32 sh, vk::Image dest,
+                     u32 dw, u32 dh) {
+        const vk::ImageSubresourceLayers layers{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        const vk::ImageBlit blit{
+            .srcSubresource = layers,
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(sw), s32(sh), 1}},
+            .dstSubresource = layers,
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(dw), s32(dh), 1}},
+        };
+        cmdbuf.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, dest,
+                         vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    }
+
+    /// The game's images (layout TransferSrcOptimal, set by the caller) into FSR's own.
+    void CopyInputs(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
+                    const Input& depth) {
+        Ensure(color_in, vk::Format::eR16G16B16A16Sfloat, color.width, color.height);
+        Ensure(motion_in, vk::Format::eR16G16Sfloat, motion.width, motion.height);
+        Ensure(depth_in, vk::Format::eR32Sfloat, depth.width, depth.height);
+        const u64 depth_bytes = u64(depth.width) * depth.height * 4;
+        if (!depth_buffer || depth_buffer_size < depth_bytes) {
+            if (depth_buffer) {
+                retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(depth_buffer));
+            }
+            depth_buffer = std::make_unique<VideoCore::UniqueBuffer>(instance.GetDevice(),
+                                                                     instance.GetAllocator());
+            depth_buffer->Create(vk::BufferCreateInfo{
+                                     .size = depth_bytes,
+                                     .usage = vk::BufferUsageFlagBits::eTransferSrc |
+                                              vk::BufferUsageFlagBits::eTransferDst,
+                                 },
+                                 VideoCore::MemoryUsage::DeviceLocal, nullptr);
+            depth_buffer_size = depth_bytes;
+        }
+        for (Owned* owned : {&color_in, &motion_in, &depth_in}) {
+            To(cmdbuf, *owned, vk::ImageLayout::eTransferDstOptimal);
+        }
+        Blit(cmdbuf, color.image, color.width, color.height, color_in.image, color.width,
+             color.height);
+        Blit(cmdbuf, motion.image, motion.width, motion.height, motion_in.image, motion.width,
+             motion.height);
+        const vk::BufferImageCopy depth_copy{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset{0, 0, 0},
+            .imageExtent{depth.width, depth.height, 1},
+        };
+        cmdbuf.copyImageToBuffer(depth.image, vk::ImageLayout::eTransferSrcOptimal, *depth_buffer,
+                                 depth_copy);
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer, {},
+                               vk::MemoryBarrier{
+                                   .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                   .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                               },
+                               {}, {});
+        vk::BufferImageCopy color_copy = depth_copy;
+        color_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        cmdbuf.copyBufferToImage(*depth_buffer, depth_in.image, vk::ImageLayout::eTransferDstOptimal,
+                                 color_copy);
+        for (Owned* owned : {&color_in, &motion_in, &depth_in}) {
+            To(cmdbuf, *owned, vk::ImageLayout::eGeneral);
+        }
     }
 
     VkResult Register(vk::Image image, vk::ImageView view, VkAccessFlags access) {
@@ -288,7 +401,6 @@ struct Upscaler::Impl {
             if (!CreateBackend(ow, oh)) {
                 return false;
             }
-            MakeTarget(ow, oh);
             reset = true;
         }
         Retire();
@@ -306,34 +418,20 @@ struct Upscaler::Impl {
         // A frame begun must reach RetireFrame even when it records nothing.
         const auto abandon = [&] { in_flight.emplace_back(frame_id, scheduler.CurrentTick()); };
 
-        // FSR's output image: General for the compute passes.
-        cmdbuf.pipelineBarrier(
-            vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eComputeShader, {}, {}, {},
-            vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
-                .dstAccessMask =
-                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
-                .oldLayout = target_fresh ? vk::ImageLayout::eUndefined
-                                          : vk::ImageLayout::eTransferSrcOptimal,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = target,
-                .subresourceRange = ColorRange,
-            });
-        target_fresh = false;
+        CopyInputs(cmdbuf, color, motion, depth);
+        Ensure(target, vk::Format::eR16G16B16A16Sfloat, ow, oh);
+        To(cmdbuf, target, vk::ImageLayout::eGeneral);
 
         constexpr VkAccessFlags read = VK_ACCESS_SHADER_READ_BIT;
-        const std::array<std::tuple<vk::Image, vk::ImageView, VkAccessFlags, const char*>, 4>
-            images{{
-                {color.image, color.view, read, "color"},
-                {depth.image, depth.view, read, "depth"},
-                {motion.image, motion.view, read, "motion"},
-                {target, *target_view, read | VK_ACCESS_SHADER_WRITE_BIT, "output"},
-            }};
-        for (const auto& [image, view, access, name] : images) {
-            if (const VkResult result = Register(image, view, access); result != VK_SUCCESS) {
+        const std::array<std::tuple<Owned*, VkAccessFlags, const char*>, 4> images{{
+            {&color_in, read, "color"},
+            {&depth_in, read, "depth"},
+            {&motion_in, read, "motion"},
+            {&target, read | VK_ACCESS_SHADER_WRITE_BIT, "output"},
+        }};
+        for (const auto& [owned, access, name] : images) {
+            if (const VkResult result = Register(owned->image, *owned->view, access);
+                result != VK_SUCCESS) {
                 Fail(std::string{"external image registration failed ("} + name + ", " +
                          std::to_string(int(result)) + ")",
                      false);
@@ -341,13 +439,13 @@ struct Upscaler::Impl {
                 return false;
             }
         }
-        const auto resource = [](vk::ImageView view, u32 w, u32 h, u32 format, u32 state) {
+        const auto resource = [](const Owned& owned, u32 format, u32 state) {
             FfxApiResource r{};
-            r.resource = reinterpret_cast<void*>(VkImageView(view));
+            r.resource = reinterpret_cast<void*>(VkImageView(*owned.view));
             r.description.type = FFX_RESOURCE_TYPE_TEXTURE2D;
             r.description.format = format;
-            r.description.width = w;
-            r.description.height = h;
+            r.description.width = owned.width;
+            r.description.height = owned.height;
             r.description.depth = 1;
             r.description.mipCount = 1;
             r.state = state;
@@ -356,14 +454,12 @@ struct Upscaler::Impl {
         ffxDispatchDescUpscale d{};
         d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
         d.commandList = reinterpret_cast<void*>(VkCommandBuffer(cmdbuf));
-        d.color = resource(color.view, color.width, color.height,
-                           FFX_SURFACE_FORMAT_R8G8B8A8_UNORM, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        d.depth = resource(depth.view, depth.width, depth.height, FFX_SURFACE_FORMAT_R32_FLOAT,
+        d.color = resource(color_in, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
                            FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        d.motionVectors = resource(motion.view, motion.width, motion.height,
-                                   FFX_SURFACE_FORMAT_R16G16_FLOAT,
+        d.depth = resource(depth_in, FFX_SURFACE_FORMAT_R32_FLOAT, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.motionVectors = resource(motion_in, FFX_SURFACE_FORMAT_R16G16_FLOAT,
                                    FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        d.output = resource(*target_view, ow, oh, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
+        d.output = resource(target, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
                             FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
         d.jitterOffset = {jx, jy};
         // The game's vectors are screen UV, current minus previous; FSR wants render pixels
@@ -400,32 +496,8 @@ struct Upscaler::Impl {
         in_flight.emplace_back(frame_id, scheduler.CurrentTick());
 
         // FSR's RGBA16F result into the resolve's target (layout TransferDst, set by the caller).
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                               vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
-                               vk::ImageMemoryBarrier{
-                                   .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
-                                   .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                                   .oldLayout = vk::ImageLayout::eGeneral,
-                                   .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                   .image = target,
-                                   .subresourceRange = ColorRange,
-                               });
-        const vk::ImageSubresourceLayers layers{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
-            .mipLevel = 0,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        };
-        const vk::ImageBlit blit{
-            .srcSubresource = layers,
-            .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(ow), s32(oh), 1}},
-            .dstSubresource = layers,
-            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(ow), s32(oh), 1}},
-        };
-        cmdbuf.blitImage(target, vk::ImageLayout::eTransferSrcOptimal, output,
-                         vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+        To(cmdbuf, target, vk::ImageLayout::eTransferSrcOptimal);
+        Blit(cmdbuf, target.image, ow, oh, output, ow, oh);
         problem.clear();
         return true;
     }

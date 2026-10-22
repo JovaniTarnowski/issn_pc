@@ -53,11 +53,19 @@ Controller
   light bar work as on the PS4.
 - Pads without a touchpad or motion sensors (Xbox, 8BitDo, ...), on by itself for them (launcher:
   Game > Controls > Controller without touchpad):
-  - Spray can: L3 + R3 together (or H) holds the pad like the spray can; L1 shakes it, the right
-    stick aims. L3 + R3 again ends it.
+  - Spray can: L3 + R3 together tilts the pad like the spray can; L1 rattles it, the right
+    stick aims. L3 + R3 again levels it.
   - Touchpad swipe (lift, push): hold Select/Back and push the right stick that way.
   - Two fingers on the touchpad (lifting the tree): hold Select/Back + RB (R1).
   - Touchpad click: Select/Back.
+- Keyboard and mouse (axylpup's layout; launcher: Game > Controls changes the buttons):
+  - WASD moves, IJKL turns the camera, Y gives the camera to the mouse (Y again gives it back).
+  - Space Cross, Left Shift Circle, C Square, F Triangle (numpad 2/6/4/8 too), Q L1, E R1,
+    U L3, O R3, Enter Options, arrows d-pad.
+  - Left click R2 (shoot), right click L2 (aim); 1 / 3 also work.
+  - R / G: left / right side of the touchpad click (G + IJKL: swipe).
+  - Spray can: hold Z to tilt the pad, tap Z or hold X to rattle it, move the mouse to aim.
+  - F12 screenshot, Insert the port's menu.
 - Text and voices: launcher > Game > Game language (Automatic follows the launcher: Portuguese
   gives the Brazilian dub on the US release).
 

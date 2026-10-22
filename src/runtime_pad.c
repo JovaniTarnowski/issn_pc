@@ -1,18 +1,16 @@
 /* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
- * Default keyboard layout (ISSN_KEY_MAP changes the buttons, see apply_button_map):
- *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
- *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
- *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
- *   IJKL d-pad (I up, K down, J left, L right), G shake, H spray pose (issn: the motion
- *   sensors of a pad without them, for inFAMOUS Second Son's spray can).
+ * Default keyboard layout (axylpup's; ISSN_KEY_MAP changes the buttons, see apply_button_map):
+ *   WASD left stick, IJKL right stick, arrows d-pad, Space Cross, LShift Circle, C Square,
+ *   F Triangle (numpad 2/6/4/8 too), Q L1, E R1, 1 / right mouse L2, 3 / left mouse R2, U L3, O R3,
+ *   Enter Options, R left touchpad (photo mode), G right touchpad (pause menu), Y mouse camera.
  *
- * issn: spray pose (pads without motion sensors). L3+R3 together, or H, turns it on and off:
- * the game reads the pad held sideways (gravity along its side, the orientation turned 90
- * degrees), L1 shakes it, and the right stick turns it to aim (angular velocity). ISSN_SPRAY_SIDE
- * =left holds it the other way up; ISSN_SPRAY_AIM=0 leaves the right stick to the game alone;
- * ISSN_SPRAY_ORIENT=level keeps the orientation level (only gravity turns sideways).
+ * issn: synthetic motion (axylpup's SyntheticMotionLocked) for a keyboard or a pad without motion
+ * sensors, for inFAMOUS Second Son's spray can: Z held (or L3+R3 / H to toggle) tilts the pad on
+ * its side, a tap of Z or X held (L1 while tilted on a pad) rattles it, and the mouse or the right
+ * stick aims while tilted. Pose, gravity and angular velocity come from one quaternion, so the
+ * accelerometer, the gyroscope and the orientation always agree.
  *
  * issn: the motion sensors of a DualShock 4/DualSense (SDL accelerometer and gyroscope) and the
  * orientation integrated from the gyroscope; scePadSetLightBar colors the pad's light bar. */
@@ -41,7 +39,7 @@ enum {
     /* Host-only sources, never shown to the game: a click on one side of the touchpad from a
      * button or key without a touch surface (play_click turns them into a touch and a click). */
     CLICK_LEFT=0x40000000, CLICK_RIGHT=0x80000000,
-    /* issn: shakes the pad (motion_shake) while held: keyboard G, or a mapped pad button. */
+    /* issn: rattles the pad (synth_motion) while held: keyboard X, or a mapped pad button. */
     SHAKE=0x20000000,
     /* issn: turns the spray pose on and off (H; L3+R3 together on a pad). */
     SPRAY_POSE=0x10000000,
@@ -112,69 +110,8 @@ static void integrate_orientation(float q[4], const float w[3], float dt) {
     if (n>0.0f) for (int i=0;i<4;++i) q[i]/=n;
 }
 
-/* A shake at 6 Hz, 2.5 G around gravity, along the axis gravity is on (y flat, x in the spray
- * pose): what shaking a spray can reads like. */
-static void motion_shake_axis(float accel[3], uint64_t now, float scale, int axis, float sign) {
-    const float t=(float)(now%1000000u)/1e6f;
-    accel[0]=accel[1]=accel[2]=0.0f;
-    accel[axis]=sign*(1.0f+2.5f*sinf(2.0f*3.14159265f*6.0f*t))*STANDARD_GRAVITY*scale;
-}
-static void motion_shake(float accel[3], uint64_t now, float scale) { motion_shake_axis(accel,now,scale,1,1.0f); }
-
-/* issn: the spray pose. The pad turned 90 degrees about its z axis (towards the player): its
- * x axis points up, so gravity reads along +x (-x with ISSN_SPRAY_SIDE=left). */
-static int spray_pose, spray_chord_held;
-static uint64_t spray_time;
-static float spray_side(void) {
-    static float side;
-    if (side==0.0f) { const char *e=getenv("ISSN_SPRAY_SIDE"); side=e && !SDL_strcasecmp(e,"left") ? -1.0f : 1.0f; }
-    return side;
-}
-static bool spray_aim(void) {
-    static int aim=-1;
-    if (aim<0) { const char *e=getenv("ISSN_SPRAY_AIM"); aim=!(e && e[0]=='0'); }
-    return aim!=0;
-}
-static bool spray_level(void) {
-    static int level=-1;
-    if (level<0) { const char *e=getenv("ISSN_SPRAY_ORIENT"); level=e && !SDL_strcasecmp(e,"level"); }
-    return level!=0;
-}
-static void spray_pose_set(int on) {
-    spray_pose=on;
-    /* Rotation of -90 (+90 the other side) degrees about z takes the pad's up axis (y) to x. */
-    const float s=0.70710678f;
-    const bool turned=on && !spray_level();
-    orientation_q[0]=0.0f; orientation_q[1]=0.0f;
-    orientation_q[2]=turned ? -spray_side()*s : 0.0f; orientation_q[3]=turned ? s : 1.0f;
-    orientation_time=0; spray_time=0;
-    printf("Runtime: pad spray pose %s\n",on ? "on (pad held sideways)" : "off");
-}
-static float stick_unit(uint8_t v) {
-    const float x=((float)v-128.0f)/127.0f;
-    return fabsf(x)<0.15f ? 0.0f : x;
-}
-/* Called under lock for each read in the spray pose. */
-static void apply_spray_pose(PadData *d, bool shaking) {
-    const float scale=accel_scale(), side=spray_side();
-    if (shaking) motion_shake_axis(d->acceleration,d->timestamp,scale,0,side);
-    else { d->acceleration[0]=side*STANDARD_GRAVITY*scale; d->acceleration[1]=0.0f; d->acceleration[2]=0.0f; }
-    float w[3]={0.0f,0.0f,0.0f};
-    if (spray_aim()) {
-        /* The right stick turns the pad: left/right about the vertical (the pad's x now), up/down
-         * about the horizontal axis across it (its y), up to 2 rad/s. Signs as the tester played
-         * the spray can (the first ones were backwards on both axes); ISSN_SPRAY_INVERT=1 flips. */
-        static int invert=-1;
-        if (invert<0) { const char *e=getenv("ISSN_SPRAY_INVERT"); invert=e && e[0]=='1'; }
-        const float sign=invert ? -1.0f : 1.0f;
-        w[0]=sign*side*2.0f*stick_unit(d->right_x);
-        w[1]=sign*2.0f*stick_unit(d->right_y);
-    }
-    memcpy(d->angular_velocity,w,sizeof(w));
-    if (spray_time) integrate_orientation(orientation_q,w,(float)(d->timestamp-spray_time)/1e6f);
-    spray_time=d->timestamp;
-    memcpy(d->orientation,orientation_q,sizeof(orientation_q));
-}
+/* issn: the L3+R3 / H toggle's edge (the synthetic motion sensor, synth_motion). */
+static int spray_chord_held;
 
 /* The pad's light bar takes the last color the game set (ISSN_LIGHTBAR=0 leaves it alone); sent
  * again after a reconnection, and only when it changes. Called under lock. */
@@ -423,14 +360,20 @@ static ButtonMap pad_map={{
     {SDL_GAMEPAD_BUTTON_DPAD_LEFT,BTN_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,BTN_RIGHT},
     {SDL_GAMEPAD_BUTTON_MISC1,SHAKE},
 },16};
+/* issn: the keyboard layout of axylpup's Second Son build (github.com/axylpup/shadPS4, release
+ * 1.0.2 input_config/default.ini): WASD moves, IJKL turns the camera, the arrows are the d-pad,
+ * the mouse buttons are L2 (aim) and R2 (shoot), Z tilts the pad (held) or rattles it (a tap), X
+ * rattles it while held, Y gives the camera to the mouse (motion_input). */
 static ButtonMap key_map={{
-    {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
-    {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
-    {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
-    {SDL_SCANCODE_RETURN,BTN_OPTIONS}, {SDL_SCANCODE_TAB,CLICK_LEFT}, {SDL_SCANCODE_BACKSPACE,CLICK_RIGHT},
-    {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
-    {SDL_SCANCODE_G,SHAKE}, {SDL_SCANCODE_H,SPRAY_POSE},
-},19};
+    {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_C,BTN_SQUARE},
+    {SDL_SCANCODE_F,BTN_TRIANGLE}, {SDL_SCANCODE_Q,BTN_L1}, {SDL_SCANCODE_E,BTN_R1},
+    {SDL_SCANCODE_1,BTN_L2}, {SDL_SCANCODE_3,BTN_R2}, {SDL_SCANCODE_U,BTN_L3}, {SDL_SCANCODE_O,BTN_R3},
+    {SDL_SCANCODE_RETURN,BTN_OPTIONS}, {SDL_SCANCODE_R,CLICK_LEFT}, {SDL_SCANCODE_G,CLICK_RIGHT},
+    {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
+    {SDL_SCANCODE_KP_2,BTN_CROSS}, {SDL_SCANCODE_KP_6,BTN_CIRCLE}, {SDL_SCANCODE_KP_4,BTN_SQUARE},
+    {SDL_SCANCODE_KP_8,BTN_TRIANGLE},
+    {SDL_SCANCODE_X,SHAKE}, {SDL_SCANCODE_H,SPRAY_POSE},
+},23};
 
 static char *trim(char *text) {
     while (*text==' ' || *text=='\t') ++text;
@@ -490,6 +433,91 @@ static void load_button_maps(void) {
 static void key_axis(uint8_t *axis, bool negative, bool positive) {
     if (negative || positive) *axis=(uint8_t)(128-(negative ? 128 : 0)+(positive ? 127 : 0));
 }
+/* issn: the mouse. Its buttons are L2 (right: aim) and R2 (left: shoot) while the game window has
+ * it; its motion goes to the synthetic motion sensor while the pad is tilted (the spray can's aim)
+ * and, while the window holds the mouse (Y in the game, issn_overlay.cpp), to the right stick as
+ * the camera. ISSN_MOUSE_SPEED (pixels per second for a full stick, default 900). */
+static float mouse_dx, mouse_dy; /* motion since the last read, for synth_motion */
+static void sample_mouse(PadData *d) {
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
+    SDL_Window *window=SDL_GetMouseFocus();
+    float dx=0.0f, dy=0.0f;
+    const SDL_MouseButtonFlags buttons=SDL_GetRelativeMouseState(&dx,&dy);
+    if (!window) { mouse_dx=mouse_dy=0.0f; return; }
+    mouse_dx+=dx; mouse_dy+=dy;
+    if (buttons & SDL_BUTTON_LMASK) { d->buttons|=BTN_R2; d->r2=255; }
+    if (buttons & SDL_BUTTON_RMASK) { d->buttons|=BTN_L2; d->l2=255; }
+    if (!SDL_GetWindowRelativeMouseMode(window)) return;
+    static float speed;
+    if (speed==0.0f) { const char *e=getenv("ISSN_MOUSE_SPEED"); speed=e && atof(e)>50.0 ? (float)atof(e) : 900.0f; }
+    static uint64_t last;
+    const uint64_t now=d->timestamp;
+    const float dt=last && now>last ? (float)(now-last)/1e6f : 0.016f;
+    last=now;
+    if (dt<=0.0f || dt>0.25f) return;
+    const float sx=dx/dt/speed, sy=dy/dt/speed;
+    if (sx!=0.0f) d->right_x=(uint8_t)lroundf(fmaxf(0.0f,fminf(255.0f,128.0f+127.0f*fmaxf(-1.0f,fminf(1.0f,sx)))));
+    if (sy!=0.0f) d->right_y=(uint8_t)lroundf(fmaxf(0.0f,fminf(255.0f,128.0f+127.0f*fmaxf(-1.0f,fminf(1.0f,sy)))));
+}
+
+/* issn: synthetic motion sensor for pads without one and the keyboard, as axylpup's build models
+ * it (src/input/controller.cpp SyntheticMotionLocked): the pad's pose is yaw * pitch * roll; held
+ * tilted it rolls 90 degrees (eased over 80 ms), and the accelerometer reads gravity in the pad's
+ * frame from that same pose (the game's own formula), with a 5 Hz rattle on top; the gyroscope
+ * reads the pose's change. Aim while tilted: the mouse (0.004 rad per pixel) or the right stick
+ * (2 rad/s). */
+static struct {
+    float yaw, pitch, phi;
+    float last_q[4];
+    uint64_t last_t, t0, rattle_until, z_down;
+    int pose_toggle, z_was;
+} synth={.last_q={0.0f,0.0f,0.0f,1.0f}};
+static void q_mul(const float a[4], const float b[4], float out[4]) { /* Hamilton product, x y z w */
+    const float r[4]={a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1], a[3]*b[1]+a[1]*b[3]+a[2]*b[0]-a[0]*b[2],
+                      a[3]*b[2]+a[2]*b[3]+a[0]*b[1]-a[1]*b[0], a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]};
+    memcpy(out,r,sizeof(r));
+}
+static void q_axis(float x, float y, float z, float angle, float out[4]) {
+    const float s=sinf(angle*0.5f);
+    out[0]=x*s; out[1]=y*s; out[2]=z*s; out[3]=cosf(angle*0.5f);
+}
+static void synth_motion(PadData *d, bool tilt, bool rattle, float aim_x, float aim_y) {
+    const float pi=3.14159265f;
+    const uint64_t now=d->timestamp;
+    if (!synth.t0) synth.t0=now;
+    const float dt=synth.last_t && now>synth.last_t ? fminf((float)(now-synth.last_t)/1e6f,0.1f) : 0.0f;
+    if (tilt) {
+        synth.yaw-=0.004f*mouse_dx+2.0f*aim_x*dt;
+        synth.pitch-=0.004f*mouse_dy+2.0f*aim_y*dt;
+        synth.pitch=fmaxf(-80.0f*pi/180.0f,fminf(80.0f*pi/180.0f,synth.pitch));
+        if (synth.yaw>pi) synth.yaw-=2.0f*pi; else if (synth.yaw<-pi) synth.yaw+=2.0f*pi;
+    } else {
+        const float ease=1.0f-expf(-dt/0.15f); /* back to the pad held flat */
+        synth.yaw-=synth.yaw*ease; synth.pitch-=synth.pitch*ease;
+    }
+    const float target=tilt ? pi*0.5f : 0.0f;
+    synth.phi+=(target-synth.phi)*(1.0f-expf(-dt/0.08f));
+    float qy[4], qp[4], qr[4], q[4];
+    q_axis(0.0f,1.0f,0.0f,synth.yaw,qy); q_axis(1.0f,0.0f,0.0f,synth.pitch,qp); q_axis(0.0f,0.0f,1.0f,synth.phi,qr);
+    q_mul(qy,qp,q); q_mul(q,qr,q);
+    const float gx=2*q[0]*q[1]+2*q[3]*q[2], gy=1-2*q[0]*q[0]-2*q[2]*q[2], gz=2*q[1]*q[2]-2*q[3]*q[0];
+    const float shake=rattle ? 2.5f*sinf(2.0f*pi*5.0f*(float)(now-synth.t0)/1e6f) : 0.0f;
+    const float g=STANDARD_GRAVITY*(1.0f+shake)*accel_scale();
+    d->acceleration[0]=gx*g; d->acceleration[1]=gy*g; d->acceleration[2]=gz*g;
+    float w[3]={0.0f,0.0f,0.0f};
+    if (dt>0.0f) {
+        const float conj[4]={-synth.last_q[0],-synth.last_q[1],-synth.last_q[2],synth.last_q[3]};
+        float dq[4];
+        q_mul(conj,q,dq);
+        if (dq[3]<0.0f) for (int i=0;i<4;++i) dq[i]=-dq[i];
+        for (int i=0;i<3;++i) w[i]=2.0f*dq[i]/dt;
+    }
+    memcpy(d->angular_velocity,w,sizeof(w));
+    memcpy(d->orientation,q,sizeof(q));
+    memcpy(synth.last_q,q,sizeof(q));
+    synth.last_t=now;
+}
+
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -542,8 +570,9 @@ static void sample_host(PadData *d) {
     if (d->buttons & BTN_R2) d->r2=255;
     key_axis(&d->left_x,k[SDL_SCANCODE_A],k[SDL_SCANCODE_D]);
     key_axis(&d->left_y,k[SDL_SCANCODE_W],k[SDL_SCANCODE_S]);
-    key_axis(&d->right_x,k[SDL_SCANCODE_LEFT],k[SDL_SCANCODE_RIGHT]);
-    key_axis(&d->right_y,k[SDL_SCANCODE_UP],k[SDL_SCANCODE_DOWN]);
+    key_axis(&d->right_x,k[SDL_SCANCODE_J],k[SDL_SCANCODE_L]);
+    key_axis(&d->right_y,k[SDL_SCANCODE_I],k[SDL_SCANCODE_K]);
+    sample_mouse(d);
 }
 
 /* ISSN_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
@@ -668,21 +697,40 @@ static void sample(PadData *d) {
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
-    /* issn: spray pose: L3+R3 together (hidden from the game) or a SPRAY_POSE source toggles it;
-     * in it L1 shakes the can. */
+    /* issn: the motion sensor of a pad without one, and of the keyboard (synth_motion). The pad
+     * is tilted while Z is held, while L3+R3 (pads without sensors) or H has toggled it on, and
+     * while it rattles; it rattles while X (a SHAKE source) is held, for 600 ms after a quick tap
+     * of Z, and on L1 while the pose is toggled on. A pad with real sensors keeps them. */
     const bool chord=pad_emulation() && (d->buttons & BTN_L3) && (d->buttons & BTN_R3);
     if (chord || (d->buttons & SPRAY_POSE)) {
-        if (!spray_chord_held) spray_pose_set(!spray_pose);
+        if (!spray_chord_held) {
+            synth.pose_toggle=!synth.pose_toggle;
+            printf("Runtime: pad tilted (spray can) %s\n",synth.pose_toggle ? "on" : "off");
+        }
         spray_chord_held=1;
         d->buttons&=~(BTN_L3|BTN_R3|SPRAY_POSE);
     } else {
         spray_chord_held=0;
     }
-    if (spray_pose && (d->buttons & BTN_L1)) d->buttons=(d->buttons&~BTN_L1)|SHAKE;
-    const bool shaking=(d->buttons & SHAKE)!=0;
+    const bool *keys=SDL_WasInit(SDL_INIT_VIDEO) && !issngpu_overlay_captures_input() ? SDL_GetKeyboardState(NULL) : NULL;
+    const bool z=keys && keys[SDL_SCANCODE_Z];
+    if (z && !synth.z_was) synth.z_down=d->timestamp;
+    if (!z && synth.z_was && d->timestamp-synth.z_down<250000) synth.rattle_until=d->timestamp+600000;
+    synth.z_was=z;
+    if (synth.pose_toggle && (d->buttons & BTN_L1)) d->buttons=(d->buttons&~BTN_L1)|SHAKE;
+    const bool rattle=(d->buttons & SHAKE)!=0 || d->timestamp<synth.rattle_until;
     d->buttons&=~SHAKE; /* host-only: the game sees the motion, not a button */
-    if (spray_pose) apply_spray_pose(d,shaking);
-    else if (shaking) motion_shake(d->acceleration,d->timestamp,accel_scale());
+    const bool tilt=z || synth.pose_toggle || rattle;
+    const bool real_sensors=gamepad && (sensors & SENSOR_ACCEL) && motion_enabled;
+    if (!real_sensors || tilt) { /* Z / X / L3+R3 also drive a pad that has sensors */
+        const float ax=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_x-128.0f)/127.0f : 0.0f;
+        const float ay=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_y-128.0f)/127.0f : 0.0f;
+        synth_motion(d,tilt,rattle,fabsf(ax)<0.15f ? 0.0f : ax,fabsf(ay)<0.15f ? 0.0f : ay);
+        static int was_tilted;
+        if (tilt!=was_tilted) printf("Runtime: pad %s\n",tilt ? "tilted (spray can)" : "level");
+        was_tilted=tilt;
+    }
+    mouse_dx=mouse_dy=0.0f;
     if (pad_emulation()) play_swipe(d);
     play_click(d);
     if (hold_after_capture) {
@@ -771,12 +819,12 @@ static void log_motion_call(const char *what, int value) {
                    !strcmp(what,"angular velocity deadband") ? 2 : -1;
     if (slot<0) {
         if (++resets<=20) printf("Runtime: pad: game reset the orientation (%u)%s\n",resets,
-                                  spray_pose ? " in the spray pose" : "");
+                                  synth.pose_toggle ? " with the pad tilted" : "");
         return;
     }
     if (last[slot]==value) return;
     last[slot]=value;
-    printf("Runtime: pad: game set %s %s%s\n",what,value ? "on" : "off",spray_pose ? " (spray pose on)" : "");
+    printf("Runtime: pad: game set %s %s%s\n",what,value ? "on" : "off",synth.pose_toggle ? " (pad tilted)" : "");
 }
 static ABI int32_t pad_tilt_correction(int32_t handle, uint8_t enable) {
     log_motion_call("tilt correction",enable!=0);

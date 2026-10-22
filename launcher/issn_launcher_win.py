@@ -324,15 +324,17 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
 # from the analog triggers and the left touchpad click (photo mode) from L1 + the right click's
 # button; neither is remapped on the gamepad.
-CONTROLS = [('cross', 'Space', 'a'), ('circle', 'Left Shift', 'b'), ('square', 'E', 'x'),
-            ('triangle', 'Q', 'y'), ('l1', '1', 'leftshoulder'), ('r1', '3', 'rightshoulder'),
-            ('l2', 'R', None), ('r2', 'F', None), ('l3', 'Z', 'leftstick'),
-            ('r3', 'C', 'rightstick'), ('options', 'Return', 'start'),
-            ('touchpad_left', 'Tab', None), ('touchpad_right', 'Backspace', 'back'),
-            ('up', 'I', 'dpup'), ('down', 'K', 'dpdown'), ('left', 'J', 'dpleft'), ('right', 'L', 'dpright'),
-            # issn: shakes the pad's motion sensors (the spray can); misc1 is the Share button of an
+# issn: the keyboard layout of axylpup's build (runtime_pad.c key_map); L2 / R2 are also the
+# right / left mouse buttons.
+CONTROLS = [('cross', 'Space', 'a'), ('circle', 'Left Shift', 'b'), ('square', 'C', 'x'),
+            ('triangle', 'F', 'y'), ('l1', 'Q', 'leftshoulder'), ('r1', 'E', 'rightshoulder'),
+            ('l2', '1', None), ('r2', '3', None), ('l3', 'U', 'leftstick'),
+            ('r3', 'O', 'rightstick'), ('options', 'Return', 'start'),
+            ('touchpad_left', 'R', None), ('touchpad_right', 'G', 'back'),
+            ('up', 'Up', 'dpup'), ('down', 'Down', 'dpdown'), ('left', 'Left', 'dpleft'), ('right', 'Right', 'dpright'),
+            # issn: rattles the pad's motion sensor (the spray can); misc1 is the Share button of an
             # Xbox Series pad and the mute button of a DualSense, which the game does not use.
-            ('shake', 'G', 'misc1')]
+            ('shake', 'X', 'misc1')]
 PS_BUTTON_NAMES = {'cross': 'Cross', 'circle': 'Circle', 'square': 'Square', 'triangle': 'Triangle',
                    'l1': 'L1', 'r1': 'R1', 'l2': 'L2', 'r2': 'R2', 'l3': 'L3', 'r3': 'R3',
                    'options': 'Options', 'touchpad_left': 'Touchpad left', 'touchpad_right': 'Touchpad right',
@@ -1581,12 +1583,13 @@ class Launcher:
         self.row(f, _('Controller without touchpad'), self.choice(f, 'pad_emulation', 'app', PAD_EMULATION),
                  _('For Xbox, 8BitDo and other pads without a touchpad or motion sensors. Touchpad click: '
                    'Select/Back (with L1: the left side). Swipe: hold Select/Back and push the right stick. '
-                   'Two fingers: hold Select/Back + RB. Spray can: L3 + R3 together, LB shakes it, the right '
-                   'stick aims. Automatic turns it off on a DualShock 4 or DualSense.'), restart=True)
-        self.row(f, _('In-game button icons'), self.choice(f, 'glyph_style', 'app', GLYPH_STYLES),
-                 hint=_('Replaces the PlayStation button icons inside the game with the ones of your controller. '
-                        'Works on a copy of two game files in the port\'s data folder (about 70 MB); your game folder '
-                        'is never changed. Applied when the game starts.'))
+                   'Two fingers: hold Select/Back + RB. Spray can: L3 + R3 together tilts the pad, LB '
+                   'rattles it, the right stick aims. Automatic turns it off on a DualShock 4 or DualSense.'),
+                 restart=True)
+        self.note(f, _('Keyboard and mouse: WASD moves, IJKL turns the camera, Y gives the camera to the mouse '
+                       '(and back). Left click R2 (shoot), right click L2 (aim). Spray can: hold Z to tilt the '
+                       'pad, tap Z or hold X to rattle it, move the mouse to aim. R / G: left / right touchpad '
+                       '(G + IJKL: swipe). Arrows: d-pad. F12: screenshot. Insert: the port\'s menu.'), top=8)
         table = ttk.Frame(f)
         table.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(16, 0))
         for column, span, title in ((0, 2, _('GAME BUTTON')), (2, 1, _('KEYBOARD')), (3, 2, _('GAMEPAD'))):

@@ -964,10 +964,27 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
+        if (down && !event.key.repeat && event.key.key == SDLK_Y && !is_open) {
+            // issn: Y gives the camera to the mouse (runtime_pad.c sample_mouse) and back, as in
+            // axylpup's build.
+            if (SDL_Window* window = SDL_GetWindowFromID(event.key.windowID)) {
+                const bool on = !SDL_GetWindowRelativeMouseMode(window);
+                SDL_SetWindowRelativeMouseMode(window, on);
+                std::printf("Mouse camera: %s (Y)\n", on ? "on" : "off");
+                std::fflush(stdout);
+            }
+            return true;
+        }
         if (down && !event.key.repeat && event.key.key == SDLK_F12) {
             // issn-axy: screenshot of the game picture (user/screenshots, PNG).
             VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
             return true;
+        }
+        if (down && !event.key.repeat && event.key.key == SDLK_INSERT && !is_open) {
+            // The menu needs the cursor: the mouse camera stops (Y turns it on again).
+            if (SDL_Window* window = SDL_GetWindowFromID(event.key.windowID)) {
+                SDL_SetWindowRelativeMouseMode(window, false);
+            }
         }
         if (down && !event.key.repeat &&
             (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {

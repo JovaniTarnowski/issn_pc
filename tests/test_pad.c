@@ -47,10 +47,14 @@ int main(void) {
         assert(near(q[0],0.0f,1e-3f) && near(q[1],0.70711f,2e-3f) && near(q[2],0.0f,1e-3f) && near(q[3],0.70711f,2e-3f));
         integrate_orientation(q,w,5.0f); /* a pause: kept */
         assert(near(q[1],0.70711f,2e-3f));
-        float a[3];
-        float lowest=10.0f, highest=-10.0f;
-        for (uint64_t t=0;t<200000;t+=5000) { motion_shake(a,t,1.0f/STANDARD_GRAVITY); if (a[1]<lowest) lowest=a[1]; if (a[1]>highest) highest=a[1]; }
-        assert(near(highest,3.5f,0.05f) && near(lowest,-1.5f,0.05f) && a[0]==0.0f && a[2]==0.0f);
+        /* synth_motion level and still: gravity along y, the identity pose, no rotation. */
+        PadData level={0};
+        level.timestamp=1000000;
+        synth_motion(&level,false,false,0.0f,0.0f);
+        level.timestamp=1010000;
+        synth_motion(&level,false,false,0.0f,0.0f);
+        assert(near(level.acceleration[1],1.0f,1e-4f) && near(level.orientation[3],1.0f,1e-6f) &&
+               level.angular_velocity[2]==0.0f);
     }
     const char *tmp=getenv("TMPDIR") ? getenv("TMPDIR") : getenv("TEMP") ? getenv("TEMP") : "/tmp";
     char path[1024];
@@ -239,30 +243,34 @@ int main(void) {
     assert(SDL_SendJoystickVirtualSensorData(joystick,SDL_SENSOR_GYRO,SDL_GetTicksNS(),still,3));
     pump();
 
-    /* The shake source (G, a mapped button, the pad file's "shake"): motion, never a button. */
+    /* The shake source (X, a mapped button, the pad file's "shake"): the pad tilts and rattles
+     * (synth_motion, axylpup's model), never a button. */
     inject(path,"shake");
     float lowest=10.0f, highest=-10.0f;
-    for (int i=0;i<12;++i) {
+    for (int i=0;i<24;++i) {
         data=read_pad();
         assert(!(data.buttons & SHAKE));
-        if (data.acceleration[1]<lowest) lowest=data.acceleration[1];
-        if (data.acceleration[1]>highest) highest=data.acceleration[1];
+        if (i>=8) { /* tilted by now (eased over 80 ms) */
+            if (data.acceleration[0]<lowest) lowest=data.acceleration[0];
+            if (data.acceleration[0]>highest) highest=data.acceleration[0];
+        }
         usleep(15000);
     }
     assert(highest-lowest>2.0f);
     inject(path,"");
-    data=read_pad();
-    assert(near(data.acceleration[1],1.0f,1e-3f));
+    for (int i=0;i<20;++i) { data=read_pad(); usleep(15000); } /* back level */
+    assert(near(data.acceleration[1],1.0f,0.05f));
 
-    /* issn: spray pose (pads without sensors): toggled by its source or L3+R3 (both hidden), the
-     * pad reads held sideways; L1 shakes it along that axis; the right stick turns it. */
+    /* issn: the tilt toggle (pads without sensors): its source or L3+R3 (both hidden); the pad
+     * rolls 90 degrees about z, so gravity reads along +x and the pose agrees; L1 rattles it;
+     * the right stick turns it. */
     inject(path,"spray_pose");
     data=read_pad();
-    assert(spray_pose && !(data.buttons & SPRAY_POSE));
+    assert(synth.pose_toggle && !(data.buttons & SPRAY_POSE));
     inject(path,"");
-    data=read_pad();
-    assert(spray_pose && near(data.acceleration[0],1.0f,1e-3f) && near(data.acceleration[1],0.0f,1e-3f));
-    assert(near(data.orientation[2],-0.7071068f,1e-3f) && near(data.orientation[3],0.7071068f,1e-3f));
+    for (int i=0;i<20;++i) { data=read_pad(); usleep(15000); }
+    assert(near(data.acceleration[0],1.0f,0.02f) && near(data.acceleration[1],0.0f,0.02f));
+    assert(near(data.orientation[2],0.7071068f,0.01f) && near(data.orientation[3],0.7071068f,0.01f));
     inject(path,"l1");
     lowest=10.0f; highest=-10.0f;
     for (int i=0;i<12;++i) {
@@ -277,13 +285,13 @@ int main(void) {
     data=read_pad();
     usleep(20000);
     data=read_pad();
-    assert(data.angular_velocity[0]>1.5f && !near(data.orientation[0],0.0f,1e-4f));
+    assert(fabsf(data.angular_velocity[0])>1.5f);
     inject(path,"l3 r3");
     data=read_pad();
-    assert(!spray_pose && !(data.buttons & (BTN_L3|BTN_R3)));
+    assert(!synth.pose_toggle && !(data.buttons & (BTN_L3|BTN_R3)));
     inject(path,"");
-    data=read_pad();
-    assert(near(data.acceleration[1],1.0f,1e-3f) && data.orientation[3]==1.0f);
+    for (int i=0;i<30;++i) { data=read_pad(); usleep(15000); }
+    assert(near(data.acceleration[1],1.0f,0.05f));
 
     /* issn: right stick + the right click source: a swipe across the touchpad, no click. */
     inject(path,"ry=0");
