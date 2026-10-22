@@ -117,7 +117,13 @@ public:
     /// SHADPS4_DLSS: the image at exactly `address` with this size, the most recently used one
     /// when several alias it (0x26b200000 holds the 1920x1080 scene depth and, after the AA, the
     /// minimap's 768x768 depth: FindImageFromRange's byte-size test matches neither).
-    [[nodiscard]] ImageId FindImageAtSize(VAddr address, u32 width, u32 height);
+    /// The most recently used image at `address` of that size (and of `format`, when given).
+    [[nodiscard]] ImageId FindImageAtSize(VAddr address, u32 width, u32 height,
+                                          vk::Format format = vk::Format::eUndefined);
+    /// issn-axy: every image starting at `address` (format, size, last use), for the log.
+    [[nodiscard]] std::string DescribeImagesAt(VAddr address);
+    /// issn-axy: the `count` most recently used images of that size anywhere (address, format).
+    [[nodiscard]] std::string DescribeRecentImages(u32 width, u32 height, size_t count);
 
     /// SHADPS4_DRAW_REPEAT_HEAP: any image whose guest address is exactly `address` (the
     /// candidates FindImageFromRange considers, without its size test or log).

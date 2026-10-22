@@ -1665,9 +1665,59 @@ void Rasterizer::DlssResolve() {
             address, out.info.size.width, out.info.size.height);
         return id ? &texture_cache.GetImage(id) : nullptr;
     };
-    VideoCore::Image* in = find(Dlss::ColorInAddr);
-    if (!in || in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
-        if (++dlss_missing <= 8) {
+    const bool fsr4_mode = Dlss::Mode() == 3;
+    // issn-axy: the colour input of the target's own format first; FSR 4 also takes another
+    // colour format (it blits). Tester 2026-10-21: with FSR 4 on the picture was yellow and the
+    // log had only the 8 "no matching input" lines - every resolve was skipped, so the target
+    // kept what another pass had left in that memory.
+    VideoCore::Image* in = nullptr;
+    if (const VideoCore::ImageId id = texture_cache.FindImageAtSize(
+            Dlss::ColorInAddr, out.info.size.width, out.info.size.height, out.info.pixel_format)) {
+        in = &texture_cache.GetImage(id);
+    } else if (fsr4_mode) {
+        in = find(Dlss::ColorInAddr);
+        if (in && (in->aspect_mask & vk::ImageAspectFlagBits::eDepth)) {
+            in = nullptr;
+        }
+    }
+    fsr4_blit_in = in && in->info.pixel_format != out.info.pixel_format;
+    const auto fsr4_missed = [&](std::string_view why) {
+        ++fsr4_misses;
+        ++fsr4_fail_streak;
+        // The first ones (loading), the one 2 s into a failing stretch (play), then now and then.
+        const bool steady = fsr4_fail_streak == 120;
+        if (fsr4_misses <= 4 || steady || (fsr4_misses & 1023) == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FSR 4: not run ({}; {} of {} resolves) - target {:#x} {} {}x{}; at "
+                        "{:#x}: {}; motion {:#x}: {}; depth {:#x}: {}",
+                        why, fsr4_misses, dlss_calls, regs.color_buffers[0].Address(),
+                        vk::to_string(out.info.pixel_format), out.info.size.width,
+                        out.info.size.height, Dlss::ColorInAddr,
+                        texture_cache.DescribeImagesAt(Dlss::ColorInAddr), Dlss::MotionAddr,
+                        texture_cache.DescribeImagesAt(Dlss::MotionAddr), Dlss::DepthAddr,
+                        texture_cache.DescribeImagesAt(Dlss::DepthAddr));
+            if (fsr4_misses <= 2 || steady) {
+                LOG_WARNING(Render_Vulkan, "FSR 4: recent {}x{} images: {}", out.info.size.width,
+                            out.info.size.height,
+                            texture_cache.DescribeRecentImages(out.info.size.width,
+                                                               out.info.size.height, 24));
+            }
+        }
+        // Not running for ~5 s of play: the game's own T2x again, rather than a wrong picture.
+        constexpr u32 FSR4_GIVE_UP = 300;
+        if (fsr4_fail_streak == FSR4_GIVE_UP) {
+            Dlss::g_ready.store(false, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan, "FSR 4: off ({}) - the game's own anti-aliasing is back",
+                        why);
+            std::printf("FSR 4: off (%.*s) - the game's own anti-aliasing is back\n",
+                        int(why.size()), why.data());
+            std::fflush(stdout);
+        }
+    };
+    if (!in) [[unlikely]] {
+        if (fsr4_mode) {
+            fsr4_missed("no colour input");
+        } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
                                        "the resolve's target keeps last frame's picture",
                         Dlss::ColorInAddr, regs.color_buffers[0].Address(), out.info.size.width,
@@ -1701,7 +1751,7 @@ void Rasterizer::DlssResolve() {
                                        : image.info.pixel_format;
                 const auto& view = image.FindView(view_info);
                 return Fsr4Aa::Input{image.GetImage(), *view.image_view, image.info.size.width,
-                                     image.info.size.height};
+                                     image.info.size.height, image.info.pixel_format};
             };
             float jx = 0.0f, jy = 0.0f;
             if (dlss_phase_in == 1 || dlss_phase_in == 2) {
@@ -1715,7 +1765,8 @@ void Rasterizer::DlssResolve() {
             }
             const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
             evaluated = fsr4->Record(cmdbuf, input(*in), input(*motion), input(*depth),
-                                     out.GetImage(), out.info.size.width, out.info.size.height,
+                                     out.GetImage(), out.info.pixel_format, out.info.size.width,
+                                     out.info.size.height,
                                      jx, jy, dlss_reset_pending);
             dlss_reset_pending = false;
             scheduler.GetDynamicState().Invalidate();
@@ -1729,9 +1780,19 @@ void Rasterizer::DlssResolve() {
                 // Assets missing: from the next frame on the game's own T2x runs again.
                 Dlss::g_ready.store(false, std::memory_order_relaxed);
             }
-        } else if (++dlss_missing <= 8) {
-            LOG_WARNING(Render_Vulkan, "FSR 4: motion vectors {} / depth {} missing - copy this frame",
-                        motion ? "found" : "missing", depth ? "found" : "missing");
+        }
+        if (evaluated) {
+            fsr4_fail_streak = 0;
+            if (dlss_evaluated == 0) {
+                LOG_WARNING(Render_Vulkan, "FSR 4: first frame resolved (colour {} {}x{} into {})",
+                            vk::to_string(in->info.pixel_format), in->info.size.width,
+                            in->info.size.height, vk::to_string(out.info.pixel_format));
+            }
+        } else {
+            fsr4_missed(!motion  ? "no motion vectors"
+                        : !depth ? "no depth"
+                                 : (fsr4 && !fsr4->Problem().empty() ? fsr4->Problem().c_str()
+                                                                     : "FSR did not record"));
         }
     } else if (Dlss::Mode() == 1) {
         VideoCore::Image* motion = find(Dlss::MotionAddr);
@@ -1828,11 +1889,34 @@ void Rasterizer::DlssResolve() {
         }
     } else if (evaluated) {
         ++dlss_evaluated;
+    } else if (fsr4_blit_in &&
+               Fsr4Aa::UnormTwin(in->info.pixel_format) != Fsr4Aa::UnormTwin(out.info.pixel_format)) {
+        // The game's picture without its AA, converted to the target's format.
+        in->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+        out.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
+        const vk::ImageSubresourceLayers layers{
+            .aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0,
+            .layerCount = 1};
+        const vk::ImageBlit blit{
+            .srcSubresource = layers,
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(in->info.size.width), s32(in->info.size.height), 1}},
+            .dstSubresource = layers,
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(out.info.size.width), s32(out.info.size.height), 1}},
+        };
+        scheduler.AcquireCommandBuffer().Handle().blitImage(
+            in->GetImage(), vk::ImageLayout::eTransferSrcOptimal, out.GetImage(),
+            vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
     } else {
         out.CopyImage(*in);
     }
     out.flags |= VideoCore::ImageFlagBits::GpuModified;
     out.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    if (fsr4_mode && (dlss_calls & 4095) == 0) {
+        LOG_WARNING(Render_Vulkan, "FSR 4: {} of {} resolves done by FSR, {} not run",
+                    dlss_evaluated, dlss_calls, fsr4_misses);
+    }
     if ((dlss_calls & 1023) == 1) {
         LOG_INFO(Render_Vulkan,
                  "DLSS: resolve actions {} (evaluated {}, no input {}), output {:#x}; jitter phase "

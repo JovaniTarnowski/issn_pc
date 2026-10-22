@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 #include <cstdlib>
@@ -1310,14 +1311,15 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageId TextureCache::FindImageAtSize(VAddr address, u32 width, u32 height) {
+ImageId TextureCache::FindImageAtSize(VAddr address, u32 width, u32 height, vk::Format format) {
     ImageId best{};
     u64 best_tick = 0;
     if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
         for (const ImageId image_id : *it) {
             const Image& image = slot_images[image_id];
             if (image.info.guest_address != address || image.info.size.width != width ||
-                image.info.size.height != height) {
+                image.info.size.height != height ||
+                (format != vk::Format::eUndefined && image.info.pixel_format != format)) {
                 continue;
             }
             if (!best || image.tick_accessed_last >= best_tick) {
@@ -1327,6 +1329,42 @@ ImageId TextureCache::FindImageAtSize(VAddr address, u32 width, u32 height) {
         }
     }
     return best;
+}
+
+std::string TextureCache::DescribeImagesAt(VAddr address) {
+    std::string text;
+    if (const auto it = page_table.find(address >> Traits::PageBits); it != nullptr) {
+        for (const ImageId image_id : *it) {
+            const Image& image = slot_images[image_id];
+            if (image.info.guest_address != address) {
+                continue;
+            }
+            text += fmt::format("{}{} {}x{} (used {})", text.empty() ? "" : ", ",
+                                vk::to_string(image.info.pixel_format), image.info.size.width,
+                                image.info.size.height, image.tick_accessed_last);
+        }
+    }
+    return text.empty() ? std::string{"none"} : text;
+}
+
+std::string TextureCache::DescribeRecentImages(u32 width, u32 height, size_t count) {
+    std::vector<const Image*> found;
+    for (const Image& image : slot_images) {
+        if (image.info.size.width == width && image.info.size.height == height &&
+            image.info.guest_address != 0) {
+            found.push_back(&image);
+        }
+    }
+    std::sort(found.begin(), found.end(), [](const Image* a, const Image* b) {
+        return a->tick_accessed_last > b->tick_accessed_last;
+    });
+    std::string text;
+    for (size_t i = 0; i < found.size() && i < count; ++i) {
+        text += fmt::format("{}{:#x} {} ({})", text.empty() ? "" : ", ",
+                            found[i]->info.guest_address, vk::to_string(found[i]->info.pixel_format),
+                            found[i]->tick_accessed_last);
+    }
+    return text.empty() ? std::string{"none"} : text;
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {

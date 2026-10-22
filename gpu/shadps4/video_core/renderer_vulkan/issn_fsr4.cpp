@@ -90,6 +90,7 @@ struct Upscaler::Impl {
         u32 width = 0, height = 0;
     };
     Owned color_in, motion_in, depth_in, target;
+    Owned color_raw, output_raw; ///< UNORM twins of sRGB images (UnormTwin), copied raw
     std::unique_ptr<VideoCore::UniqueBuffer> depth_buffer;
     u64 depth_buffer_size = 0;
     std::deque<std::pair<u64, Owned>> retired_images;
@@ -224,7 +225,7 @@ struct Upscaler::Impl {
     }
 
     /// `owned` as a width x height image of `format` (made again when either changes).
-    void Ensure(Owned& owned, vk::Format format, u32 width, u32 height) {
+    void Ensure(Owned& owned, vk::Format format, u32 width, u32 height, bool transfer_only = false) {
         if (owned.image && owned.format == format && owned.width == width && owned.height == height) {
             return;
         }
@@ -240,10 +241,20 @@ struct Upscaler::Impl {
             .mipLevels = 1,
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
-            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+            .usage = (transfer_only ? vk::ImageUsageFlags{}
+                                    : vk::ImageUsageFlagBits::eStorage |
+                                          vk::ImageUsageFlagBits::eSampled) |
                      vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
             .initialLayout = vk::ImageLayout::eUndefined,
         });
+        if (transfer_only) {
+            owned.view.reset();
+            owned.layout = vk::ImageLayout::eUndefined;
+            owned.format = format;
+            owned.width = width;
+            owned.height = height;
+            return;
+        }
         auto [result, view] = device.createImageViewUnique({
             .image = owned.image,
             .viewType = vk::ImageViewType::e2D,
@@ -297,6 +308,20 @@ struct Upscaler::Impl {
                          vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
     }
 
+    static void Copy(vk::CommandBuffer cmdbuf, vk::Image source, vk::Image dest, u32 w, u32 h) {
+        const vk::ImageSubresourceLayers layers{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        cmdbuf.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, dest,
+                         vk::ImageLayout::eTransferDstOptimal,
+                         vk::ImageCopy{.srcSubresource = layers,
+                                       .dstSubresource = layers,
+                                       .extent{w, h, 1}});
+    }
+
     /// The game's images (layout TransferSrcOptimal, set by the caller) into FSR's own.
     void CopyInputs(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
                     const Input& depth) {
@@ -321,8 +346,17 @@ struct Upscaler::Impl {
         for (Owned* owned : {&color_in, &motion_in, &depth_in}) {
             To(cmdbuf, *owned, vk::ImageLayout::eTransferDstOptimal);
         }
-        Blit(cmdbuf, color.image, color.width, color.height, color_in.image, color.width,
-             color.height);
+        if (const vk::Format twin = UnormTwin(color.format); twin != color.format) {
+            Ensure(color_raw, twin, color.width, color.height, true);
+            To(cmdbuf, color_raw, vk::ImageLayout::eTransferDstOptimal);
+            Copy(cmdbuf, color.image, color_raw.image, color.width, color.height);
+            To(cmdbuf, color_raw, vk::ImageLayout::eTransferSrcOptimal);
+            Blit(cmdbuf, color_raw.image, color.width, color.height, color_in.image, color.width,
+                 color.height);
+        } else {
+            Blit(cmdbuf, color.image, color.width, color.height, color_in.image, color.width,
+                 color.height);
+        }
         Blit(cmdbuf, motion.image, motion.width, motion.height, motion_in.image, motion.width,
              motion.height);
         const vk::BufferImageCopy depth_copy{
@@ -372,8 +406,8 @@ struct Upscaler::Impl {
     }
 
     bool Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                const Input& depth, vk::Image output, u32 ow, u32 oh, float jx, float jy,
-                bool reset) {
+                const Input& depth, vk::Image output, vk::Format output_format, u32 ow, u32 oh,
+                float jx, float jy, bool reset) {
         if (fatal) {
             return false;
         }
@@ -497,7 +531,15 @@ struct Upscaler::Impl {
 
         // FSR's RGBA16F result into the resolve's target (layout TransferDst, set by the caller).
         To(cmdbuf, target, vk::ImageLayout::eTransferSrcOptimal);
-        Blit(cmdbuf, target.image, ow, oh, output, ow, oh);
+        if (const vk::Format twin = UnormTwin(output_format); twin != output_format) {
+            Ensure(output_raw, twin, ow, oh, true);
+            To(cmdbuf, output_raw, vk::ImageLayout::eTransferDstOptimal);
+            Blit(cmdbuf, target.image, ow, oh, output_raw.image, ow, oh);
+            To(cmdbuf, output_raw, vk::ImageLayout::eTransferSrcOptimal);
+            Copy(cmdbuf, output_raw.image, output, ow, oh);
+        } else {
+            Blit(cmdbuf, target.image, ow, oh, output, ow, oh);
+        }
         problem.clear();
         return true;
     }
@@ -509,10 +551,10 @@ Upscaler::Upscaler(const Instance& instance, Scheduler& scheduler)
 Upscaler::~Upscaler() = default;
 
 bool Upscaler::Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                      const Input& depth, vk::Image output, u32 out_width, u32 out_height,
-                      float jitter_x, float jitter_y, bool reset) {
-    return impl->Record(cmdbuf, color, motion, depth, output, out_width, out_height, jitter_x,
-                        jitter_y, reset);
+                      const Input& depth, vk::Image output, vk::Format output_format,
+                      u32 out_width, u32 out_height, float jitter_x, float jitter_y, bool reset) {
+    return impl->Record(cmdbuf, color, motion, depth, output, output_format, out_width,
+                        out_height, jitter_x, jitter_y, reset);
 }
 
 const std::string& Upscaler::Problem() const noexcept {

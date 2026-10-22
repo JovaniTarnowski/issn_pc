@@ -335,6 +335,9 @@ public:
     u64 dlss_evaluated{};
     u32 dlss_last_combo{};
     bool dlss_reset_pending{true};
+    u64 fsr4_misses{};      ///< ISSN_FSR4: resolves FSR 4 could not run (logged separately)
+    u32 fsr4_fail_streak{}; ///< consecutive ones; at FSR4_GIVE_UP the game's own AA comes back
+    bool fsr4_blit_in{};    ///< the colour input differs in format from the target (blit, no copy)
     std::unique_ptr<Fsr4Aa::Upscaler> fsr4; ///< ISSN_FSR4 (issn_fsr4.h), made at the first resolve
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;

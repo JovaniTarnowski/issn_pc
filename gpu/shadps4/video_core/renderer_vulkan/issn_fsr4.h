@@ -27,7 +27,24 @@ struct Input {
     vk::Image image;
     vk::ImageView view;
     u32 width, height;
+    vk::Format format;
 };
+
+/// The UNORM format with the same bytes as an sRGB one (else `format`): the game's sRGB and UNORM
+/// views of one picture hold the same gamma-encoded bytes, so they are copied raw, not blitted
+/// (a blit would decode or encode the gamma).
+constexpr vk::Format UnormTwin(vk::Format format) {
+    switch (format) {
+    case vk::Format::eR8G8B8A8Srgb:
+        return vk::Format::eR8G8B8A8Unorm;
+    case vk::Format::eB8G8R8A8Srgb:
+        return vk::Format::eB8G8R8A8Unorm;
+    case vk::Format::eA8B8G8R8SrgbPack32:
+        return vk::Format::eA8B8G8R8UnormPack32;
+    default:
+        return format;
+    }
+}
 
 class Upscaler {
 public:
@@ -39,8 +56,8 @@ public:
     /// through a blit from FSR's RGBA16F image. `motion_uv`: vectors in screen UV, current minus
     /// previous (the game's). False = not run; the caller falls back to the game's picture.
     bool Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                const Input& depth, vk::Image output, u32 out_width, u32 out_height, float jitter_x,
-                float jitter_y, bool reset);
+                const Input& depth, vk::Image output, vk::Format output_format, u32 out_width,
+                u32 out_height, float jitter_x, float jitter_y, bool reset);
 
     /// The last failure, or empty; permanent ones stop further attempts.
     [[nodiscard]] const std::string& Problem() const noexcept;
