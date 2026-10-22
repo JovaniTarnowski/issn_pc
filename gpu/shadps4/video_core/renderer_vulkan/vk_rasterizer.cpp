@@ -1654,6 +1654,17 @@ void Rasterizer::DlssResolve() {
     // a plain copy of the tonemap output (the game without its temporal AA for that frame).
     ++dlss_calls;
     ++dlss_phases[dlss_phase_in & 3];
+    {
+        // issn-axy: more than 100 ms since the last resolve (Home switched it off, a menu, a
+        // load): FSR's history is another picture, so it starts over.
+        const u64 now_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+        if (dlss_last_resolve_ns != 0 && now_ns - dlss_last_resolve_ns > 100'000'000) {
+            dlss_reset_pending = true;
+        }
+        dlss_last_resolve_ns = now_ns;
+    }
     Dlss5::g_resolves.fetch_add(1, std::memory_order_release); // a game-rendered frame
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};

@@ -3,6 +3,7 @@
 // previous core (vk_fsr4.cpp of branch issn), without its 4.1.1 replay.
 #include "video_core/renderer_vulkan/issn_fsr4.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -95,6 +96,11 @@ struct Upscaler::Impl {
     u64 depth_buffer_size = 0;
     std::deque<std::pair<u64, Owned>> retired_images;
     std::deque<std::pair<u64, std::unique_ptr<VideoCore::UniqueBuffer>>> retired_buffers;
+    // GPU time of the whole FSR 4 pass (copies, model, result), logged as an average.
+    static constexpr u32 TimerSlots = 32;
+    vk::UniqueQueryPool timer_pool;
+    double timer_period_ns = 0.0, timer_sum_ms = 0.0, timer_max_ms = 0.0;
+    u32 timer_count = 0;
 
     Impl(const Instance& instance_, Scheduler& scheduler_)
         : instance{instance_}, scheduler{scheduler_} {}
@@ -186,6 +192,18 @@ struct Upscaler::Impl {
             return false;
         }
         backend_ok = true;
+        if (!timer_pool) {
+            const float period =
+                instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+            auto [pool_result, pool] = instance.GetDevice().createQueryPoolUnique({
+                .queryType = vk::QueryType::eTimestamp,
+                .queryCount = TimerSlots * 2,
+            });
+            if (pool_result == vk::Result::eSuccess && period > 0.0f) {
+                timer_pool = std::move(pool);
+                timer_period_ns = period;
+            }
+        }
 
         ffxCreateContextDescUpscale desc{};
         desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -211,9 +229,35 @@ struct Upscaler::Impl {
         return true;
     }
 
+    void ReadTimer(u64 frame_id) {
+        if (!timer_pool) {
+            return;
+        }
+        std::array<u64, 2> stamps{};
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            *timer_pool, u32(frame_id % TimerSlots) * 2, 2, sizeof(stamps), stamps.data(),
+            sizeof(u64), vk::QueryResultFlagBits::e64);
+        if (result != vk::Result::eSuccess || stamps[1] <= stamps[0]) {
+            return;
+        }
+        const double ms = double(stamps[1] - stamps[0]) * timer_period_ns / 1e6;
+        timer_sum_ms += ms;
+        timer_max_ms = std::max(timer_max_ms, ms);
+        if (++timer_count == 600) {
+            LOG_WARNING(Render_Vulkan, "FSR 4: {:.2f} ms per frame on the GPU (max {:.2f}, 600 frames)",
+                        timer_sum_ms / timer_count, timer_max_ms);
+            std::printf("FSR 4: %.2f ms per frame on the GPU (max %.2f)\n", timer_sum_ms / timer_count,
+                        timer_max_ms);
+            std::fflush(stdout);
+            timer_sum_ms = timer_max_ms = 0.0;
+            timer_count = 0;
+        }
+    }
+
     void Retire() {
         while (!in_flight.empty() && scheduler.IsFree(in_flight.front().second)) {
             ffxFsr4VkRetireFrame(&backend, in_flight.front().first);
+            ReadTimer(in_flight.front().first);
             in_flight.pop_front();
         }
         while (!retired_images.empty() && scheduler.IsFree(retired_images.front().first)) {
@@ -452,6 +496,12 @@ struct Upscaler::Impl {
         // A frame begun must reach RetireFrame even when it records nothing.
         const auto abandon = [&] { in_flight.emplace_back(frame_id, scheduler.CurrentTick()); };
 
+        const u32 timer_slot = u32(frame_id % TimerSlots) * 2;
+        if (timer_pool) {
+            cmdbuf.resetQueryPool(*timer_pool, timer_slot, 2);
+            // All-commands: the start waits for the game's earlier work, so only FSR is timed.
+            cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, *timer_pool, timer_slot);
+        }
         CopyInputs(cmdbuf, color, motion, depth);
         Ensure(target, vk::Format::eR16G16B16A16Sfloat, ow, oh);
         To(cmdbuf, target, vk::ImageLayout::eGeneral);
@@ -539,6 +589,10 @@ struct Upscaler::Impl {
             Copy(cmdbuf, output_raw.image, output, ow, oh);
         } else {
             Blit(cmdbuf, target.image, ow, oh, output, ow, oh);
+        }
+        if (timer_pool) {
+            cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, *timer_pool,
+                                  timer_slot + 1);
         }
         problem.clear();
         return true;

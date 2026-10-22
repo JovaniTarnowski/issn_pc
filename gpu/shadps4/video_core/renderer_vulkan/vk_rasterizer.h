@@ -342,7 +342,8 @@ public:
     /// 1.07 update (tester 2026-10-22): colour 0x2fa0d0000 and motion 0x305c70000, +0x2c0000;
     /// the depth and the target are where his build has them.
     s64 dlss_addr_delta{};
-    u64 dlss_delta_searches{};    ///< the colour input differs in format from the target (blit, no copy)
+    u64 dlss_delta_searches{};
+    u64 dlss_last_resolve_ns{}; ///< a gap (Home off, menus, loads) restarts FSR's history    ///< the colour input differs in format from the target (blit, no copy)
     std::unique_ptr<Fsr4Aa::Upscaler> fsr4; ///< ISSN_FSR4 (issn_fsr4.h), made at the first resolve
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;

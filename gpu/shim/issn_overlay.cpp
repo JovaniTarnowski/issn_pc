@@ -27,6 +27,7 @@ extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends
 #include "imgui_internal.h" // RegisterUserTexture (save pictures)
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -302,7 +303,15 @@ std::string OverlayText() {
     sample.fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
     sample.frame_ms = frame_ms_avg;
     sample.upscaler = UpscalerLabel(s.upscaler);
-    return P::Format(sample, items, s.overlay_layout == 0);
+    unsigned shown = items;
+    if (const int mode = Vulkan::Dlss::Mode(); mode == 1 || mode == 3) {
+        // issn-axy: the anti-aliasing in use (Home switches it), always shown with FSR 4 / DLSS.
+        const bool on = Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
+                        Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+        sample.upscaler = on ? (mode == 3 ? "FSR 4" : "DLSS") : "Game AA";
+        shown |= P::Upscaler;
+    }
+    return P::Format(sample, shown, s.overlay_layout == 0);
 }
 
 constexpr const char* Unsupported = "Unavailable: game version or code signature mismatch.";
@@ -981,6 +990,17 @@ bool HandleEvent(const SDL_Event& event) {
                 std::printf("Mouse camera: %s (Y)\n", on ? "on" : "off");
                 std::fflush(stdout);
             }
+            return true;
+        }
+        if (down && !event.key.repeat && event.key.key == SDLK_HOME && !is_open &&
+            (Vulkan::Dlss::Mode() == 1 || Vulkan::Dlss::Mode() == 3)) {
+            // issn-axy: Home switches FSR 4 / DLSS and the game's own AA live (axylpup's key),
+            // to compare the picture and the frame rate in one spot (tester 2026-10-22).
+            const bool on = !Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+            Vulkan::Dlss::g_user_on.store(on, std::memory_order_relaxed);
+            std::printf("Anti-aliasing: %s (Home)\n",
+                        on ? (Vulkan::Dlss::Mode() == 3 ? "FSR 4" : "DLSS") : "the game's own");
+            std::fflush(stdout);
             return true;
         }
         if (down && !event.key.repeat && event.key.key == SDLK_F12) {

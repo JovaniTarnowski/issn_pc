@@ -19,7 +19,8 @@ What's new in 0.3.0
   1.0.2), about 2.5x the frame rate of 0.2 (city, standing: 38 -> 90-105 FPS on the tester's PC).
 - Anti-aliasing (launcher: Graphics > Anti-aliasing): the game's own, FSR 4 Native AA (included;
   Radeon RX 7000 / 9000) or DLSS (NVIDIA RTX; NVIDIA's files are not included, the launcher shows
-  where they go and where to download them).
+  where they go and where to download them). In the game, Home switches FSR 4 / DLSS and the
+  game's own anti-aliasing live (the FPS bar shows which one runs).
 - Frame rate limit and VSync from the launcher and the in-game menu (applied on restart);
   Unlimited by default, the game keeps its speed at any frame rate.
 - Draw distance back to the game's own, with Long and Very long for less pop-in.
