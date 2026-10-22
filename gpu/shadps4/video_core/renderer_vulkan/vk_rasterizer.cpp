@@ -1691,7 +1691,12 @@ void Rasterizer::DlssResolve() {
             const auto input = [](VideoCore::Image& image) {
                 VideoCore::ImageViewInfo view_info{};
                 view_info.type = AmdGpu::ImageType::Color2D;
-                view_info.format = image.info.pixel_format;
+                // A D32S8 view would hold both aspects, which a sampled view must not (AMD:
+                // device lost in the spray-can tutorial, tester 2026-10-21): R32 picks the depth
+                // aspect alone (ImageView, IsFormatDepthCompatible).
+                view_info.format = (image.aspect_mask & vk::ImageAspectFlagBits::eDepth)
+                                       ? vk::Format::eR32Sfloat
+                                       : image.info.pixel_format;
                 const auto& view = image.FindView(view_info);
                 return Fsr4Aa::Input{image.GetImage(), *view.image_view, image.info.size.width,
                                      image.info.size.height};

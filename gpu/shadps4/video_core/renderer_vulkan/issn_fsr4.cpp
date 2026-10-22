@@ -102,6 +102,7 @@ struct Upscaler::Impl {
             LOG_WARNING(Render_Vulkan, "FSR 4 unavailable: {} - the game's own anti-aliasing stays",
                         reason);
             std::printf("FSR 4: %s\n", reason.c_str());
+            std::fflush(stdout);
         }
         problem = std::move(reason);
         fatal |= permanent;
@@ -191,8 +192,10 @@ struct Upscaler::Impl {
         context_ok = true;
         out_width = ow;
         out_height = oh;
-        LOG_INFO(Render_Vulkan, "FSR 4: v07 INT8 Native AA, {} tier, {}x{}", assets.tier, ow, oh);
+        LOG_WARNING(Render_Vulkan, "FSR 4: v07 INT8 Native AA running, {} tier, {}x{}", assets.tier, ow,
+                    oh);
         std::printf("FSR 4: v07 INT8 Native AA, %s tier, %ux%u\n", assets.tier, ow, oh);
+        std::fflush(stdout);
         return true;
     }
 
