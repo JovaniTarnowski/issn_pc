@@ -3,7 +3,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
@@ -37,6 +41,32 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
             SDL_SetHintWithPriority(hint, "", SDL_HINT_OVERRIDE);
         }
     }
+    // issn: under Steam the physical pad can be hidden from this process while Steam Input
+    // presents a virtual one (VID 0x28de), which SDL skips unless allowed (tester 2026-10-22:
+    // with the filter dropped SDL still saw 0 joysticks).
+    if (std::getenv("SteamGameId") || std::getenv("SteamAppId") || std::getenv("SteamClientLaunch")) {
+        std::printf("Window: started from Steam (SteamGameId=%s); Steam's virtual pad allowed\n",
+                    std::getenv("SteamGameId") ? std::getenv("SteamGameId") : "-");
+        SDL_SetHintWithPriority("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD", "1",
+                                SDL_HINT_OVERRIDE);
+    }
+#ifdef _WIN32
+    // What XInput itself reports, before SDL (a pad Steam hides from this process is missing here).
+    if (HMODULE xinput = LoadLibraryA("xinput1_4.dll")) {
+        using GetState = DWORD(WINAPI*)(DWORD, void*);
+        if (auto get_state = reinterpret_cast<GetState>(GetProcAddress(xinput, "XInputGetState"))) {
+            unsigned char state[16]{};
+            std::string slots;
+            for (DWORD i = 0; i < 4; ++i) {
+                if (get_state(i, state) == 0) {
+                    slots += (slots.empty() ? "" : ", ") + std::to_string(i + 1);
+                }
+            }
+            std::printf("Window: XInput controllers connected: %s\n",
+                        slots.empty() ? "none" : slots.c_str());
+        }
+    }
+#endif
     // As axylpup's build: pads keep working while another window has the focus.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
