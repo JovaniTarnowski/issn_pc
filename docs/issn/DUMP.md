@@ -14,12 +14,11 @@ digital) e tira uma cópia dele de um PS4 desbloqueado. Este guia mostra como.
 | Um pendrive ou HD externo | Formatado em **exFAT**, com pelo menos **60 GB livres** |
 | Um PC com Windows | Para onde a cópia vai |
 
-**Versão recomendada:** a **01.00**, que é a do disco e do jogo base, sem atualização. É a
-versão em que o fork do shadPS4 para o Second Son foi testado, e os patches embutidos do port
-(qualidade, trava anti-congelamento, resolução) conferem os bytes dela. Se o seu PS4 já tem uma
-atualização instalada, tudo bem: no passo 4 faça o dump do **jogo base** e da **atualização**
-separados (o Itemzflow faz os dois), e a gente decide depois qual usar. A versão americana é a
-**CUSA00004**; a europeia é a **CUSA00223**.
+**Versão:** o jogo base (01.00, a do disco) e o jogo com a atualização 01.07 funcionam (a 01.07
+foi a usada nos testes da 0.3.0). Se o seu PS4 tem a atualização, no passo 4 faça o dump do
+**jogo base** e da **atualização** separados (o Itemzflow faz os dois). A versão americana é a
+**CUSA00223** (UP9000); a europeia é a **CUSA00004** (EP9000). Os exemplos abaixo usam
+`CUSA00004`: troque pelo código da sua.
 
 ## Passo 1: conferir o firmware
 
