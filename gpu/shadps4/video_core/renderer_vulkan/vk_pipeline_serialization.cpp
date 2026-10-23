@@ -693,8 +693,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             if (SimProfileActive()) {
                 // counted above
             } else if (!found.empty()) {
+                // issn_pc: the annotator returns codes only when the rebuild with them is word for
+                // word the cached module, so the permutation is verified in this same run.
                 vs_formats[fmt_key] = std::move(found);
                 vs_formats_dirty = true;
+                ++rs.equal[si];
+                if (perm_idx < 256) {
+                    stamp_perms[program->info.pgm_hash].push_back(static_cast<u8>(perm_idx));
+                }
             } else if (again.empty()) {
                 ++rs.no_code[si];
             } else if (again == spv && same_layout) {
