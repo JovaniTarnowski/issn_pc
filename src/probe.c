@@ -1067,9 +1067,12 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
+        char app_ver[16]="";
+        sfo_value(sfo,"APP_VER",app_ver,sizeof(app_ver),NULL);
         uint64_t sdk=0;
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
-        IssnGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080,(uint64_t)(uintptr_t)image};
+        IssnGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080,(uint64_t)(uintptr_t)image,
+                           app0,app_ver};
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (issngpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,issngpu_symbol_count());

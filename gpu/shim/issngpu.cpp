@@ -30,6 +30,10 @@
 #include <SDL3/SDL.h>
 #include "../issngpu.h"
 #include "common/elf_info.h"
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <xxhash.h>
 #include "common/fault_monitor.h"
 #include "common/logging/log.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -134,6 +138,94 @@ public:
         info.title = config.title ? config.title : "";
         info.sdk_ver = config.sdk_version;
         info.psf_attributes.raw = config.psf_attributes;
+        // issn_pc (2026-10-23): the shader seed (SHADPS4_CACHE_REBUILD) makes stages from the
+        // game's own files in this folder and checks the game by its code hash; both were left
+        // empty, so a verify run found "no code in the game index" for every stage.
+        info.app_ver = config.app_ver ? config.app_ver : "";
+        if (config.game_dir && *config.game_dir) {
+            info.game_folder = std::filesystem::u8path(config.game_dir);
+            const auto eboot = info.game_folder / "eboot.bin";
+            info.eboot_code_hash = EbootCodeHash(eboot);
+            if (info.eboot_code_hash == 0) {
+                // Not an ELF / SELF this reads: the whole file still names the game version.
+                std::ifstream in{eboot, std::ios::binary};
+                const std::vector<char> bytes{std::istreambuf_iterator<char>(in),
+                                              std::istreambuf_iterator<char>()};
+                info.eboot_code_hash = bytes.empty() ? 0 : XXH3_64bits(bytes.data(), bytes.size());
+            }
+            std::printf("Shader seed: game code %016llx (%s %s)\n",
+                        static_cast<unsigned long long>(info.eboot_code_hash),
+                        info.game_serial.c_str(), info.app_ver.c_str());
+        }
+    }
+
+    /// XXH3 of the eboot's executable PT_LOAD segments, chained by seed (axylpup's
+    /// ReadEbootCodeHash): from a plain ELF or a plaintext PS4 SELF (scripts/prepare.py reads
+    /// the same two); 0 for anything else.
+    static u64 EbootCodeHash(const std::filesystem::path& path) {
+        std::ifstream in{path, std::ios::binary};
+        const std::vector<char> bytes{std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>()};
+        const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
+        const u64 size = bytes.size();
+        const auto read = [&](u64 at, u64 width, u64& value) {
+            value = 0;
+            if (at > size || width > size - at) {
+                return false;
+            }
+            std::memcpy(&value, data + at, width);
+            return true;
+        };
+        // A SELF: 32-byte header, `count` 32-byte segment entries, then the ELF header.
+        u64 elf = 0, count = 0;
+        if (size >= 4 && std::memcmp(data, "\x4f\x15\x3d\x1d", 4) == 0) {
+            if (!read(24, 2, count)) {
+                return 0;
+            }
+            elf = 32 + count * 32;
+        }
+        u64 phoff, phentsize, phnum;
+        if (elf + 64 > size || std::memcmp(data + elf, "\x7f" "ELF", 4) != 0 ||
+            !read(elf + 0x20, 8, phoff) || !read(elf + 0x36, 2, phentsize) ||
+            !read(elf + 0x38, 2, phnum) || phentsize < 56) {
+            return 0;
+        }
+        u64 hash = 0;
+        for (u64 i = 0; i < phnum; ++i) {
+            const u64 at = elf + phoff + i * phentsize;
+            u64 type, flags, offset, filesz;
+            if (!read(at, 4, type) || !read(at + 4, 4, flags) || !read(at + 8, 8, offset) ||
+                !read(at + 32, 8, filesz)) {
+                return 0;
+            }
+            if (type != 1 || (flags & 1) == 0 || filesz == 0) {
+                continue;
+            }
+            if (count != 0) {
+                // The segment's bytes sit where its SELF entry (bit 11: has a segment, bits
+                // 20-31: program header index) says.
+                bool found = false;
+                for (u64 e = 0; e < count && !found; ++e) {
+                    u64 eflags, eoffset, esize;
+                    if (!read(32 + e * 32, 8, eflags) || !read(40 + e * 32, 8, eoffset) ||
+                        !read(48 + e * 32, 8, esize)) {
+                        return 0;
+                    }
+                    if ((eflags & 0x800) != 0 && ((eflags >> 20) & 0xfff) == i && esize == filesz) {
+                        offset = eoffset;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    return 0;
+                }
+            }
+            if (offset > size || filesz > size - offset) {
+                return 0;
+            }
+            hash = XXH3_64bits_withSeed(data + offset, filesz, hash);
+        }
+        return hash;
     }
 };
 

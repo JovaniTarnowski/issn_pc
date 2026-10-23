@@ -14,6 +14,9 @@ typedef struct {
     uint32_t psf_attributes;    /* param.sfo ATTRIBUTE */
     int32_t width, height;      /* initial window size */
     uint64_t eboot_base;        /* where the eboot's first segment is mapped (axylpup's game patches) */
+    const char *game_dir;       /* the /app0 folder (game + update view): the shader seed reads the
+                                   game's own shader code from it; NULL: none */
+    const char *app_ver;        /* param.sfo APP_VER ("01.07"), logged with the seed */
 } IssnGpuConfig;
 /* Registers kernel event queues (needed with or without graphics). */
 void issngpu_register_kernel(void);
