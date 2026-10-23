@@ -51,9 +51,16 @@ class ControlMapTest(unittest.TestCase):
         env = launcher.game_environment({**base, 'anti_aliasing': 'fsr4'})
         self.assertEqual(env['ISSN_FSR4'], '1')
         self.assertNotIn('SHADPS4_DLSS', env)
-        env = launcher.game_environment({**base, 'anti_aliasing': 'dlss'})
+        with unittest.mock.patch.object(launcher, 'WINDOWS', True):
+            env = launcher.game_environment({**base, 'anti_aliasing': 'dlss', 'ui_language': 'en'})
         self.assertEqual((env['SHADPS4_DLSS'], env['SHADPS4_DLSS_UPSCALE']), ('1', '1'))
         self.assertNotIn('ISSN_FSR4', env)
+        # Linux: NVIDIA's Streamline is Windows only - neither offered nor passed on.
+        with unittest.mock.patch.object(launcher, 'WINDOWS', False):
+            env = launcher.game_environment({**base, 'anti_aliasing': 'dlss'})
+        self.assertNotIn('SHADPS4_DLSS', env)
+        if not launcher.WINDOWS:
+            self.assertNotIn('dlss', [value for value, _text in launcher.ANTI_ALIASING])
         with __import__('unittest').mock.patch.dict(__import__('os').environ, {'ISSN_FSR4': '1'}):
             self.assertNotIn('ISSN_FSR4', launcher.game_environment(base))  # never mixed with a stale one
 

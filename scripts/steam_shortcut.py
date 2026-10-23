@@ -119,6 +119,18 @@ def steam_executable():
     return None
 
 
+def host_environment():
+    """Linux: the session's environment for Steam, without what the AppImage / the frozen
+    launcher set for their own libraries (Steam would load them and break)."""
+    if WINDOWS:
+        return None
+    env = dict(os.environ)
+    for name in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'PYTHONHOME', 'PYTHONPATH', 'TCL_LIBRARY', 'TK_LIBRARY',
+                 'FONTCONFIG_FILE'):
+        env.pop(name, None)
+    return env
+
+
 def close_steam(timeout=40, running=steam_running, sleep=None):
     """Asks Steam to exit (steam -shutdown) and waits for it; True once it is closed."""
     import time
@@ -126,7 +138,9 @@ def close_steam(timeout=40, running=steam_running, sleep=None):
     exe = steam_executable()
     if exe is None:
         return not running()
-    subprocess.Popen([exe, '-shutdown'], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    subprocess.Popen([exe, '-shutdown'], creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                     env=host_environment(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
     for _ in range(timeout * 2):
         if not running():
             sleep(2)  # Steam writes shortcuts.vdf on the way out
@@ -138,7 +152,9 @@ def close_steam(timeout=40, running=steam_running, sleep=None):
 def start_steam():
     exe = steam_executable()
     if exe:
-        subprocess.Popen([exe], creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0))
+        subprocess.Popen([exe], creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0), env=host_environment(),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         **({} if WINDOWS else {'start_new_session': True}))
 
 
 def steam_roots():

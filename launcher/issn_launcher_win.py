@@ -209,7 +209,7 @@ def pick_fonts(families):
 def host_environment():
     """The environment of the user's session for programs outside the bundle (xdg-open)."""
     env = dict(os.environ)
-    for name in ('LD_LIBRARY_PATH', 'PYTHONHOME', 'PYTHONPATH', 'TCL_LIBRARY', 'TK_LIBRARY'):
+    for name in ('LD_LIBRARY_PATH', 'PYTHONHOME', 'PYTHONPATH', 'TCL_LIBRARY', 'TK_LIBRARY', 'FONTCONFIG_FILE'):
         env.pop(name, None)
     return env
 
@@ -250,13 +250,36 @@ def windows_language():
 
 def register_font(path):
     """Makes a font file available to this process (nothing else sees it). False when the file is missing or
-    GDI refuses it: the launcher then keeps its standard fonts."""
+    GDI refuses it: the launcher then keeps its standard fonts. Linux: a fontconfig file that adds the
+    font's folder to the system's (FONTCONFIG_FILE, set before Tk starts), in the launcher's config folder."""
     if not WINDOWS:
-        return False
+        return register_font_fontconfig(path)
     try:
         return path.is_file() and bool(ctypes.windll.gdi32.AddFontResourceExW(str(path), FR_PRIVATE, 0))
     except (AttributeError, OSError):
         return False
+
+
+def register_font_fontconfig(path):
+    if not path.is_file():
+        return False
+    system = next((p for p in ('/etc/fonts/fonts.conf', '/usr/share/fontconfig/fonts.conf') if Path(p).is_file()), None)
+    if system is None:
+        return False
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        conf = CONFIG_DIR / 'fonts.conf'
+        from xml.sax.saxutils import escape
+        text = ('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n'
+                f'  <include ignore_missing="yes">{escape(system)}</include>\n'
+                f'  <dir>{escape(str(path.parent))}</dir>\n'
+                f'  <cachedir>{escape(str(CONFIG_DIR / "fontcache"))}</cachedir>\n</fontconfig>\n')
+        if not conf.is_file() or conf.read_text(encoding='utf-8') != text:
+            conf.write_text(text, encoding='utf-8')
+    except OSError:
+        return False
+    os.environ['FONTCONFIG_FILE'] = str(conf)
+    return True
 
 
 # The title face has ASCII letters only: the Latin-script languages use it for headings with
@@ -446,6 +469,9 @@ RENDER_SCALES = [('', ('100%: 1920x1080, the game\'s own (default)',)), ('83', (
 # port (third_party/fsr4); DLSS needs NVIDIA's Streamline files in dlss_folder().
 ANTI_ALIASING = [('game', ("The game's own (SMAA T2x)",)), ('fsr4', ('FSR 4 Native AA (AMD Radeon RX 7000 / 9000)',)),
                  ('dlss', ('DLSS (NVIDIA RTX)',))]
+# NVIDIA's Streamline (DLSS) is Windows only: on Linux the choice is not offered.
+if not WINDOWS:
+    ANTI_ALIASING = [option for option in ANTI_ALIASING if option[0] != 'dlss']
 DLSS_FILES = ('sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.pcl.dll', 'nvngx_dlss.dll')
 STREAMLINE_PAGE = 'https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16'
 # ISSN_NO_MSAA: '' leaves the game's own default, off on AMD's and Intel's Windows drivers
@@ -476,9 +502,11 @@ def dlss_missing():
 
 
 def fsr4_folder():
-    """Next to the port; in the data directory when the port is read-only (AppImage)."""
-    if WINDOWS or os.access(PORT_DIR, os.W_OK):
-        return PORT_DIR / 'fsr4_shaders'
+    """Next to the port (the packages ship it, the AppImage too); in the data directory when the
+    port is read-only and has none."""
+    shipped = PORT_DIR / 'fsr4_shaders'
+    if WINDOWS or os.access(PORT_DIR, os.W_OK) or (shipped / 'rcas.spv').is_file():
+        return shipped
     return DATA_DIR / 'fsr4_shaders'
 
 
@@ -806,7 +834,7 @@ def game_environment(s):
     anti_aliasing = s.get('anti_aliasing', 'game')
     if anti_aliasing == 'fsr4':
         env['ISSN_FSR4'] = '1'
-    elif anti_aliasing == 'dlss':
+    elif anti_aliasing == 'dlss' and WINDOWS:
         env['SHADPS4_DLSS'] = '1'
         env['SHADPS4_DLSS_UPSCALE'] = '1'  # the game's 1080p up to the window (DLAA at 1080p)
     if (fsr4_folder() / 'rcas.spv').is_file():
@@ -1386,7 +1414,15 @@ class Launcher:
         self.row(f, _('Anti-aliasing'), self.choice(f, 'anti_aliasing', 'app', ANTI_ALIASING, width=44),
                  _("Replaces the game's own temporal anti-aliasing. FSR 4 (included) needs a Radeon RX 7000 or "
                    "9000; DLSS needs an NVIDIA RTX card and NVIDIA's files (below). Without what they need the "
-                   "game keeps its own."), restart=True)
+                   "game keeps its own.") if WINDOWS else
+                 _("Replaces the game's own temporal anti-aliasing. FSR 4 (included) needs a Radeon RX 7000 or "
+                   "9000 and a recent Mesa (RADV); without it the game keeps its own."), restart=True)
+        if not WINDOWS:  # DLSS (Streamline) is Windows only
+            self.section(f, _('Overlay'))
+            self.check(f, 'show_fps', 'ini', _('Show performance overlay'),
+                       _('Items, size and corner: in-game menu (Insert / R3+L2) > Overlay.'))
+            self.note(f, _('Screenshots: F12 (saved in the user/screenshots folder).'), top=10)
+            return
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Open the DLSS folder'), command=self.open_dlss_folder).pack(side='left')
@@ -1425,7 +1461,8 @@ class Launcher:
         self.check(f, 'vsync', 'ini', _('VSync'), _('Off allows tearing for the lowest latency.'), restart=True)
         self.check(f, 'hdr', 'app', _('Allow HDR output', 'Разрешить HDR'),
                    _('When HDR is on in Windows and the display supports it.',
-                     'Если HDR включён в Windows и монитор его поддерживает.'))
+                     'Если HDR включён в Windows и монитор его поддерживает.') if WINDOWS else
+                   _('When the desktop (KDE Plasma 6, GNOME 48 or gamescope) has HDR on and the display supports it.'))
 
     def build_performance(self):
         f = self.scrolled_page('performance', _('Performance'), _('Frame rate and speed options.'))
@@ -2646,8 +2683,8 @@ def main():
             root.option_add(f'*{window}.cursor', ARROW)
     families = font.families(root)
     pick_fonts(families)
-    # Linux has no private font registration: the title face counts when it is installed.
-    FONT_LOADED = FONT_LOADED or HEADING_FAMILY in families
+    # Linux: the fontconfig file (register_font) only counts when Tk then lists the face.
+    FONT_LOADED = (FONT_LOADED and WINDOWS) or HEADING_FAMILY in families
     Launcher(root, tk, ttk, filedialog, messagebox)
     root.mainloop()
 
