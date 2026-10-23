@@ -75,6 +75,7 @@ struct Upscaler::Impl {
     ffxContext context{};
     bool context_ok = false;
     u32 out_width = 0, out_height = 0;
+    u32 render_width = 0, render_height = 0;
     std::string problem;
     bool fatal = false;
     u64 next_frame_id = 1;
@@ -126,9 +127,37 @@ struct Upscaler::Impl {
         fatal |= permanent;
     }
 
-    bool CreateBackend(u32 ow, u32 oh) {
+    /// The model trained for this scale (the presets' ratios: 1, 1.5, 1.7, 2, 3).
+    static FfxFsr4ModelPreset PresetFor(u32 rw, u32 rh, u32 ow, u32 oh) {
+        const double ratio = std::max(double(ow) / std::max(rw, 1u), double(oh) / std::max(rh, 1u));
+        return ratio <= 1.05   ? FFX_FSR4_MODEL_PRESET_NATIVE_AA
+               : ratio <= 1.6  ? FFX_FSR4_MODEL_PRESET_QUALITY
+               : ratio <= 1.85 ? FFX_FSR4_MODEL_PRESET_BALANCED
+               : ratio <= 2.5  ? FFX_FSR4_MODEL_PRESET_PERFORMANCE
+                               : FFX_FSR4_MODEL_PRESET_ULTRA_PERFORMANCE;
+    }
+
+    static const char* PresetName(FfxFsr4ModelPreset preset) {
+        switch (preset) {
+        case FFX_FSR4_MODEL_PRESET_NATIVE_AA:
+            return "Native AA";
+        case FFX_FSR4_MODEL_PRESET_QUALITY:
+            return "Quality";
+        case FFX_FSR4_MODEL_PRESET_BALANCED:
+            return "Balanced";
+        case FFX_FSR4_MODEL_PRESET_PERFORMANCE:
+            return "Performance";
+        case FFX_FSR4_MODEL_PRESET_ULTRA_PERFORMANCE:
+            return "Ultra Performance";
+        default:
+            return "?";
+        }
+    }
+
+    bool CreateBackend(u32 rw, u32 rh, u32 ow, u32 oh) {
+        const FfxFsr4ModelPreset preset = PresetFor(rw, rh, ow, oh);
         FfxFsr4V07AssetSet assets{};
-        if (!ffxFsr4V07BuildAssetSet(FFX_FSR4_MODEL_PRESET_NATIVE_AA, ow, oh, &assets)) {
+        if (!ffxFsr4V07BuildAssetSet(preset, ow, oh, &assets)) {
             Fail("output size is not supported by the v07 model", true);
             return false;
         }
@@ -210,7 +239,7 @@ struct Upscaler::Impl {
         // The input is the game's tonemapped RGBA8 frame (no HDR, no exposure) and its depth is
         // reversed (GreaterEqual).
         desc.flags = FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-        desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+        desc.maxRenderSize = {(rw + 7) & ~7u, (rh + 7) & ~7u};
         desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
         ffxFsr4V07SetBackendInterface(&backend);
         const auto created = ffxFsr4V07CreateContext(&context, &desc.header, nullptr);
@@ -222,9 +251,12 @@ struct Upscaler::Impl {
         context_ok = true;
         out_width = ow;
         out_height = oh;
-        LOG_WARNING(Render_Vulkan, "FSR 4: v07 INT8 Native AA running, {} tier, {}x{}", assets.tier, ow,
-                    oh);
-        std::printf("FSR 4: v07 INT8 Native AA, %s tier, %ux%u\n", assets.tier, ow, oh);
+        render_width = rw;
+        render_height = rh;
+        LOG_WARNING(Render_Vulkan, "FSR 4: v07 INT8 {} running, {} tier, {}x{} -> {}x{}",
+                    PresetName(preset), assets.tier, rw, rh, ow, oh);
+        std::printf("FSR 4: v07 INT8 %s, %s tier, %ux%u -> %ux%u\n", PresetName(preset), assets.tier,
+                    rw, rh, ow, oh);
         std::fflush(stdout);
         return true;
     }
@@ -449,9 +481,31 @@ struct Upscaler::Impl {
         return ffxFsr4VkSetExternalImageState(&backend, &state);
     }
 
+    static void Layout(vk::CommandBuffer cmdbuf, vk::Image image, vk::ImageLayout from,
+                       vk::ImageLayout to) {
+        if (from == to) {
+            return;
+        }
+        cmdbuf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {},
+            {}, {},
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead,
+                .dstAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead,
+                .oldLayout = from,
+                .newLayout = to,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange = ColorRange,
+            });
+    }
+
     bool Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                const Input& depth, vk::Image output, vk::Format output_format, u32 ow, u32 oh,
-                float jx, float jy, bool reset) {
+                const Input& depth, const Output& out, float jx, float jy, bool reset) {
+        const vk::Image output = out.image;
+        const vk::Format output_format = out.format;
+        const u32 ow = out.width, oh = out.height;
         if (fatal) {
             return false;
         }
@@ -461,7 +515,8 @@ struct Upscaler::Impl {
                  true);
             return false;
         }
-        if (!context_ok || ow != out_width || oh != out_height) {
+        if (!context_ok || ow != out_width || oh != out_height || color.width != render_width ||
+            color.height != render_height) {
             if (context_ok || backend_ok) {
                 // A size change (rare: the game renders 1920x1080) - the old context's frames
                 // must be done first.
@@ -476,7 +531,7 @@ struct Upscaler::Impl {
                 }
                 in_flight.clear();
             }
-            if (!CreateBackend(ow, oh)) {
+            if (!CreateBackend(color.width, color.height, ow, oh)) {
                 return false;
             }
             reset = true;
@@ -579,8 +634,9 @@ struct Upscaler::Impl {
         }
         in_flight.emplace_back(frame_id, scheduler.CurrentTick());
 
-        // FSR's RGBA16F result into the resolve's target (layout TransferDst, set by the caller).
+        // FSR's RGBA16F result into the output (the resolve's target or the upscaler's scene).
         To(cmdbuf, target, vk::ImageLayout::eTransferSrcOptimal);
+        Layout(cmdbuf, output, out.layout, vk::ImageLayout::eTransferDstOptimal);
         if (const vk::Format twin = UnormTwin(output_format); twin != output_format) {
             Ensure(output_raw, twin, ow, oh, true);
             To(cmdbuf, output_raw, vk::ImageLayout::eTransferDstOptimal);
@@ -590,6 +646,7 @@ struct Upscaler::Impl {
         } else {
             Blit(cmdbuf, target.image, ow, oh, output, ow, oh);
         }
+        Layout(cmdbuf, output, vk::ImageLayout::eTransferDstOptimal, out.layout);
         if (timer_pool) {
             cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, *timer_pool,
                                   timer_slot + 1);
@@ -605,10 +662,9 @@ Upscaler::Upscaler(const Instance& instance, Scheduler& scheduler)
 Upscaler::~Upscaler() = default;
 
 bool Upscaler::Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                      const Input& depth, vk::Image output, vk::Format output_format,
-                      u32 out_width, u32 out_height, float jitter_x, float jitter_y, bool reset) {
-    return impl->Record(cmdbuf, color, motion, depth, output, output_format, out_width,
-                        out_height, jitter_x, jitter_y, reset);
+                      const Input& depth, const Output& output, float jitter_x, float jitter_y,
+                      bool reset) {
+    return impl->Record(cmdbuf, color, motion, depth, output, jitter_x, jitter_y, reset);
 }
 
 const std::string& Upscaler::Problem() const noexcept {

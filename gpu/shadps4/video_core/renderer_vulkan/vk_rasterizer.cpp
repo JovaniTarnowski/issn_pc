@@ -1842,11 +1842,25 @@ void Rasterizer::DlssResolve() {
                 fsr4 = std::make_unique<Fsr4Aa::Upscaler>(instance, scheduler);
             }
             const auto cmdbuf = scheduler.AcquireCommandBuffer().Handle();
-            evaluated = fsr4->Record(cmdbuf, input(*in), input(*motion), input(*depth),
-                                     out.GetImage(), out.info.pixel_format, out.info.size.width,
-                                     out.info.size.height,
+            // issn-axy: FSR 4 as the upscaler (vk_dlss_upscale.h, as DLSS): with the window larger
+            // than the game's render size it writes the window size into the upscaler's own image
+            // and this target becomes the HUD layer the presenter lays over it.
+            Dlss::Upscaler* const upscaler =
+                Dlss::HudLayerActive() ? Dlss::GetUpscaler(instance) : nullptr;
+            Fsr4Aa::Output target{out.GetImage(), out.info.pixel_format,
+                                  vk::ImageLayout::eTransferDstOptimal, out.info.size.width,
+                                  out.info.size.height};
+            if (upscaler) {
+                const Dlss::EvalImage scene = upscaler->SceneTarget(cmdbuf);
+                target = {scene.image, scene.format, scene.layout, scene.width, scene.height};
+            }
+            evaluated = fsr4->Record(cmdbuf, input(*in), input(*motion), input(*depth), target,
                                      jx, jy, dlss_reset_pending);
             dlss_reset_pending = false;
+            if (upscaler && evaluated) {
+                upscaler->SceneWritten(cmdbuf);
+                hud_layer = true;
+            }
             scheduler.GetDynamicState().Invalidate();
             GraphicsBindTracker::Invalidate();
             scheduler.InvalidateNativeHeaps();
@@ -14508,7 +14522,7 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
     const auto& regs = liverpool->BackRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetBlendConstants(regs.blend_constants);
-    if (Dlss::Mode() == 1) [[unlikely]] {
+    if (Dlss::UpscaleWanted()) [[unlikely]] { // issn-axy: DLSS or FSR 4 upscaling
         auto masks = pipeline->GetGraphicsKey().write_masks;
         Dlss::ApplyHudLayerMask(masks, regs.color_buffers[0].Address());
         dynamic_state.SetColorWriteMasks(masks);

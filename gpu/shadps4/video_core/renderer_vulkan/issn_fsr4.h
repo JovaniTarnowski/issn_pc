@@ -30,6 +30,15 @@ struct Input {
     vk::Format format;
 };
 
+/// Where the result goes: the resolve's target (Native AA, TransferDst) or the upscaler's scene
+/// image at the window size (General). `layout` is the image's layout before and after.
+struct Output {
+    vk::Image image;
+    vk::Format format;
+    vk::ImageLayout layout;
+    u32 width, height;
+};
+
 /// The UNORM format with the same bytes as an sRGB one (else `format`): the game's sRGB and UNORM
 /// views of one picture hold the same gamma-encoded bytes, so they are copied raw, not blitted
 /// (a blit would decode or encode the gamma).
@@ -51,13 +60,14 @@ public:
     Upscaler(const Instance& instance, Scheduler& scheduler);
     ~Upscaler();
 
-    /// Records FSR 4 Native AA into `cmdbuf`: color / motion / depth in layout General, `output`
-    /// (the resolve's target, layout TransferDst afterwards is the caller's) receives the result
-    /// through a blit from FSR's RGBA16F image. `motion_uv`: vectors in screen UV, current minus
-    /// previous (the game's). False = not run; the caller falls back to the game's picture.
+    /// Records FSR 4 into `cmdbuf`: color / motion / depth (layout TransferSrc) at the render
+    /// size, `output` at the same size (Native AA) or larger (upscaling: the model preset follows
+    /// the ratio - Quality 1.5x, Balanced 1.7x, Performance 2x, Ultra Performance 3x). The
+    /// result reaches `output` through a blit from FSR's RGBA16F image. Motion vectors: screen
+    /// UV, current minus previous (the game's). False = not run; the caller falls back.
     bool Record(vk::CommandBuffer cmdbuf, const Input& color, const Input& motion,
-                const Input& depth, vk::Image output, vk::Format output_format, u32 out_width,
-                u32 out_height, float jitter_x, float jitter_y, bool reset);
+                const Input& depth, const Output& output, float jitter_x, float jitter_y,
+                bool reset);
 
     /// The last failure, or empty; permanent ones stop further attempts.
     [[nodiscard]] const std::string& Problem() const noexcept;

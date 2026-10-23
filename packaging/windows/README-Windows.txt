@@ -36,6 +36,10 @@ What's new in 0.3.0
   Radeon RX 7000 / 9000) or DLSS (NVIDIA RTX; NVIDIA's files are not included, the launcher shows
   where they go and where to download them). In the game, Home switches FSR 4 / DLSS and the
   game's own anti-aliasing live (the FPS bar shows which one runs).
+- Internal resolution (launcher: Performance > Internal resolution): the game draws at 83%, 67%,
+  58% or 50% of 1080 lines. With FSR 4 the picture is rebuilt at the window size by the matching
+  preset (67% = Quality, 58% = Balanced, 50% = Performance); with the game's own AA it is only
+  scaled up. FSR 4 also upscales the game's 1080p to a larger window (1440p, 4K).
 - Performance mode (launcher: Performance > Performance mode, from axylpup's 1.1): the game's
   own lower settings for the open city. Balanced is about 13% more FPS there, Maximum about 19%
   with fewer pedestrians.

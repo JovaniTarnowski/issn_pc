@@ -319,7 +319,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
                 'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': '',
-                'perf_mode': '',
+                'perf_mode': '', 'render_scale': '',
                 'anti_aliasing': 'game'}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
@@ -436,6 +436,12 @@ DRAW_DISTANCE = [('', ('Original (default)',)), ('0.6', ('Short (faster)',)), ('
 # fewer high-resolution textures; Maximum also halves the pedestrians.
 PERF_MODES = [('', ('Off: full quality (default)',)), ('low', ('Balanced: about 13% more FPS in the city',)),
               ('office', ('Maximum: about 19% more FPS, fewer pedestrians',))]
+# ISSN_RENDER_SCALE (gpu/shim/issn_game_patches.cpp, axylpup's 1.1 render size): the lines the
+# game renders, in percent of 1080. With FSR 4 the picture is rebuilt at the window size by the
+# preset for that ratio (67% = Quality, 58% = Balanced, 50% = Performance).
+RENDER_SCALES = [('', ('100%: 1920x1080, the game\'s own (default)',)), ('83', ('83%: 1592x896',)),
+                 ('67', ('67%: 1280x720 (FSR 4 Quality)',)), ('58', ('58%: 1112x624 (FSR 4 Balanced)',)),
+                 ('50', ('50%: 968x544 (FSR 4 Performance)',))]
 # issn-axy: what replaces the game's own temporal anti-aliasing (SMAA T2x). FSR 4 ships with the
 # port (third_party/fsr4); DLSS needs NVIDIA's Streamline files in dlss_folder().
 ANTI_ALIASING = [('game', ("The game's own (SMAA T2x)",)), ('fsr4', ('FSR 4 Native AA (AMD Radeon RX 7000 / 9000)',)),
@@ -830,6 +836,10 @@ def game_environment(s):
     if s.get('draw_distance') in {value for value, _text in DRAW_DISTANCE if value}:
         env['ISSN_LOD_SCALE'] = str(s['draw_distance'])
     env.pop('ISSN_PERF_MODE', None)
+    for name in ('ISSN_RENDER_SCALE', 'ISSN_RENDER_HEIGHT'):
+        env.pop(name, None)
+    if s.get('render_scale') in {value for value, _text in RENDER_SCALES if value}:
+        env['ISSN_RENDER_SCALE'] = s['render_scale']
     if s.get('perf_mode') in {value for value, _text in PERF_MODES if value}:
         env['ISSN_PERF_MODE'] = s['perf_mode']
     for key, name in (('frame_stats', 'ISSN_FRAME_STATS'), ('vk_validation', 'ISSN_VK_VALIDATION')):
@@ -1427,6 +1437,10 @@ class Launcher:
         self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
                  _('How far buildings and details keep their full detail in the open city. Long and Very long '
                    'show less pop-in than the PS4 and cost some FPS.'), restart=True)
+        self.row(f, _('Internal resolution'), self.choice(f, 'render_scale', 'app', RENDER_SCALES),
+                 _('The size the game draws at. Below 100% is faster; with FSR 4 (Graphics > Anti-aliasing) '
+                   'the picture is rebuilt at the window size, otherwise it is only scaled up and looks soft. '
+                   'The HUD keeps its layout.'), restart=True)
         self.row(f, _('Performance mode'), self.choice(f, 'perf_mode', 'app', PERF_MODES),
                  _('The game\'s own lower settings, from axylpup\'s 1.1: shorter detail distance, one shadow '
                    'level less, lighter particles and fewer high-resolution textures nearby. Figures are '

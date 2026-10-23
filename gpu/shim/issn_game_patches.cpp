@@ -7,6 +7,9 @@
 // simply turns it off. Flags as in axylpup's release (shadps4-flags.txt):
 //   SHADPS4_PARTICLE_LATE_READ=1, SHADPS4_PARTICLE_ARENA_DISCARD=1 (on), and the optional
 //   SHADPS4_PARTICLE_LIGHT_ONE_SUBMIT, SHADPS4_HOUSE_SPLIT / SHADPS4_HOUSE_CHUNK (off).
+#include <cstdio>
+#include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -222,6 +225,85 @@ static void ApplyHouseSplit() {
                        : "unchanged",
              chunk != 0 ? chunk : 1000);
 }
+// issn-axy: render size (axylpup's 1.1 SHADPS4_RENDER_HEIGHT / screen percentage, his
+// common/memory_patcher.cpp ApplyAspectRatio, 16:9 only, decided at boot, no live changes).
+// The renderer's size setup FUN_8001eff00 stores the render size and the output size from four
+// 1920 / 1080 immediates, and the mode toggle FUN_8001f0be0 re-applies them from two more; all
+// six get the chosen size, so every buffer follows. The 2D screen space (HUD layout, camera
+// aspect) keeps its 1920x1080 immediates: some HUD parts are sized in 1080p pixels (his s1440).
+// The picture reaches the window through FSR 4 (upscaling, vk_dlss_upscale.h) or the presenter's
+// scaling. ISSN_RENDER_SCALE = percent of 1080 lines (50-200), ISSN_RENDER_HEIGHT = lines.
+// Above 3200x1800 the game's tile light list is enlarged (his ApplyLightListCapacity: 3840x2160
+// lost the device with the game's 25,600 tiles).
+static u32 Round8(double v) {
+    return static_cast<u32>(std::lround(v / 8.0) * 8);
+}
+
+static void ApplyLightListCapacity(u32 width, u32 height) {
+    constexpr u32 Original = 0x320000;
+    const u64 tiles = u64((width + 15) / 16) * ((height + 15) / 16);
+    const u64 need = tiles * 128;
+    if (need <= Original) {
+        return;
+    }
+    const u32 entries = static_cast<u32>((need + 0xffff) & ~u64(0xffff));
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    static constexpr u8 imul_head[3] = {0x41, 0x69, 0xf7}; // imul esi, r15d, imm32 (0x16be04)
+    static constexpr u8 mov_head[2] = {0x41, 0xb8};        // mov r8d, imm32 (0x16be1d)
+    u32 imul_imm = 0, mov_imm = 0;
+    std::memcpy(&imul_imm, at(0x16be07), 4);
+    std::memcpy(&mov_imm, at(0x16be1f), 4);
+    if (std::memcmp(at(0x16be04), imul_head, 3) != 0 || std::memcmp(at(0x16be1d), mov_head, 2) != 0 ||
+        imul_imm != Original || mov_imm != Original) {
+        std::printf("Render size: light list not enlarged (the code differs in this eboot.bin)\n");
+        return;
+    }
+    std::memcpy(at(0x16be07), &entries, 4);
+    std::memcpy(at(0x16be1f), &entries, 4);
+    std::printf("Render size: light list %u entries for %ux%u\n", entries, width, height);
+}
+
+static void ApplyRenderSize() {
+    u32 height = 0;
+    if (const char* v = std::getenv("ISSN_RENDER_HEIGHT"); v && std::atoi(v) > 0) {
+        height = static_cast<u32>(std::atoi(v));
+    } else if (const char* p = std::getenv("ISSN_RENDER_SCALE"); p && std::atof(p) > 0.0) {
+        height = static_cast<u32>(std::lround(1080.0 * std::atof(p) / 100.0));
+    }
+    if (height == 0) {
+        return;
+    }
+    height = std::clamp<u32>(Round8(height), 360, 2160);
+    const u32 width = Round8(height * 16.0 / 9.0);
+    if (width == 1920 && height == 1080) {
+        return;
+    }
+    struct Imm {
+        u64 offset;
+        u32 original;
+        bool width;
+    };
+    static constexpr Imm imms[] = {
+        {0x1eff4a, 0x780, true}, {0x1eff51, 0x438, false}, // render size
+        {0x1eff57, 0x780, true}, {0x1eff5e, 0x438, false}, // output size
+        {0x1f0d3e, 0x780, true}, {0x1f0d4d, 0x438, false}, // mode toggle
+    };
+    for (const auto& imm : imms) {
+        u32 live = 0;
+        std::memcpy(&live, reinterpret_cast<const void*>(g_eboot_address + imm.offset), 4);
+        if (live != imm.original) {
+            std::printf("Render size: unavailable (eboot+%#llx holds %#x, not %#x)\n",
+                        static_cast<unsigned long long>(imm.offset), live, imm.original);
+            return;
+        }
+    }
+    for (const auto& imm : imms) {
+        const u32 value = imm.width ? width : height;
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
+    }
+    ApplyLightListCapacity(width, height);
+    std::printf("Render size: %ux%u (%.0f%% of 1080 lines)\n", width, height, height * 100.0 / 1080.0);
+}
 } // namespace
 
 extern "C" void issngpu_apply_game_patches(void) {
@@ -231,4 +313,5 @@ extern "C" void issngpu_apply_game_patches(void) {
     ApplyParticleLateRead();
     ApplyParticleLightOneSubmit();
     ApplyHouseSplit();
+    ApplyRenderSize();
 }
