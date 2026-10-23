@@ -773,6 +773,7 @@ EXTRA = {
         '{} · {} · draw distance: {}': '{} · {} · distância de detalhe: {}',
         'version {}': 'versão {}',
         'Performance mode': 'Modo de desempenho',
+        'The game writes its log to {}': 'O jogo grava o log em {}',
         'Internal resolution': 'Resolução interna',
         "100%: 1920x1080, the game's own (default)": '100%: 1920x1080, a do próprio jogo (padrão)',
         '83%: 1592x896': '83%: 1592x896',

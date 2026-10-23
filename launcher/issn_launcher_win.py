@@ -2116,17 +2116,32 @@ class Launcher:
         self.set_log('')
         # The same last_run.log as --play, so a report from the PLAY button has the file too.
         run_log = open_play_log(self.app)
+        # With 'close_on_play' the launcher exits 5 s after the start: the game writes the log
+        # file itself (its output goes straight to the file, which outlives the launcher).
+        # Tester 2026-10-23: three runs in that mode left last_run.log at an older run.
+        direct_log = open_direct_log(self.app) if self.app.get('close_on_play') else None
         try:
             self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
-                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=direct_log if direct_log else subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW, **NEW_GROUP)
         except OSError as error:
+            if direct_log:
+                direct_log.close()
             run_log.close()
             self.append(_('Could not start: {}', 'Не удалось запустить: {}').format(error) + '\n')
             self.process = None
             return
         self.job = GameJob(self.process)
-        threading.Thread(target=self.read_output, args=(self.process, run_log), daemon=True).start()
+        if direct_log:
+            direct_log.close()  # the game holds its own handle
+            self.append(_('The game writes its log to {}', 'Игра пишет журнал в {}')
+                        .format(run_log_path(self.app)) + '\n')
+            run_log.close()
+            process = self.process
+            threading.Thread(target=lambda: self.output.put((process.wait(),)), daemon=True).start()
+        else:
+            threading.Thread(target=self.read_output, args=(self.process, run_log), daemon=True).start()
         self.play_button.configure(text=heading_text(_('RUNNING')), state='disabled')
         self.status.configure(text=_('Preparing the game; it opens in its own window…',
                                      'Подготовка игры; она откроется в своём окне…'), fg=TEXT)
@@ -2516,6 +2531,17 @@ def open_play_log(settings):
     if settings.get('close_on_play'):
         return _NullLog()
     return open_run_log(settings)
+
+
+def open_direct_log(settings):
+    """last_run.log as a binary file for the game's own stdout (close_on_play); None when the
+    folder cannot be written (the game then starts without a log)."""
+    path = run_log_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return open(path, 'wb')
+    except (OSError, ValueError):
+        return None
 
 
 def _close_quietly(log):

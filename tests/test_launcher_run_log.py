@@ -97,6 +97,16 @@ class RunLogTest(unittest.TestCase):
                 log.write('x\n')
             self.assertEqual(launcher.run_log_path({'user_dir': tmp}).read_text(encoding='utf-8'), 'x\n')
 
+    def test_closing_launcher_hands_the_game_the_log_file(self):
+        # close_on_play: the game's stdout goes straight to last_run.log (tester 2026-10-23: three
+        # runs left an older log in place).
+        with tempfile.TemporaryDirectory() as tmp:
+            log = launcher.open_direct_log({'user_dir': tmp})
+            self.assertIsNotNone(log)
+            log.write(b'Window: Fullscreen\n')
+            log.close()
+            self.assertEqual(launcher.run_log_path({'user_dir': tmp}).read_bytes(), b'Window: Fullscreen\n')
+
 
 def _launcher_class():
     """The launcher window class, found by its method so the test does not build a Tk window."""
