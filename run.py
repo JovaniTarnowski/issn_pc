@@ -23,6 +23,17 @@ if WINDOWS:
 PORT = Path(__file__).resolve().parent
 
 
+
+def shader_seed_name(port, user_dir):
+    """The folder name in shader-seed.txt when that folder is in user_dir/cache, else None."""
+    try:
+        name = (Path(port) / 'shader-seed.txt').read_text().strip()
+    except OSError:
+        return None
+    if not name or not all(c.isalnum() or c in '-_.' for c in name) or name.startswith('.'):
+        return None
+    return name if (Path(user_dir) / 'cache' / name).is_dir() else None
+
 def fail(message):
     print(message, file=sys.stderr)
     sys.exit(1)
@@ -327,6 +338,9 @@ def main():
         user_dir = Path(env.get('ISSN_USER_DIR', data / 'user')).resolve()
         user_dir.mkdir(parents=True, exist_ok=True)
         env.setdefault('ISSN_GPU_USER_DIR', str(user_dir))
+        # issn_pc: the shader seed of this package (packaging/windows/package.sh) is the cache folder.
+        if (seed_name := shader_seed_name(PORT, user_dir)):
+            env.setdefault('SHADPS4_CACHE_NAME', seed_name)
         from save_backup import backup
         try:
             if made := backup(user_dir):

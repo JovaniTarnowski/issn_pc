@@ -71,6 +71,12 @@ void Push(DeferredPipeline* job);
 void Promote(DeferredPipeline* job);
 /// Returns once nothing is queued or running (shader hot reload).
 void WaitIdle();
+/// issn_pc (2026-10-23): a compute compile the game asked for during play is queued, or a thread
+/// is waiting for one. The graphics compiler threads (SHADPS4_ASYNC_PIPELINES) hold back then:
+/// a skipped graphics draw costs a moment of a missing object, a waited compute pipeline a
+/// frozen frame (the async test of 2026-10-23: compute waits grew from 0.2 s to 2-3.6 s per 10 s
+/// once graphics compiled alongside).
+bool ComputeUrgent();
 /// WaitIdle for at most `timeout`; the jobs still queued or running (0 = idle). Duplicates from
 /// Promote count twice (a progress figure, not an exact count).
 size_t WaitIdleFor(std::chrono::milliseconds timeout);

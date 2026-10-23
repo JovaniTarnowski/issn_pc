@@ -36,6 +36,10 @@ struct Stats {
     std::atomic<u64> queue_max{}, promoted{};
 };
 Stats g_stats;
+/// issn_pc (2026-10-23): compute compiles the game is waiting for, or will soon (demand queue), and
+/// threads blocked in Wait(); ComputeUrgent() lets the graphics compiler threads stand back.
+std::atomic<u32> g_demand_size{};
+std::atomic<u32> g_waiters{};
 
 void AtomicMax(std::atomic<u64>& slot, u64 value) {
     u64 cur = slot.load(std::memory_order_relaxed);
@@ -72,6 +76,7 @@ public:
                 Start();
             }
             (job->preload ? preload : demand).push_back(job);
+            g_demand_size.store(static_cast<u32>(demand.size()), std::memory_order_relaxed);
             AtomicMax(g_stats.queue_max, demand.size() + preload.size());
         }
         cv.notify_one();
@@ -89,6 +94,7 @@ public:
                 return; // shut down: the waiter runs it
             }
             demand.push_back(job);
+            g_demand_size.store(static_cast<u32>(demand.size()), std::memory_order_relaxed);
         }
         g_stats.promoted.fetch_add(1, std::memory_order_relaxed);
         cv.notify_one();
@@ -130,6 +136,7 @@ public:
         std::scoped_lock lk{mutex};
         demand.clear();
         preload.clear();
+        g_demand_size.store(0, std::memory_order_relaxed);
         idle_cv.notify_all();
     }
 
@@ -165,6 +172,7 @@ private:
                 auto& queue = from_preload ? preload : demand;
                 job = queue.front();
                 queue.pop_front();
+                g_demand_size.store(static_cast<u32>(demand.size()), std::memory_order_relaxed);
                 ++running;
                 if (from_preload && preload.empty() && !preload_drained_logged) {
                     preload_drained_logged = true;
@@ -282,12 +290,14 @@ void DeferredPipeline::Wait() {
         return;
     }
     const auto t_start = Clock::now();
+    g_waiters.fetch_add(1, std::memory_order_relaxed);
     if (!TryRun(true)) {
         for (u32 s = state.load(std::memory_order_acquire); s != Done;
              s = state.load(std::memory_order_acquire)) {
             state.wait(s, std::memory_order_acquire);
         }
     }
+    g_waiters.fetch_sub(1, std::memory_order_relaxed);
     const u64 wait_ns = NsSince(t_start);
     g_stats.waits.fetch_add(1, std::memory_order_relaxed);
     g_stats.preload_waits.fetch_add(preload ? 1 : 0, std::memory_order_relaxed);
@@ -355,6 +365,11 @@ size_t WaitIdleFor(std::chrono::milliseconds timeout) {
 
 void Shutdown() {
     GetPool().Shutdown();
+}
+
+bool ComputeUrgent() {
+    return g_demand_size.load(std::memory_order_relaxed) != 0 ||
+           g_waiters.load(std::memory_order_relaxed) != 0;
 }
 
 } // namespace PipelineCompilePool

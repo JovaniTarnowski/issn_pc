@@ -412,6 +412,17 @@ private:
     void Run(std::stop_token stoken, u32 index) {
         const std::string name = fmt::format("shadPS4:PipelineCompiler{}", index);
         Common::SetCurrentThreadName(name.c_str());
+        // issn_pc (2026-10-23): below the game's threads (a skipped draw can wait), and a driver
+        // pipeline cache of its own: one shared vk::PipelineCache is serialized by the driver,
+        // so the compute compiles the frame waits for queued behind these. Nothing reads these
+        // caches back (the driver cache is not saved), and a pipeline outlives its cache.
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        vk::UniquePipelineCache own_cache{};
+        if (auto [result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+            result == vk::Result::eSuccess) {
+            own_cache = std::move(cache);
+        }
+        const vk::PipelineCache use_cache = own_cache ? *own_cache : pipeline_cache;
         while (true) {
             std::unique_ptr<AsyncJob> job;
             {
@@ -424,9 +435,16 @@ private:
                 queue.pop_front();
                 ++busy;
             }
+            // Compute first: up to 100 ms per job while the game waits for (or has just asked
+            // for) a compute pipeline.
+            for (u32 i = 0; i < 200 && PipelineCompilePool::ComputeUrgent() &&
+                            !stoken.stop_requested();
+                 ++i) {
+                std::this_thread::sleep_for(std::chrono::microseconds{500});
+            }
             const auto t_create = CompileClock::now();
             job->pipeline = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, profile, job->key, pipeline_cache, job->infos,
+                instance, scheduler, desc_heap, profile, job->key, use_cache, job->infos,
                 job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
                 &job->desc_bindings);
             job->create_ms = MsSince(t_create);

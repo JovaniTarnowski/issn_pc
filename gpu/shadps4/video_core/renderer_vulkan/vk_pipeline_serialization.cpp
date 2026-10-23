@@ -1275,6 +1275,12 @@ void PipelineCache::WarmUp() {
     // marked metas from an earlier PRECOMPILE launch).
     precompile_retired = ReadPrecompileHashes(PrecompileRetiredFile);
     ReadSeedGraphicsKeys(); // any rebuild mode: seed keys stay out unless the stamp allows them
+    if (CacheRebuildMode() & 2) {
+        // issn_pc: the list of differing metas is this VERIFY run's alone (it was appended to, so
+        // an ANNOTATE run before it left the vertex shaders it then fixed in the list).
+        std::error_code ec;
+        std::filesystem::remove(Storage::DataBase::Instance().SidecarPath("rebuild-differ.txt"), ec);
+    }
     if (CacheRebuildMode() & 1) {
         ReadSeedStamp();
         if (RebuildThreads() > 0 && (seed_stamp.compute || seed_stamp.graphics)) {

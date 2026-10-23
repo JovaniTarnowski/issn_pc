@@ -74,6 +74,27 @@ fi
 cp -r third_party/fsr4 "$dest/fsr4_shaders"
 # The title face of the launcher (Bebas Neue, SIL Open Font License).
 cp launcher/OFL-BebasNeue.txt "$dest/launcher/"
+# Shader seed (ISSN_SHADER_SEED_FROM=<cache folder verified with SHADPS4_CACHE_REBUILD=2>,
+# tools/make_shader_seed.py): pipeline keys and shader metas, no shader code; a player's first start
+# makes the shaders from their own game files. Shipped as user/cache/<name>, which run.py uses as the
+# cache folder (shader-seed.txt). The stamp holds the hash of the executable it was verified with,
+# so the verify run must have used this package's issn-probe.exe.
+if [[ -n ${ISSN_SHADER_SEED_FROM:-} ]]; then
+    version=$(sed -n "s/^VERSION = '\(.*\)'.*/\1/p" launcher/issn_launcher_win.py)
+    seed_name=${ISSN_SHADER_SEED_NAME:-issn-seed-$version}
+    verified_exe=$(dirname -- "$ISSN_SHADER_SEED_FROM")/../../bin/issn-probe.exe
+    if [[ ! -f $verified_exe ]] || ! cmp -s "$verified_exe" "$dest/bin/issn-probe.exe"; then
+        echo "The seed's folder was not verified with this package's bin/issn-probe.exe ($verified_exe)." >&2
+        echo 'Run the verify from dist/issn-windows after packaging, without building again.' >&2
+        exit 1
+    fi
+    "$python" -I "$(cygpath -w "$PWD/tools/make_shader_seed.py")" "$(cygpath -w "$ISSN_SHADER_SEED_FROM")" \
+        "$(cygpath -w "$PWD/$dest/user/cache/$seed_name")"
+    extra=$(find "$dest/user" -type f ! -name '*.key' ! -name '*.meta' ! -name seed-stamp.bin \
+        ! -name vs-formats.bin ! -name seed-graphics-keys.txt -print)
+    [[ -z $extra ]] || { echo "The seed holds files that must not ship:" >&2; echo "$extra" >&2; exit 1; }
+    printf '%s\n' "$seed_name" > "$dest/shader-seed.txt"
+fi
 mkdir -p dist
 rm -f dist/issn-windows.zip
 (cd out/stage && powershell -NoProfile -Command \
