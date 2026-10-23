@@ -1,4 +1,4 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.0
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.1
 ======================================================
 
 A test build: the game plays from the start, at about 90-105 FPS standing in the open city on a
@@ -13,6 +13,21 @@ nvngx_dlss.dll. Then choose DLSS in Graphics > Anti-aliasing. Untested by us (no
 please report how it goes. Without the files the game keeps its own anti-aliasing.
 
 Reporting problems).
+
+What's new in 0.3.1
+- axylpup's 1.1 fixes in the graphics core: texture-cache hangs, 8 GB AMD cards (RX 6600)
+  closing while the world loads, less video memory below 10 GB and less RAM below 24 GB.
+- CPUs with fewer than 20 threads no longer give a whole core to the GPU feeder (axylpup's
+  measurement: 8-12% more FPS).
+- Performance mode (launcher: Performance > Performance mode): Balanced / Maximum use the
+  game's own lower settings. On the tester's Ryzen 7 3700X + RX 9060 XT in the city: about
+  55-65 FPS before, 80+ with Maximum.
+- FSR 4 / DLSS find the game's images by themselves on every game version; Home switches them
+  and the game's own AA live; FSR 4's GPU time is in the log (about 1.9 ms on an RX 9060 XT).
+- 1:1 mouse aim (axylpup's camera hook): click in the window; Y / F7 lets the mouse go.
+- A damaged shader cache file is skipped instead of stopping the game.
+- Pads keep working when the game is started from Steam.
+- The first start after updating prepares the shaders again (a few minutes, some stutter).
 
 What's new in 0.3.0
 - New graphics core: axylpup's shadPS4 build for this game (github.com/axylpup/shadPS4, release

@@ -57,11 +57,11 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEW_GROUP = {} if WINDOWS else {'start_new_session': True}
 UI_FONT, MONO_FONT, SERIF_FONT = 'Segoe UI', 'Consolas', 'Georgia'
 # This build; GitHub release tags are windows-v<VERSION>.
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 # This port's own test builds (never the God of War III port's: they must not be installed over
 # it). The source repository is private; the builds are published in a public repository that
 # holds only releases (tag windows-v<VERSION>, the zip from packaging/windows/package.sh).
-RELEASES_REPO = 'Liondarkz/issn_pc-releases'
+RELEASES_REPO = 'Liondarkz/issn_pc'  # releases moved here with 0.3.0 (the repo is public)
 RELEASES_API = f'https://api.github.com/repos/{RELEASES_REPO}/releases/latest'
 RELEASES_PAGE = f'https://github.com/{RELEASES_REPO}/releases'
 UPDATES = bool(RELEASES_API)
