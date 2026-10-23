@@ -42,6 +42,13 @@ public:
 
     void End();
 
+    /// A new interval from the next tick (the vblank rate changed live); the accumulated
+    /// wait / overrun is dropped so the new rate starts clean.
+    void SetInterval(std::chrono::nanoseconds interval) {
+        target_interval = interval;
+        total_wait = {};
+    }
+
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }
@@ -53,6 +60,23 @@ std::string GetCurrentThreadName();
 /// THREAD_PRIORITY_HIGHEST; =2 additionally restricts it to the performance cores (highest CPU
 /// set efficiency class). Default off. Windows only; call on the thread itself.
 void ApplyCommandProcessorPlacement();
+
+/// SHADPS4_MEM_CENSUS: this process's private bytes and working set (0 / 0 where unknown).
+void ProcessMemory(u64& private_bytes, u64& working_set);
+
+/// Installed physical memory in bytes (0 where unknown). SHADPS4_SIM_RAM_MB stands in for it.
+u64 PhysicalRamBytes();
+
+/// SHADPS4_MEM_CENSUS: committed bytes by kind and place (VirtualQuery walk): private / mapped,
+/// inside the guest range 0x200000000 - 0x1000000000 or outside it (emulator, driver, heaps).
+struct CommitCensus {
+    u64 private_guest{}, private_host{}, mapped_guest{}, mapped_host{}, image{};
+    u32 host_blocks{};             ///< private allocations outside the guest range
+    u64 top_base[8]{}, top_bytes[8]{}; ///< the largest of them (committed bytes per allocation)
+    u64 default_heap{}, other_heaps{}; ///< committed bytes: the process heap (malloc / new), others
+    u32 heaps{};
+};
+CommitCensus WalkCommitted();
 /// SHADPS4_GUEST_PCORE=<mask> (2026-10-15, notes/gamemain-saturation-2026-10-15.md): bit 0 the game's
 /// JobWorker* threads, bit 1 Game:Main get every performance logical processor (minus reserved
 /// cores) as selected CPU sets and power throttling off. Called with the thread's handle and name.

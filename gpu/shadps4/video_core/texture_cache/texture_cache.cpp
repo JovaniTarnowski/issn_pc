@@ -11,6 +11,7 @@
 #include <limits>
 #include <xxhash.h>
 
+#include "common/memory_patcher.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/dirty_epoch.h"
 #include "common/path_util.h"
@@ -688,6 +689,41 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {merged_image_id, -1, -1};
         }
 
+        // Live screen percentage (study 10-20 route A, sec. 2 / 3.4; Opus review 10-20): for 3 s
+        // after a change the game re-describes its screen-sized render targets at the new size at
+        // the same addresses. A render target / depth image of the render shape asked for at
+        // another size of that shape: a new image (smaller: no view into the old one's corner;
+        // larger: no unresolvable overlap). Only in that window and only screen-shaped sizes, so
+        // the usual aliasing (the minimap's 768x768 depth at the main depth's address) keeps its
+        // view. Freed when not used in this submission (DeleteImage defers the Vulkan side until
+        // the GPU is done; the per-frame memos revalidate on unregister); else both stay.
+        if (image_info.size != cache_image.info.size &&
+            (cache_image.usage.render_target || cache_image.usage.depth_target) &&
+            MemoryPatcher::InLiveResizeWindow() &&
+            MemoryPatcher::IsRenderShaped(image_info.size.width, image_info.size.height) &&
+            MemoryPatcher::IsRenderShaped(cache_image.info.size.width,
+                                          cache_image.info.size.height)) {
+            const bool unused = cache_image.tick_accessed_last < AgeTick();
+            // SHADPS4_LIVE_RES_LOG=1 (test): every image this rule replaces.
+            static const bool log_rule = [] {
+                const char* v = std::getenv("SHADPS4_LIVE_RES_LOG");
+                return v && v[0] == '1';
+            }();
+            if (log_rule) {
+                LOG_INFO(Render_Vulkan,
+                         "LiveResize: {} {}x{} {} at {:#x} (rt {} depth {}) for a {}x{} request",
+                         unused ? "freed" : "kept", cache_image.info.size.width,
+                         cache_image.info.size.height, vk::to_string(cache_image.info.pixel_format),
+                         cache_image.info.guest_address, +cache_image.usage.render_target,
+                         +cache_image.usage.depth_target, image_info.size.width,
+                         image_info.size.height);
+            }
+            if (unused) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
+
         if (const auto depth_image_id = ResolveDepthOverlap(image_info, binding, cache_image_id)) {
             return {depth_image_id, -1, -1};
         }
@@ -833,6 +869,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   merged_image_id.index, static_cast<int>(binding), AgeTick(),
                   AgeTick() - cache_image.tick_accessed_last);
 
+        if (MemoryPatcher::InLiveResizeWindow()) {
+            // Just after a live size change: a new image instead of stopping (the old one freed
+            // when unused, as above).
+            if (safe_to_delete || cache_image.tick_accessed_last < AgeTick()) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
 
@@ -1479,6 +1523,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // UpdateImage above acquires/releases the mutex itself; do not cover it here.
         CacheLock lock{*this};
         ImageId stencil_id{};
+        ImageId any_stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
                                  if (image.info.guest_address != desc.info.stencil_addr) {
@@ -1486,11 +1531,22 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                  }
                                  // STENCIL_PLANE_MERGE: several planes can share the address
                                  // (Pro 1600x1800 and 3200x1800); keep the one matching the depth.
-                                 if (!stencil_id || !StencilPlaneMerge() ||
-                                     image.info.size == desc.info.size) {
-                                     stencil_id = image_id;
+                                 // A live render-size change leaves a plane of the old size at
+                                 // the address too (user RenderDoc 10-21: the last one won, an
+                                 // all-zero 1280x720 copy for a 2560x1440 depth - Delsin lost
+                                 // his shading): with live changes only a same-size plane.
+                                 if (image.info.size == desc.info.size) {
+                                     if (!stencil_id || !StencilPlaneMerge() ||
+                                         slot_images[stencil_id].info.size != desc.info.size) {
+                                         stencil_id = image_id;
+                                     }
+                                 } else if (!any_stencil_id) {
+                                     any_stencil_id = image_id;
                                  }
                              });
+        if (!stencil_id && !MemoryPatcher::LiveResizeAvailable()) {
+            stencil_id = any_stencil_id; // the old pick: any plane at the address
+        }
         if (!stencil_id) {
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
@@ -1882,6 +1938,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     LogImageChurn("Register", image);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    std::atomic_ref<u64>{image.gc_touch}.store(gc_tick, std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         auto& page_ids = page_table[page];
         for (const ImageId other : page_ids) {
@@ -2058,6 +2115,11 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    // The walk tests every image's own use tick (review 10-20: it runs every frame where the
+    // trigger is 0 - cards of <= 8 GB or no memory report): every 4th tick unless critical.
+    if ((gc_tick & 3) != 0 && total_used_memory < critical_gc_memory) {
+        return;
+    }
     CacheLock lock{*this};
     bool pressured = false;
     bool aggresive = false;
@@ -2104,14 +2166,21 @@ void TextureCache::GarbageCollectImages() {
         return false;
     };
 
-    // Try to remove anything old enough and not high priority.
+    // Try to remove anything old enough and not high priority. The list order is no longer the
+    // use order (TouchImage stores the tick in the image): every item is tested by its tick.
+    const auto old_enough = [&](ImageId image_id) {
+        if (UsedSince(slot_images[image_id], gc_tick - ticks_to_destroy + 1)) {
+            return false;
+        }
+        return clean_up(image_id);
+    };
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItem(old_enough);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItem(old_enough);
     }
 }
 
@@ -2156,17 +2225,95 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
+void TextureCache::PurgeOldRenderSize(u32 old_w, u32 old_h, u32 new_w, u32 new_h) {
+    // Live screen percentage (user 10-20 ~22:20: lighting shifts, photo-mode shadows lost after
+    // changes; s1511: the ResolveOverlap rule fired twice in 21 changes): every size the player
+    // visits leaves a full set of the game's screen-sized targets, and a return to that size
+    // perfect-matches the old set with its old contents. At the end of the first frame drawn at
+    // the new size, the old size's targets that frame did not touch are freed: the old size and
+    // its /2 /4 /8 /16 (the game's size table, study-live-resolution sec. 1; +-8 px rounding),
+    // never a size of the new family, never a display buffer (Opus review 10-20). No download:
+    // SafeToDownload holds for every target the GPU drew (s1518: it kept all of them), and the
+    // game re-describes and redraws these addresses at the new size - the old contents are dead.
+    const auto family = [](u32 w, u32 h, u32 base_w, u32 base_h) {
+        for (u32 k = 0; k <= 4; ++k) {
+            const s64 fw = base_w >> k;
+            const s64 fh = base_h >> k;
+            if (std::abs(s64(w) - fw) <= 8 && std::abs(s64(h) - fh) <= 8) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CacheLock lock{*this};
+    std::vector<ImageId> stale;
+    bool new_size_seen = false;
+    lru_cache.ForEachItem([&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            return;
+        }
+        const u32 w = image.info.size.width;
+        const u32 h = image.info.size.height;
+        const bool used = UsedSince(image, gc_tick);
+        const bool target = image.usage.render_target || image.usage.depth_target;
+        if (target && used && w == new_w && h == new_h) {
+            new_size_seen = true;
+        }
+        // Sampled-only images of the old size go too (user 10-21 RenderDoc, study-live-resize-
+        // lighting: an R8Uint copy of the depth buffer's stencil plane from an earlier visit to
+        // a size, all zeros, matched again on return - 7 lighting / shadow passes read it and
+        // Delsin lost his shading). A texture freed here is uploaded again from guest memory.
+        if (!used && !image.usage.vo_surface && family(w, h, old_w, old_h) &&
+            !family(w, h, new_w, new_h)) {
+            stale.push_back(image_id);
+        }
+    });
+    if (!new_size_seen) {
+        // This frame was still the old size (the back runs behind Game:Main): next frame.
+        MemoryPatcher::RequeueLivePurge();
+        return;
+    }
+    std::sort(stale.begin(), stale.end(),
+              [](ImageId a, ImageId b) { return a.index < b.index; });
+    stale.erase(std::unique(stale.begin(), stale.end()), stale.end());
+    u64 bytes = 0;
+    size_t freed = 0;
+    for (const ImageId id : stale) {
+        Image& image = slot_images[id];
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        bytes += image.info.guest_size;
+        FreeImage(id);
+        ++freed;
+    }
+    LOG_INFO(Render_Vulkan,
+             "LiveResize: dropped {} target(s) of the old {}x{} ({} listed), {} MB of guest size",
+             freed, old_w, old_h, stale.size(), bytes >> 20);
+}
+
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
 
+    if (u64 sizes[2]; MemoryPatcher::TakeLivePurge(sizes)) {
+        PurgeOldRenderSize(u32(sizes[0] >> 32), u32(sizes[0]), u32(sizes[1] >> 32), u32(sizes[1]));
+    }
     GarbageCollectImages();
     GarbageCollectSamplers();
 }
 
 void TextureCache::TouchImage(const Image& image) {
-    lru_cache.Touch(image.lru_id, gc_tick);
+    std::atomic_ref<u64>{const_cast<u64&>(image.gc_touch)}.store(
+        std::atomic_ref<u64>{const_cast<u64&>(gc_tick)}.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+}
+
+bool TextureCache::UsedSince(const Image& image, u64 tick) const {
+    return std::atomic_ref<u64>{const_cast<u64&>(image.gc_touch)}.load(
+               std::memory_order_relaxed) >= tick;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

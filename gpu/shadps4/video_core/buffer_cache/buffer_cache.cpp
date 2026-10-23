@@ -22,6 +22,7 @@
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/memory_patcher.h"
+#include "common/path_util.h"
 #include "core/memory.h"
 #include "shader_recompiler/native_emit.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -655,7 +656,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // eShaderDeviceAddress: SHADPS4_NATIVE_PT reads a page-table miss from the table itself.
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-                           BDA_PAGETABLE_SIZE} {
+                           BdaPageTableSize()} {
     g_discard_cache = this; // SHADPS4_PARTICLE_ARENA_DISCARD hook
     g_lane_on = scheduler.HasLane();
     g_lane_counters = &scheduler.lane_c;
@@ -685,6 +686,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                  host_mirror_max);
     }
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
+    LOG_INFO(Render_Vulkan, "GPU page table: {} MB (covers {} GB of guest addresses)",
+             BdaPageTableSize() >> 20, (BdaNumPages() * CACHING_PAGESIZE) >> 30);
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
 
@@ -7303,22 +7306,42 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         }
         const char* t = std::getenv("SHADPS4_BIG_GROW_TIERS");
         const bool tiers = !(t && t[0] == '0');
+        // 1.1 (PERF-PLAN 11): with < 24 GB of RAM the 3.75 GB tier is skipped (3 GB / 2.75 GB by VRAM). Every byte of video
+        // memory also commits a byte of system memory (s1436: a 2 GB device-local buffer added
+        // 2 GB of private RAM), and the game's mesh memory measured 2491-2515 MB: the 3.75 GB
+        // buffer's spare memory costs a 16 GB PC RAM it needs (s1438, 16 GB simulated: VRAM 6.89 ->
+        // 6.12 GB, private RAM 14.3 -> 13.5 GB).
+        const u64 ram = Common::PhysicalRamBytes();
+        const bool low_ram = ram != 0 && ram < (24ull << 30);
         u64 size = 0;
-        if (heap >= (min_mb << 20)) {
+        if (heap >= (min_mb << 20) && !(tiers && low_ram)) {
             size = 0xF0000000ull; // 3.75 GB
         } else if (tiers && heap >= (7168ull << 20)) {
             size = 0xC0000000ull; // 3 GB
         } else if (tiers) {
             size = 0xB0000000ull; // 2.75 GB
         }
-        const u64 max_alloc = instance.MaxMemoryAllocationSize();
+        u64 max_alloc = instance.MaxMemoryAllocationSize();
+        // SHADPS4_SIM_MAX_ALLOC_MB (test): a smaller reported limit, e.g. 2048 like the RX 6600.
+        if (const char* m = std::getenv("SHADPS4_SIM_MAX_ALLOC_MB")) {
+            max_alloc = std::min<u64>(max_alloc, std::strtoull(m, nullptr, 10) << 20);
+        }
         if (size > max_alloc) {
-            size = tiers && max_alloc >= 0xB0000000ull ? 0xB0000000ull : 0;
+            // 1.1 (GitHub #15, RX 6600 8 GB, reported max allocation 2048 MiB): turning BIG_GROW
+            // off below 2.75 GB did not avoid a big allocation - the old growth path made the
+            // mesh buffer 2471 MB on that card anyway, then a 2473 MB copy beside it at the next
+            // growth (6212 / 6336 MB -> out of video memory). The mesh memory needs one ~2.5 GB
+            // buffer on either path, so a reported limit below 2.75 GB keeps the card's tier, at
+            // most 3 GB (the city save's mesh memory reached 2790 MB in s1558: 2.75 GB is too
+            // tight). A limit of 2.75 GB or more is respected as before.
+            size = !tiers                        ? 0
+                   : max_alloc >= 0xB0000000ull ? 0xB0000000ull
+                                                 : std::min<u64>(size, 0xC0000000ull);
         }
         LOG_INFO(Render_Vulkan,
-                 "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB, tiers {}), "
-                 "max allocation {} MiB -> {} MB{}",
-                 heap >> 20, simulated ? " (SIMULATED, SHADPS4_SIM_VRAM_MB)" : "", min_mb,
+                 "BIG_GROW: largest device-local heap {} MiB{} (3.75 GB needs >= {} MiB and >= 24 GB "
+                 "RAM, RAM {} MB, tiers {}), max allocation {} MiB -> {} MB{}",
+                 heap >> 20, simulated ? " (SIMULATED, SHADPS4_SIM_VRAM_MB)" : "", min_mb, ram >> 20,
                  tiers ? "on" : "off", max_alloc >> 20, size >> 20,
                  size != 0 ? " - one mesh buffer sized once"
                            : " - OFF: fallback to the old growth path");
@@ -7556,8 +7579,23 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
             vk::DeviceAddress addr = buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS);
             bda_addrs.push_back(addr);
         }
-        WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
-                        bda_addrs.data(), bda_addrs.size() * sizeof(vk::DeviceAddress));
+        // SHADPS4_PT_BITS: entries above the table are not written (that range reads as a miss).
+        const u64 table_pages = BdaNumPages();
+        const u64 n = page_begin < table_pages
+                          ? std::min<u64>(bda_addrs.size(), table_pages - page_begin)
+                          : 0;
+        if (n != 0) {
+            WriteDataBuffer(bda_pagetable_buffer, page_begin * sizeof(vk::DeviceAddress),
+                            bda_addrs.data(), n * sizeof(vk::DeviceAddress));
+        }
+        if (n < bda_addrs.size()) { // wholly or partly above the table (review 10-20, item 3)
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LOG_WARNING(Render_Vulkan, "GPU page table: a buffer at {:#x} is above the table "
+                                           "(SHADPS4_PT_BITS) - GPU pointer reads there see a miss",
+                            device_addr_begin);
+            }
+        }
         if (g_buffer_ranges_lock) {
             std::unique_lock lk{buffer_ranges_mutex};
             buffer_ranges.Add(buffer.CpuAddr(), buffer.SizeBytes(), buffer_id);
@@ -7567,8 +7605,13 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     } else {
         total_used_memory -= Common::AlignUp(size, CACHING_PAGESIZE);
         lru_cache.Free(buffer.LRUId());
-        const u64 offset = bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
-        bda_pagetable_buffer.Fill(offset, size_pages * sizeof(vk::DeviceAddress), 0);
+        if (const u64 table_pages = BdaNumPages(); page_begin < table_pages) {
+            const u64 offset =
+                bda_pagetable_buffer.Offset(page_begin * sizeof(vk::DeviceAddress));
+            bda_pagetable_buffer.Fill(
+                offset, std::min<u64>(size_pages, table_pages - page_begin) * sizeof(vk::DeviceAddress),
+                0);
+        }
         if (g_buffer_ranges_lock) {
             std::unique_lock lk{buffer_ranges_mutex};
             buffer_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
@@ -8612,7 +8655,12 @@ void BufferCache::RunGarbageCollector() {
         vram_peak_vma = std::max(vram_peak_vma, vma_local);
         vram_peak_driver = std::max(vram_peak_driver, total_used_memory);
         const auto now = std::chrono::steady_clock::now();
-        if (now - vram_last_log >= std::chrono::seconds{60}) {
+        // SHADPS4_MEM_CENSUS=1: every 10 s (the census below rides on this line).
+        static const bool census_fast = [] {
+            const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+            return v && (v[0] == '1' || v[0] == '2');
+        }();
+        if (now - vram_last_log >= std::chrono::seconds{census_fast ? 10 : 60}) {
             vram_last_log = now;
             LOG_INFO(Render_Vulkan,
                      "VideoMemory: VMA video {} MB (peak {} MB); driver process usage {} MB (peak "
@@ -8620,6 +8668,108 @@ void BufferCache::RunGarbageCollector() {
                      vma_local >> 20, vram_peak_vma >> 20, total_used_memory >> 20,
                      vram_peak_driver >> 20, trigger_gc_memory >> 20,
                      Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+            // SHADPS4_MEM_CENSUS=1 (PERF-PLAN 11, diagnostic): where the memory goes. Buffer and
+            // image sizes are guest sizes (host allocations add alignment / tiling: inferred).
+            static const bool census = [] {
+                const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+                return v && (v[0] == '1' || v[0] == '2');
+            }();
+            if (census) {
+                u64 buf_bytes = 0, buf_largest = 0;
+                u32 bufs = 0;
+                for (const auto& buffer : slot_buffers) {
+                    buf_bytes += buffer.SizeBytes();
+                    buf_largest = std::max<u64>(buf_largest, buffer.SizeBytes());
+                    ++bufs;
+                }
+                const auto img = texture_cache.MemoryCensus();
+                u64 priv = 0, ws = 0;
+                Common::ProcessMemory(priv, ws);
+                // SHADPS4_MEM_PROBE=1 (once): does freed host-visible upload memory return to
+                // Windows? A 2 GB Upload buffer as UploadCopies' large branch makes, filled, freed.
+                static bool probed = false;
+                if (const char* pv = std::getenv("SHADPS4_MEM_PROBE"); pv && pv[0] == '1' &&
+                                                                        !probed) {
+                    probed = true;
+                    u64 p0 = 0, p1 = 0, p2 = 0, w = 0;
+                    Common::ProcessMemory(p0, w);
+                    {
+                        Buffer probe{instance, scheduler, MemoryUsage::Upload, 0,
+                                     vk::BufferUsageFlagBits::eTransferSrc, 2_GB};
+                        if (!probe.mapped_data.empty()) {
+                            std::memset(probe.mapped_data.data(), 1, probe.mapped_data.size());
+                        }
+                        Common::ProcessMemory(p1, w);
+                    }
+                    Common::ProcessMemory(p2, w);
+                    LOG_INFO(Render_Vulkan,
+                             "MemProbe: private before {} MB, with a filled 2 GB upload buffer {} "
+                             "MB, after freeing it {} MB",
+                             p0 >> 20, p1 >> 20, p2 >> 20);
+                    // (A 2 GB device-local probe, 10-20 s1436: private RAM +2 GB while it
+                    // existed - the driver commits system memory for video memory. Removed:
+                    // its GPU wait in this context lost the device.)
+                }
+                const auto cc = Common::WalkCommitted();
+                std::string top;
+                for (int i = 0; i < 8 && cc.top_bytes[i] != 0; ++i) {
+                    top += fmt::format(" {:#x}:{}MB", cc.top_base[i], cc.top_bytes[i] >> 20);
+                }
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: committed - private in the guest range {} MB, private "
+                         "outside {} MB in {} allocations (largest:{}), mapped in the guest range "
+                         "{} MB, mapped outside {} MB, modules {} MB | heaps: process heap {} MB, "
+                         "{} other heaps {} MB",
+                         cc.private_guest >> 20, cc.private_host >> 20, cc.host_blocks, top,
+                         cc.mapped_guest >> 20, cc.mapped_host >> 20, cc.image >> 20,
+                         cc.default_heap >> 20, cc.heaps - 1, cc.other_heaps >> 20);
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: buffers {} MB in {} (largest {} MB) | render targets / depth {} "
+                         "MB in {} | textures {} MB in {} (largest image {} MB) | process RAM "
+                         "private {} MB, working set {} MB | game quality level {}",
+                         buf_bytes >> 20, bufs, buf_largest >> 20, img.targets_bytes >> 20,
+                         img.targets, img.textures_bytes >> 20, img.textures,
+                         img.largest_bytes >> 20, priv >> 20, ws >> 20,
+                         MemoryPatcher::GameQualityLevel());
+                // What VMA itself holds in video memory (blocks / live allocations) vs the
+                // driver's count for the process (budget usage): the rest is driver-internal
+                // (NGX, shader code, swapchain, command memory: inferred).
+                u64 vma_blocks = 0, vma_allocs = 0;
+                u32 vma_count = 0;
+                for (u32 i = 0; i < mp.memoryHeapCount; ++i) {
+                    if (mp.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                        vma_blocks += budgets[i].statistics.blockBytes;
+                        vma_allocs += budgets[i].statistics.allocationBytes;
+                        vma_count += budgets[i].statistics.allocationCount;
+                    }
+                }
+                LOG_INFO(Render_Vulkan,
+                         "MemCensus: video memory - VMA blocks {} MB, VMA allocations {} MB in {}, "
+                         "process usage {} MB (outside VMA {} MB)",
+                         vma_blocks >> 20, vma_allocs >> 20, vma_count, vma_local >> 20,
+                         (vma_local > vma_blocks ? vma_local - vma_blocks : 0) >> 20);
+                // SHADPS4_MEM_CENSUS=2: once, at the 6th census (~60 s), every VMA allocation (size,
+                // type, usage flags) to vma-stats.json in the log folder.
+                static u32 census_n = 0;
+                static const bool dump = [] {
+                    const char* v = std::getenv("SHADPS4_MEM_CENSUS");
+                    return v && v[0] == '2';
+                }();
+                if (dump && ++census_n == 6) {
+                    char* stats = nullptr;
+                    vmaBuildStatsString(instance.GetAllocator(), &stats, VK_TRUE);
+                    if (stats) {
+                        const auto path =
+                            Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "vma-stats.json";
+                        if (std::FILE* f = std::fopen(path.string().c_str(), "wb")) {
+                            std::fwrite(stats, 1, std::strlen(stats), f);
+                            std::fclose(f);
+                        }
+                        vmaFreeStatsString(instance.GetAllocator(), stats);
+                        LOG_INFO(Render_Vulkan, "MemCensus: VMA map written to {}", path.string());
+                    }
+                }
+            }
         }
     }
     if (total_used_memory < trigger_gc_memory) {

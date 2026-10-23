@@ -15,6 +15,7 @@
 #include "core/address_space.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/buffer_cache/pt_bits.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
@@ -177,6 +178,20 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     CreateDevice();
     CollectPhysicalMemoryInfo();
     CreateSimBallast();
+    {
+        // The GPU page table's default coverage (pt_bits.h): the 64 MB table where video memory
+        // is short (the game maps GPU memory no higher than 63.5 GB, s1457 / s1460).
+        u64 heap = 0;
+        for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+            if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                heap = std::max<u64>(heap, memory_properties.memoryHeaps[i].size);
+            }
+        }
+        if (sim_vram_bytes != 0) {
+            heap = std::min<u64>(heap, sim_vram_bytes);
+        }
+        VideoCore::g_pt_auto_bits.store(heap < (10ull << 30) ? 37u : 40u);
+    }
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
@@ -1161,10 +1176,18 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // SHADPS4_VMA_BLOCK_MB (PERF-PLAN 11, 2026-10-20): VMA's block size for large heaps (default
+    // 256 MB). City 1080p (s1456): 620 MB of the 6.9 GB VMA holds was empty space inside blocks
+    // (video 340 MB of 736, the host-visible video type 282 MB of 480).
+    u64 block_bytes = 0;
+    if (const char* v = std::getenv("SHADPS4_VMA_BLOCK_MB"); v && std::atoi(v) >= 16) {
+        block_bytes = u64(std::min(std::atoi(v), 1024)) << 20;
+    }
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = block_bytes,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

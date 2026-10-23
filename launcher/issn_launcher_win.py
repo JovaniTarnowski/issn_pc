@@ -319,6 +319,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
                 'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': '',
+                'perf_mode': '',
                 'anti_aliasing': 'game'}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
@@ -430,6 +431,11 @@ READBACKS = [('', ('Full effects (default)',)), ('1', ('Light: faster, some effe
 # ISSN_LOD_SCALE: how far detail is drawn in the city ('' = the game profile's 1.0, the game's own).
 DRAW_DISTANCE = [('', ('Original (default)',)), ('0.6', ('Short (faster)',)), ('1.5', ('Long (less pop-in)',)),
                  ('2.0', ('Very long (least pop-in, slower)',))]
+# ISSN_PERF_MODE (axylpup's 1.1 performance mode, gpu/shim/issn_view.cpp): the game's own lower
+# settings for the open city: shorter LOD, one shadow cascade less, lower-resolution particles,
+# fewer high-resolution textures; Maximum also halves the pedestrians.
+PERF_MODES = [('', ('Off: full quality (default)',)), ('low', ('Balanced: about 13% more FPS in the city',)),
+              ('office', ('Maximum: about 19% more FPS, fewer pedestrians',))]
 # issn-axy: what replaces the game's own temporal anti-aliasing (SMAA T2x). FSR 4 ships with the
 # port (third_party/fsr4); DLSS needs NVIDIA's Streamline files in dlss_folder().
 ANTI_ALIASING = [('game', ("The game's own (SMAA T2x)",)), ('fsr4', ('FSR 4 Native AA (AMD Radeon RX 7000 / 9000)',)),
@@ -823,6 +829,9 @@ def game_environment(s):
     # gone with it: settings saved by 0.2 keep their keys and nothing reads them.
     if s.get('draw_distance') in {value for value, _text in DRAW_DISTANCE if value}:
         env['ISSN_LOD_SCALE'] = str(s['draw_distance'])
+    env.pop('ISSN_PERF_MODE', None)
+    if s.get('perf_mode') in {value for value, _text in PERF_MODES if value}:
+        env['ISSN_PERF_MODE'] = s['perf_mode']
     for key, name in (('frame_stats', 'ISSN_FRAME_STATS'), ('vk_validation', 'ISSN_VK_VALIDATION')):
         if s[key]:
             env[name] = '1'
@@ -1418,6 +1427,10 @@ class Launcher:
         self.row(f, _('Draw distance'), self.choice(f, 'draw_distance', 'app', DRAW_DISTANCE),
                  _('How far buildings and details keep their full detail in the open city. Long and Very long '
                    'show less pop-in than the PS4 and cost some FPS.'), restart=True)
+        self.row(f, _('Performance mode'), self.choice(f, 'perf_mode', 'app', PERF_MODES),
+                 _('The game\'s own lower settings, from axylpup\'s 1.1: shorter detail distance, one shadow '
+                   'level less, lighter particles and fewer high-resolution textures nearby. Figures are '
+                   'from his PC in the heaviest city view.'), restart=True)
         self.row(f, _('Effects'), self.choice(f, 'readbacks', 'app', READBACKS),
                  _('Smoke, sparks, neon and bullets are computed on the graphics card and read back by the '
                    'game. Full keeps all of them; Light and Off are faster but lose effects.'), restart=True)

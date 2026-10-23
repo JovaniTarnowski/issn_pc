@@ -25,6 +25,7 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+#include <psapi.h>
 #include <bit>
 #include <intrin.h>
 #include "common/string_util.h"
@@ -486,6 +487,91 @@ void ApplyHelperThreadPlacement(const char* name) {
              name, n, ok);
 }
 
+void ProcessMemory(u64& private_bytes, u64& working_set) {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                sizeof(pmc))) {
+        private_bytes = pmc.PrivateUsage;
+        working_set = pmc.WorkingSetSize;
+    } else {
+        private_bytes = working_set = 0;
+    }
+}
+
+u64 PhysicalRamBytes() {
+    if (const char* sim = std::getenv("SHADPS4_SIM_RAM_MB")) {
+        return std::strtoull(sim, nullptr, 10) << 20;
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
+}
+
+CommitCensus WalkCommitted() {
+    CommitCensus c{};
+    u64 cur_base = 0, cur_bytes = 0;
+    const auto flush = [&] {
+        if (cur_bytes == 0) {
+            return;
+        }
+        ++c.host_blocks;
+        for (int i = 0; i < 8; ++i) {
+            if (cur_bytes > c.top_bytes[i]) {
+                for (int j = 7; j > i; --j) {
+                    c.top_bytes[j] = c.top_bytes[j - 1];
+                    c.top_base[j] = c.top_base[j - 1];
+                }
+                c.top_bytes[i] = cur_bytes;
+                c.top_base[i] = cur_base;
+                break;
+            }
+        }
+        cur_bytes = 0;
+    };
+    u64 a = 0x10000;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (a < 0x7fffffff0000ull &&
+           VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        const u64 base = reinterpret_cast<u64>(mbi.BaseAddress);
+        const u64 size = mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT) {
+            const bool guest = base >= 0x200000000ull && base < 0x1000000000ull;
+            if (mbi.Type == MEM_PRIVATE) {
+                (guest ? c.private_guest : c.private_host) += size;
+                if (!guest) {
+                    const u64 alloc = reinterpret_cast<u64>(mbi.AllocationBase);
+                    if (alloc != cur_base) {
+                        flush();
+                        cur_base = alloc;
+                    }
+                    cur_bytes += size;
+                }
+            } else if (mbi.Type == MEM_MAPPED) {
+                (guest ? c.mapped_guest : c.mapped_host) += size;
+            } else {
+                c.image += size;
+            }
+        }
+        a = base + size;
+    }
+    flush();
+    // Heaps: the default process heap carries the CRT's malloc / new (ours); a driver or other
+    // module heap shows up among the others. HeapSummary needs Windows 10.
+    HANDLE heaps[256];
+    const DWORD n = GetProcessHeaps(256, heaps);
+    const HANDLE def = GetProcessHeap();
+    for (DWORD i = 0; i < n && i < 256; ++i) {
+        HEAP_SUMMARY hs{};
+        hs.cb = sizeof(hs);
+        if (HeapSummary(heaps[i], 0, &hs)) {
+            (heaps[i] == def ? c.default_heap : c.other_heaps) += hs.cbCommitted;
+        }
+    }
+    c.heaps = n;
+    return c;
+}
+
 void ApplyCommandProcessorPlacement() {
     const char* value = std::getenv("SHADPS4_CP_QOS");
     int mode = value ? value[0] - '0' : 0;
@@ -742,6 +828,16 @@ u32 AutoPoolWorkers(bool) {
 void ApplyGuestThreadPlacement(void*, const char*) {}
 void ApplyHelperThreadPlacement(const char*) {}
 void ApplyCommandProcessorPlacement() {}
+void ProcessMemory(u64& private_bytes, u64& working_set) {
+    private_bytes = working_set = 0;
+}
+CommitCensus WalkCommitted() {
+    return {};
+}
+u64 PhysicalRamBytes() {
+    const char* sim = std::getenv("SHADPS4_SIM_RAM_MB");
+    return sim ? std::strtoull(sim, nullptr, 10) << 20 : 0;
+}
 void ApplyHotThreadPlacement(HotThread) {}
 void ApplyCriticalThreadPriority(HotThread) {}
 void SampleCommandProcessorCore() {}

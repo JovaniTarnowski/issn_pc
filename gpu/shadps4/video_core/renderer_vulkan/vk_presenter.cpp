@@ -38,6 +38,8 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <thread>
+#include <SDL3/SDL_events.h>
 #include <csetjmp>
 #include <cstring>
 #include <ctime>
@@ -115,6 +117,12 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
     u32 dst_width = swapchain_width;
     u32 dst_height = swapchain_height;
 
+    // Within 1% of the window's shape: fill it (user 10-21: render sizes are multiples of 8, so
+    // at some screen percentages the picture was a few pixels off the window's shape and thin
+    // black bars appeared, changing with the percentage; a 1% stretch is not visible).
+    if (std::abs(frame_aspect / swapchain_aspect - 1.0f) < 0.01f) {
+        return vk::Rect2D{{0, 0}, {dst_width, dst_height}};
+    }
     if (frame_aspect > swapchain_aspect) {
         dst_height = static_cast<s32>(swapchain_width / frame_aspect);
     } else {
@@ -474,6 +482,8 @@ namespace {
 // SHADPS4_BOOT_SCREEN (2026-10-17, user: the first launch's preparation is too easy to miss): the
 // presenter whose rasterizer is being built - WarmUp runs inside that, on the main thread.
 Presenter* g_booting_presenter = nullptr;
+// 1.1 (user 10-21): when the first boot frame was shown (HoldBootScreen's 3 s minimum).
+std::chrono::steady_clock::time_point g_boot_first_frame{};
 
 bool BootScreenEnabled() {
     static const bool on = [] {
@@ -487,8 +497,33 @@ bool BootScreenEnabled() {
 void PresentBootScreen(std::string_view headline, std::string_view detail, float fraction,
                        bool one_time) {
     if (g_booting_presenter && BootScreenEnabled()) {
+        if (g_boot_first_frame == std::chrono::steady_clock::time_point{}) {
+            g_boot_first_frame = std::chrono::steady_clock::now();
+        }
         g_booting_presenter->DrawBootScreen(headline, detail, fraction, one_time);
     }
+}
+
+void HoldBootScreen(std::string_view headline, std::string_view detail, bool one_time,
+                    std::chrono::milliseconds min_shown) {
+    if (!g_booting_presenter || !BootScreenEnabled() ||
+        g_boot_first_frame == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+    // A warm cache can load in well under a second; the version line must still be readable.
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - g_boot_first_frame < min_shown) {
+        g_booting_presenter->DrawBootScreen(headline, detail, 1.0f, one_time);
+        SDL_PumpEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    LOG_INFO(Render_Vulkan, "Boot screen: shown {} ms, held {} ms for the version line",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - g_boot_first_frame)
+                 .count(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start)
+                 .count());
 }
 
 void Presenter::DrawBootScreen(std::string_view headline, std::string_view detail,
@@ -859,7 +894,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     std::optional<Dlss::CompositeJob> dlss_job;
     if (Dlss::Upscaler* upscaler = Dlss::GetUpscaler(instance)) {
         if (upscaler->Ready() && !(Dlss::UpscaleTestBits() & 1)) {
-            const auto hud_id = texture_cache.FindImageAtSize(Dlss::HudLayerAddr, 1920, 1080);
+            const auto hud_id = texture_cache.FindImageAtSize(
+                Dlss::HudLayerAddr(), Dlss::g_game_width.load(std::memory_order_relaxed),
+                Dlss::g_game_height.load(std::memory_order_relaxed));
             if (hud_id) {
                 auto& hud = texture_cache.GetImage(hud_id);
                 hud.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1065,19 +1102,26 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+void Presenter::ReleaseFrame(Frame* frame) {
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_one();
+}
+
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool hold_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
             last_submit_frame = frame;
-            std::scoped_lock fl{free_mutex};
-            free_queue.push(frame);
-            free_cv.notify_one();
+            if (!hold_frame) {
+                ReleaseFrame(frame);
+            }
         }
     };
 
-    // Recreate the swapchain if the window was resized.
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+    // Recreate the swapchain if the window was resized or F3's Present Mode changed (live).
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
+        swapchain.PresentModeChanged()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 

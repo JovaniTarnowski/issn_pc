@@ -60,8 +60,11 @@ std::vector<const char*> g_device_extensions;
 u32 g_options_preset = ~0u; // the preset the options were last set with
 u32 g_options_width = 0;     // ... and the output size
 u32 g_options_height = 0;
+u32 g_options_in_w = 0; // ... and the input size (a live screen percentage changes it)
+u32 g_options_in_h = 0;
 std::chrono::steady_clock::time_point g_last_eval{};
 u64 g_evaluated = 0;
+u64 g_refused_key = 0; ///< input / output sizes no mode takes (asked once)
 u64 g_failed = 0;
 
 // A fixed id for this project (Streamline uses it with engineVersion instead of an NVIDIA id).
@@ -292,7 +295,7 @@ void DeviceCreated(vk::Instance instance, vk::PhysicalDevice physical_device, vk
         g_jitter_combo.store(static_cast<u32>(std::atoi(v)) & 3, std::memory_order_relaxed);
     }
     g_ready.store(true, std::memory_order_relaxed);
-    LOG_INFO(Render_Vulkan, "DLSS: ready (DLAA 1920x1080; Home = on / off, Page Up = jitter signs)");
+    LOG_INFO(Render_Vulkan, "DLSS: ready (DLAA at the game's render size; Home = on / off)");
 }
 
 PFN_vkQueuePresentKHR PresentFunction() {
@@ -320,29 +323,36 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         return false;
     }
     const sl::ViewportHandle viewport{0u};
-    const u32 preset = [] {
-        const char* v = std::getenv("SHADPS4_DLSS_PRESET");
-        return v ? static_cast<u32>(std::atoi(v)) : 0u; // 0 = default (K for DLAA)
-    }();
+    const u32 preset = g_preset.load(std::memory_order_relaxed); // 0 = default (K for DLAA)
     if (preset != g_options_preset || output.width != g_options_width ||
-        output.height != g_options_height) {
+        output.height != g_options_height || color.width != g_options_in_w ||
+        color.height != g_options_in_h) {
         sl::DLSSOptions options{};
         options.mode = sl::DLSSMode::eDLAA;
         options.outputWidth = output.width;
         options.outputHeight = output.height;
+        const u64 key = (u64(color.width) << 48) | (u64(color.height) << 32) |
+                        (u64(output.width) << 16) | u64(output.height);
+        if (key == g_refused_key) {
+            return false;
+        }
         if (output.width != color.width || output.height != color.height) {
             // SHADPS4_DLSS_UPSCALE: the game's 1920x1080 into the window size - the first mode
             // whose render range holds it (1080p -> 1440p is 0.75: Quality, inferred).
+            // Ultra Performance last: SHADPS4_RENDER_HEIGHT=480 into a 1440p window is 0.33.
             constexpr std::array modes{sl::DLSSMode::eMaxQuality, sl::DLSSMode::eUltraQuality,
-                                       sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance};
-            options.mode = sl::DLSSMode::eMaxQuality;
+                                       sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+                                       sl::DLSSMode::eUltraPerformance};
+            // A mode the driver refuses is skipped (s1440 rh480: Ultra Quality failed and the old
+            // loop stopped at Quality, whose floor is 1280x718 - DLSS drew garbage from 856x480).
+            // No mode whose range holds the input: no evaluate (the caller shows the game's frame).
+            bool fits = false;
             for (const sl::DLSSMode m : modes) {
                 options.mode = m;
                 sl::DLSSOptimalSettings opt{};
                 if (!g_api.dlss_get_optimal ||
                     g_api.dlss_get_optimal(options, opt) != sl::Result::eOk) {
-                    options.mode = sl::DLSSMode::eMaxQuality;
-                    break;
+                    continue;
                 }
                 LOG_INFO(Render_Vulkan,
                          "DLSS: mode {} for {}x{}: render {}x{} (min {}x{}, max {}x{})",
@@ -351,13 +361,23 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
                          opt.renderWidthMax, opt.renderHeightMax);
                 if (opt.renderWidthMin <= color.width && color.width <= opt.renderWidthMax &&
                     opt.renderHeightMin <= color.height && color.height <= opt.renderHeightMax) {
+                    fits = true;
                     break;
                 }
+            }
+            if (!fits) {
+                g_refused_key = key;
+                LOG_WARNING(Render_Vulkan, "DLSS: no mode takes {}x{} to {}x{} - not run",
+                            color.width, color.height, output.width, output.height);
+                ++g_failed;
+                return false;
             }
         }
         options.qualityPreset = static_cast<sl::DLSSPreset>(preset);
         options.ultraQualityPreset = static_cast<sl::DLSSPreset>(preset);
         options.balancedPreset = static_cast<sl::DLSSPreset>(preset);
+        options.performancePreset = static_cast<sl::DLSSPreset>(preset);
+        options.ultraPerformancePreset = static_cast<sl::DLSSPreset>(preset);
         options.colorBuffersHDR = sl::Boolean::eFalse; // the tonemapped LDR frame
         options.preExposure = 1.0f;
         options.exposureScale = 1.0f;
@@ -371,8 +391,15 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
             return false;
         }
         g_options_preset = preset;
+        g_status_in_w.store(color.width, std::memory_order_relaxed);
+        g_status_in_h.store(color.height, std::memory_order_relaxed);
+        g_status_out_w.store(output.width, std::memory_order_relaxed);
+        g_status_out_h.store(output.height, std::memory_order_relaxed);
+        g_status_mode.store(static_cast<u32>(options.mode), std::memory_order_relaxed);
         g_options_width = output.width;
         g_options_height = output.height;
+        g_options_in_w = color.width;
+        g_options_in_h = color.height;
         LOG_INFO(Render_Vulkan, "DLSS: options set: mode {} {}x{} -> {}x{}, preset {}",
                  static_cast<u32>(options.mode), color.width, color.height, output.width,
                  output.height, preset);
@@ -475,6 +502,7 @@ bool Evaluate(vk::CommandBuffer cmdbuf, u64 frame, const EvalImage& color, const
         return false;
     }
     ++g_evaluated;
+    g_status_evaluates.store(g_evaluated, std::memory_order_relaxed);
     return true;
 }
 

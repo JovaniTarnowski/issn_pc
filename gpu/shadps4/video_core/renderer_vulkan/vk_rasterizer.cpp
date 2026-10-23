@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "video_core/texture_cache/tex_table.h"
+#include "common/memory_patcher.h"
 #include "common/thread.h"
 #include "common/debug.h"
 #include "common/buffer_sample_probe.h"
@@ -1600,6 +1601,11 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
     if (Dlss::IsResolve(regs.ps_program.Address<VAddr>())) [[unlikely]] {
         return DrawClass::DlssResolve;
     }
+    // SHADPS4_SKIP_PS (test): that pixel shader's draws are dropped (as primitive type None).
+    if (const u64 skip = Dlss::g_skip_ps.load(std::memory_order_relaxed);
+        skip != 0 && skip == regs.ps_program.Address<VAddr>()) [[unlikely]] {
+        return DrawClass::PrimitiveNone;
+    }
 
     return DrawClass::Draw;
 }
@@ -1669,42 +1675,54 @@ void Rasterizer::DlssResolve() {
     const auto& regs = liverpool->BackRegs();
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
-    // By address and size: 0x26b200000 also holds the minimap's 768x768 depth after the AA
-    // (play log 2026-10-17: depth "missing" on 109,135 of 109,569 resolves).
+    // The inputs come from this frame's SMAA edges draw and the resolve itself (vk_dlss.h "Any
+    // render size"; the 1080p addresses until those ran). Found by address and size: 0x26b200000
+    // also holds the minimap's 768x768 depth after the AA (play log 2026-10-17: depth "missing"
+    // on 109,135 of 109,569 resolves).
+    const VAddr color_addr = Dlss::g_color_addr.load(std::memory_order_relaxed);
+    const VAddr motion_addr = Dlss::g_motion_addr.load(std::memory_order_relaxed);
+    const VAddr depth_addr = Dlss::g_depth_addr.load(std::memory_order_relaxed);
     const auto find = [&](VAddr address) -> VideoCore::Image* {
         const VideoCore::ImageId id = texture_cache.FindImageAtSize(
             address, out.info.size.width, out.info.size.height);
         return id ? &texture_cache.GetImage(id) : nullptr;
     };
     const bool fsr4_mode = Dlss::Mode() == 3;
-    // issn-axy: the colour and the motion vectors move together between game builds; where
-    // axylpup's addresses hold nothing, each R16G16 float image of the target's size is tried as
-    // the motion vectors, with the colour at the same offset (+0x2c0000 known first).
-    const auto colour_at = [&](s64 delta) {
-        return texture_cache.FindImageAtSize(Dlss::ColorInAddr + delta, out.info.size.width,
-                                             out.info.size.height, out.info.pixel_format);
+    // issn-axy: axylpup's 1.1 learns the inputs from this frame's SMAA draws (above). Where
+    // they hold no colour image of the target's format, the offset search of 0.3.0: the colour
+    // and the motion vectors move together between game builds (CUSA00223 1.07: +0x2c0000), and
+    // each R16G16 float image of the target's size is tried as the motion vectors.
+    const auto colour_at = [&](VAddr address) {
+        return texture_cache.FindImageAtSize(address, out.info.size.width, out.info.size.height,
+                                             out.info.pixel_format);
     };
-    if (!colour_at(dlss_addr_delta) && dlss_delta_searches++ % 30 == 0) {
-        std::vector<s64> deltas{0, 0x2c0000};
-        for (const VAddr motion_addr : texture_cache.FindAddressesOf(
-                 out.info.size.width, out.info.size.height, vk::Format::eR16G16Sfloat)) {
-            deltas.push_back(s64(motion_addr) - s64(Dlss::MotionAddr));
-        }
-        for (const s64 delta : deltas) {
-            if (delta != dlss_addr_delta && colour_at(delta) &&
-                texture_cache.FindImageAtSize(Dlss::MotionAddr + delta, out.info.size.width,
-                                              out.info.size.height)) {
-                LOG_WARNING(Render_Vulkan,
-                            "DLSS/FSR 4: inputs found at colour {:#x}, motion {:#x} (offset {:+#x} "
-                            "from axylpup's build)",
-                            Dlss::ColorInAddr + delta, Dlss::MotionAddr + delta, delta);
-                dlss_addr_delta = delta;
-                break;
+    VAddr colour_addr = color_addr;
+    VAddr motion_at = motion_addr;
+    if (!colour_at(colour_addr)) {
+        if (!colour_at(Dlss::ColorInAddr + dlss_addr_delta) && dlss_delta_searches++ % 30 == 0) {
+            std::vector<s64> deltas{0, 0x2c0000};
+            for (const VAddr candidate : texture_cache.FindAddressesOf(
+                     out.info.size.width, out.info.size.height, vk::Format::eR16G16Sfloat)) {
+                deltas.push_back(s64(candidate) - s64(Dlss::MotionAddr));
+            }
+            for (const s64 delta : deltas) {
+                if (delta != dlss_addr_delta && colour_at(Dlss::ColorInAddr + delta) &&
+                    texture_cache.FindImageAtSize(Dlss::MotionAddr + delta, out.info.size.width,
+                                                  out.info.size.height)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "DLSS/FSR 4: inputs found at colour {:#x}, motion {:#x} (offset "
+                                "{:+#x} from axylpup's build)",
+                                Dlss::ColorInAddr + delta, Dlss::MotionAddr + delta, delta);
+                    dlss_addr_delta = delta;
+                    break;
+                }
             }
         }
+        if (colour_at(Dlss::ColorInAddr + dlss_addr_delta)) {
+            colour_addr = Dlss::ColorInAddr + dlss_addr_delta;
+            motion_at = Dlss::MotionAddr + dlss_addr_delta;
+        }
     }
-    const VAddr colour_addr = Dlss::ColorInAddr + dlss_addr_delta;
-    const VAddr motion_addr = Dlss::MotionAddr + dlss_addr_delta;
     // issn-axy: the colour input of the target's own format first; FSR 4 also takes another
     // colour format (it blits). Tester 2026-10-21: with FSR 4 on the picture was yellow and the
     // log had only the 8 "no matching input" lines - every resolve was skipped, so the target
@@ -1732,9 +1750,9 @@ void Rasterizer::DlssResolve() {
                         why, fsr4_misses, dlss_calls, regs.color_buffers[0].Address(),
                         vk::to_string(out.info.pixel_format), out.info.size.width,
                         out.info.size.height, colour_addr,
-                        texture_cache.DescribeImagesAt(colour_addr), motion_addr,
-                        texture_cache.DescribeImagesAt(motion_addr), Dlss::DepthAddr,
-                        texture_cache.DescribeImagesAt(Dlss::DepthAddr));
+                        texture_cache.DescribeImagesAt(colour_addr), motion_at,
+                        texture_cache.DescribeImagesAt(motion_at), depth_addr,
+                        texture_cache.DescribeImagesAt(depth_addr));
             if (fsr4_misses <= 2 || steady) {
                 LOG_WARNING(Render_Vulkan, "FSR 4: recent {}x{} images: {}", out.info.size.width,
                             out.info.size.height,
@@ -1756,7 +1774,22 @@ void Rasterizer::DlssResolve() {
     if (!in) [[unlikely]] {
         if (fsr4_mode) {
             fsr4_missed("no colour input");
-        } else if (++dlss_missing <= 8) {
+            return;
+        }
+        // A target that keeps stale memory would show (a 1440p patch before 1.1: a yellow
+        // picture, RTX 5070 Ti report 10-20). Off the 1080p frame DLSS then steps aside for the
+        // session: g_ready off stops the classification (the game's own T2x resolve runs from the
+        // next frame on, on every path), the upscaler and DLSS 5.
+        if (out.info.size.width != 1920 || out.info.size.height != 1080) {
+            if (Dlss::g_ready.exchange(false, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan,
+                            "DLSS steps aside: no colour input at {:#x} for the game's {}x{} "
+                            "frame; the game's own anti-aliasing runs",
+                            colour_addr, out.info.size.width, out.info.size.height);
+            }
+            return;
+        }
+        if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: no matching input at {:#x} for output {:#x} ({}x{}); "
                                        "the resolve's target keeps last frame's picture",
                         colour_addr, regs.color_buffers[0].Address(), out.info.size.width,
@@ -1764,13 +1797,19 @@ void Rasterizer::DlssResolve() {
         }
         return;
     }
+    if (dlss_calls == 1 || (dlss_calls & 1023) == 1) {
+        LOG_INFO(Render_Vulkan, "DLSS: inputs at {}x{}: colour {:#x}, motion {:#x}, depth {:#x}, "
+                                "HUD layer {:#x}",
+                 out.info.size.width, out.info.size.height, colour_addr, motion_at, depth_addr,
+                 regs.color_buffers[0].Address());
+    }
     scheduler.EndRendering();
     bool evaluated = false;
     bool hud_layer = false;
     if (Dlss::Mode() == 3) {
         // issn-axy: ISSN_FSR4 - FSR 4 Native AA from the same inputs (issn_fsr4.h).
-        VideoCore::Image* motion = find(motion_addr);
-        VideoCore::Image* depth = find(Dlss::DepthAddr);
+        VideoCore::Image* motion = find(motion_at);
+        VideoCore::Image* depth = find(depth_addr);
         if (motion && depth) [[likely]] {
             // FSR 4 copies them into images of its own (issn_fsr4.cpp CopyInputs).
             for (VideoCore::Image* image : {in, motion, depth}) {
@@ -1834,8 +1873,8 @@ void Rasterizer::DlssResolve() {
                                                                      : "FSR did not record"));
         }
     } else if (Dlss::Mode() == 1) {
-        VideoCore::Image* motion = find(motion_addr);
-        VideoCore::Image* depth = find(Dlss::DepthAddr);
+        VideoCore::Image* motion = find(motion_at);
+        VideoCore::Image* depth = find(depth_addr);
         if (motion && depth) [[likely]] {
             in->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
             motion->Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1863,12 +1902,31 @@ void Rasterizer::DlssResolve() {
             };
             // The game's two jitter phases are +-0.25 px diagonally (study sec. 1.4); which sign
             // goes with which phase is calibrated live (Page Up cycles the four combinations).
+            // +-0.25 render px at every render size: the game divides its +-0.5 by the slot-2
+            // render target's size (FUN_800472810, notes/study-jitter-2026-10-20.md); the 1/1920
+            // constants have no reader. SHADPS4_DLSS_JITTER_SCALE=1 (test) scales by size / 1080p.
             float jx = 0.0f, jy = 0.0f;
-            if (dlss_phase_in == 1 || dlss_phase_in == 2) {
+            // Phase 4: the emulator's Halton offset, exact for this frame (memory_patcher.cpp
+            // JitterFrame). A switch between it and the game's 2 phases starts a new history.
+            const bool explicit_jitter = dlss_phase_in == 4;
+            dlss_reset_pending |= explicit_jitter != dlss_last_explicit;
+            dlss_last_explicit = explicit_jitter;
+            if (explicit_jitter) {
+                jx = dlss_jitter_in[0];
+                jy = dlss_jitter_in[1];
+            } else if (dlss_phase_in == 1 || dlss_phase_in == 2) {
                 const float j = dlss_phase_in == 1 ? 0.25f : -0.25f;
                 const u32 combo = Dlss::g_jitter_combo.load(std::memory_order_relaxed);
-                jx = (combo & 1) ? -j : j;
-                jy = (combo & 2) ? -j : j;
+                static const bool scale_jitter = [] {
+                    const char* v = std::getenv("SHADPS4_DLSS_JITTER_SCALE");
+                    return v && v[0] == '1';
+                }();
+                const float sx =
+                    scale_jitter ? static_cast<float>(out.info.size.width) / 1920.0f : 1.0f;
+                const float sy =
+                    scale_jitter ? static_cast<float>(out.info.size.height) / 1080.0f : 1.0f;
+                jx = ((combo & 1) ? -j : j) * sx;
+                jy = ((combo & 2) ? -j : j) * sy;
                 const bool combo_changed = combo != dlss_last_combo;
                 dlss_last_combo = combo;
                 dlss_reset_pending |= combo_changed;
@@ -1911,7 +1969,7 @@ void Rasterizer::DlssResolve() {
             scheduler.InvalidateNativeHeaps();
         } else if (++dlss_missing <= 8) {
             LOG_WARNING(Render_Vulkan, "DLSS: motion vectors {:#x} {} / depth {:#x} {} - copy this frame",
-                        motion_addr, motion ? "found" : "missing", Dlss::DepthAddr,
+                        motion_at, motion ? "found" : "missing", depth_addr,
                         depth ? "found" : "missing");
         }
     }
@@ -1975,6 +2033,8 @@ bool Rasterizer::FilterDraw() {
         return true;
     }
     dlss_phase_in = Dlss::t_phase;
+    dlss_jitter_in[0] = Dlss::t_jitter[0];
+    dlss_jitter_in[1] = Dlss::t_jitter[1];
     ExecuteFilteredDraw(draw_class);
     return false;
 }
@@ -2452,6 +2512,8 @@ void Rasterizer::PrepareDrawFront(SplitDraw& draw) {
     Dlss::NoteDraw(liverpool->regs);
     if (draw.draw_class != DrawClass::Draw) {
         draw.dlss_phase = Dlss::t_phase;
+        draw.dlss_jitter[0] = Dlss::t_jitter[0];
+        draw.dlss_jitter[1] = Dlss::t_jitter[1];
         return;
     }
     if (!draw.args.is_indirect) {
@@ -2538,6 +2600,8 @@ void Rasterizer::ExecuteDraw(const SplitDraw& draw,
         }
         if (draw.draw_class != DrawClass::Draw) {
             dlss_phase_in = draw.dlss_phase;
+            dlss_jitter_in[0] = draw.dlss_jitter[0];
+            dlss_jitter_in[1] = draw.dlss_jitter[1];
             ExecuteFilteredDraw(draw.draw_class);
             return false;
         }
@@ -14067,6 +14131,14 @@ bool Rasterizer::MappedInterval(VAddr addr, VAddr& lo, VAddr& hi) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    // PERF-PLAN 11 (2026-10-20): the GPU page table (BDA_PAGETABLE_SIZE, 512 MB of video memory)
+    // covers 40 bits; how high does the game map GPU memory? Each new highest end is logged.
+    static std::atomic<VAddr> highest_end{0};
+    if (const VAddr end = addr + size; end > highest_end.load(std::memory_order_relaxed)) {
+        highest_end.store(end, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "GPU map: highest mapped end now {:#x} ({} GB; map {:#x} + {:#x})",
+                 end, end >> 30, addr, size);
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += boost::icl::interval_set<VAddr>::interval_type::right_open(addr, addr + size);

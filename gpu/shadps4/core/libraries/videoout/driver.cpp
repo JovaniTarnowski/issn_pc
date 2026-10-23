@@ -253,7 +253,18 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // Present the frame.
     const auto present_start = Common::FaultMonitor::Now();
-    presenter->Present(req.frame);
+    // "Fifo (half refresh)" / SHADPS4_VSYNC_DIVIDER (vk_swapchain.cpp): the same picture again,
+    // so with FIFO it stays up exactly that many screen refreshes. The frame is held back from
+    // reuse until the repeats are submitted: the game, running ahead in this mode, waits for a
+    // free frame and would otherwise draw into it while it is still being shown (review 10-21).
+    const u32 divider = Vulkan::VsyncDivider();
+    presenter->Present(req.frame, false, divider > 1);
+    if (divider > 1) {
+        for (u32 i = 1; i < divider; ++i) {
+            DrawLastFrame();
+        }
+        presenter->ReleaseFrame(req.frame);
+    }
     const auto present_ns = Common::FaultMonitor::SinceNs(present_start);
 
     // Update flip status.
@@ -414,7 +425,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    u32 vblank_hz = EmulatorSettings.GetVblankFrequency();
     while (!token.stop_requested()) {
+        // F3 -> Vblank Frequency applies live (user 10-21): the tick follows the setting.
+        if (const u32 hz = EmulatorSettings.GetVblankFrequency(); hz != vblank_hz) [[unlikely]] {
+            vblank_hz = hz;
+            timer.SetInterval(std::chrono::nanoseconds(1000000000 / hz));
+            LOG_INFO(Lib_VideoOut, "vblank_frequency now {} Hz", hz);
+        }
         timer.Start();
 
         if (DebugState.IsGuestThreadsPaused()) {

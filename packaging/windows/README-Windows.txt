@@ -21,6 +21,9 @@ What's new in 0.3.0
   Radeon RX 7000 / 9000) or DLSS (NVIDIA RTX; NVIDIA's files are not included, the launcher shows
   where they go and where to download them). In the game, Home switches FSR 4 / DLSS and the
   game's own anti-aliasing live (the FPS bar shows which one runs).
+- Performance mode (launcher: Performance > Performance mode, from axylpup's 1.1): the game's
+  own lower settings for the open city. Balanced is about 13% more FPS there, Maximum about 19%
+  with fewer pedestrians.
 - Frame rate limit and VSync from the launcher and the in-game menu (applied on restart);
   Unlimited by default, the game keeps its speed at any frame rate.
 - Draw distance back to the game's own, with Long and Very long for less pop-in.

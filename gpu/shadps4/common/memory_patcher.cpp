@@ -2,15 +2,30 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <codecvt>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <pugixml.hpp>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/emulator_settings.h"
+#include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
@@ -23,6 +38,7 @@ namespace MemoryPatcher {
 
 EXPORT uintptr_t g_eboot_address;
 uint64_t g_eboot_image_size;
+uintptr_t g_eboot_scratch = 0;
 std::string g_game_serial;
 std::string patch_file;
 bool patches_applied = false;
@@ -362,6 +378,991 @@ static void ApplyParticleLightOneSubmit() {
 // cut that run into ~5 jobs recorded in parallel. SHADPS4_HOUSE_CHUNK=N also sets the 1000-item chunk
 // (FUN_800197050's imm32). Refused unless every original byte matches. The game's context pool has
 // no bounds check (at most 254 per frame): the census in gnmdriver logs the count per frame.
+static int g_screen_w = 0, g_screen_h = 0;
+static int g_display_w = 0, g_display_h = 0;    // the monitor the window opened on, in pixels
+static u32 g_render_w = 1920, g_render_h = 1080; // the game's render size after ApplyAspectRatio
+static float g_hud_ratio = 1.0f;
+static double g_aspect = 16.0 / 9.0; // the shape the game renders, decided at boot
+static u32 g_h0 = 1080;              // its height at 16:9 (the size setup's basis)
+static float g_percent_now = 0.0f;   // the screen percentage in effect (0 = the game's 1080 lines)
+static bool g_height_from_flags = false;
+// Live screen percentage (1.1, user 10-20 ~21:00; notes/study-live-resolution-2026-10-20.md route
+// A): the game boots at the largest size M (its buffers get memory for M once) and draws at the
+// live size S <= M inside it; a change pokes the game's own Pro / HDR mode switch FUN_8001f0be0.
+static RenderSize g_max{1920, 1080};       // M: the boot size (the allocation)
+static bool g_live_ok = false;             // live changes possible this run
+static std::atomic<u64> g_live_pending{0}; // S to apply at the next sceGnmSubmitDone (w << 32 | h)
+static std::atomic<u64> g_now_size{(u64(1920) << 32) | 1080}; // the size drawn (w << 32 | h)
+static std::atomic<s64> g_live_ms{0};      // steady-clock ms of the last applied change
+// A change was taken: the back drops the old size's targets (old w << 32 | h, new; 0 = none).
+static std::atomic<u64> g_purge_old{0};
+static std::atomic<u64> g_purge_new{0};
+static std::atomic<int> g_purge_tries{0};
+static u64 g_purge_last_old = 0; // the back: the old size it is trying to drop
+static u64 g_live_check = 0; // Game:Main: the size last poked, until the game took it
+static int g_live_tries = 0; // Game:Main: pokes of g_live_check so far
+
+static s64 NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+constexpr const char* RenderSizeFile = "render-size.ini";
+constexpr u32 MinLines = 96, MaxLines = 4320;
+// At most 4K's pixels in any shape (user 10-21: native 4K in 1.1). 3840x2160 lost the device on
+// 10-20 (s1491 / s1493): the game's tile light list held only 25,600 tiles - ApplyLightListCapacity
+// now sizes it from the boot size. Was 3200x1800 (s1492 ran clean, 97 FPS); 10% (256x144) ran too.
+constexpr u64 MaxPixels = u64(3840) * 2160;
+// The live headroom (the size every run boots at for live changes) stays at 3200x1800's pixels:
+// tested on 10-20 / 10-21, and smaller cards do not draw the loading frames at 4K. A pick above it
+// boots at the pick.
+constexpr u64 HeadroomPixels = u64(3200) * 1800;
+
+float HudSafeAreaRatio() {
+    return g_hud_ratio;
+}
+
+void SetScreenSize(int width, int height) {
+    g_screen_w = width;
+    g_screen_h = height;
+}
+
+void SetDisplaySize(int width, int height) {
+    g_display_w = width;
+    g_display_h = height;
+}
+
+namespace {
+
+u32 Round8(double v) {
+    return u32(std::lround(v / 8.0) * 8);
+}
+
+/// The render size at 16:9-basis height h0 in the shape `aspect`: wide shapes keep the height
+/// (at most 32:9), narrow ones the 16:9 width (at most 1:1).
+RenderSize SizeAt(u32 h0, double aspect) {
+    const bool narrow = aspect < 16.0 / 9.0 - 1e-6;
+    const u32 w0 = Round8(h0 * 16.0 / 9.0);
+    return narrow ? RenderSize{w0, std::min(w0, Round8(w0 / aspect))}
+                  : RenderSize{std::min(Round8(h0 * 32.0 / 9.0), Round8(h0 * aspect)), h0};
+}
+
+/// Lowers h0 until the size has at most `max_pixels` (the wide and tall shapes).
+u32 CapPixels(u32 h0, double aspect, u64 max_pixels = MaxPixels) {
+    while (h0 > MinLines) {
+        const RenderSize s = SizeAt(h0, aspect);
+        if (u64(s.width) * s.height <= max_pixels) {
+            break;
+        }
+        h0 -= 8;
+    }
+    return h0;
+}
+
+/// 100% of the screen: the largest box of the render shape on the monitor (the boot window is
+/// often 1280x720 before F11, so the monitor is the reference; the window without one).
+RenderSize Reference(double aspect) {
+    double dw = g_display_w > 0 ? g_display_w : g_screen_w;
+    double dh = g_display_w > 0 ? g_display_h : g_screen_h;
+    if (dw <= 0.0 || dh <= 0.0) {
+        dw = 1920.0;
+        dh = 1080.0;
+    }
+    return aspect >= dw / dh ? RenderSize{u32(dw), u32(std::lround(dw / aspect))}
+                             : RenderSize{u32(std::lround(dh * aspect)), u32(dh)};
+}
+
+/// The 16:9-basis height of 100%.
+double FullBaseHeight(double aspect) {
+    const RenderSize ref = Reference(aspect);
+    return std::min<double>(ref.height, ref.width * 9.0 / 16.0);
+}
+
+/// The 16:9-basis height for `percent` of the screen, 96 lines .. 8K.
+u32 BaseHeightForPercent(float percent, double aspect) {
+    // 33 and 67 = DLSS's exact 1/3 and 2/3 (Ultra Performance takes one exact size: 4K -> 720
+    // lines, 1080p -> 640x360; 0.33 would miss it by 8 lines).
+    const int whole = int(std::lround(percent));
+    const double p = whole == 33   ? 1.0 / 3.0
+                     : whole == 67 ? 2.0 / 3.0
+                                   : std::clamp(percent, 10.0f, 200.0f) / 100.0;
+    return CapPixels(std::clamp(Round8(FullBaseHeight(aspect) * p), MinLines, MaxLines), aspect);
+}
+
+std::filesystem::path RenderSizePath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / RenderSizeFile;
+}
+
+// Native 4K (user 10-21; notes/study-4k-crash-2026-10-20.md, measured 10-21 in the user's capture):
+// the deferred lighting cs_ce1675e0 writes up to 128 light indices per 16x16-pixel tile into one
+// u16 buffer and skips the tiles past its size; ~40 forward-lit pixel shaders walk a skipped
+// tile's list to an end marker that was never written, and the GPU hangs (device lost). The game
+// makes it 0x320000 entries (25,600 tiles: 3200x1800 needs 22,600, 3840x2160 32,400) in
+// FUN_80016bd10: the allocation (element bytes x 0x320000) and the descriptor's record count
+// (0x320000) are two immediates. Both get the boot size M's tile count x 128 (M: every target is
+// allocated at it, live sizes stay below).
+void ApplyLightListCapacity(RenderSize max) {
+    constexpr u32 Original = 0x320000;
+    const u64 tiles = u64((max.width + 15) / 16) * ((max.height + 15) / 16);
+    const u64 need = tiles * 128;
+    if (need <= Original) {
+        return;
+    }
+    const u32 entries = u32((need + 0xffff) & ~u64(0xffff));
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    static constexpr u8 imul_head[3] = {0x41, 0x69, 0xf7}; // imul esi, r15d, imm32 (0x16be04)
+    static constexpr u8 mov_head[2] = {0x41, 0xb8};        // mov r8d, imm32 (0x16be1d)
+    u32 imul_imm = 0, mov_imm = 0;
+    std::memcpy(&imul_imm, at(0x16be07), 4);
+    std::memcpy(&mov_imm, at(0x16be1f), 4);
+    if (std::memcmp(at(0x16be04), imul_head, 3) != 0 || std::memcmp(at(0x16be1d), mov_head, 2) != 0 ||
+        imul_imm != Original || mov_imm != Original) {
+        LOG_ERROR(Loader, "Light list: refused, FUN_80016bd10 differs (eboot 01.07 only) - "
+                          "sizes above 3200x1800 may hang the GPU");
+        return;
+    }
+    std::memcpy(at(0x16be07), &entries, 4);
+    std::memcpy(at(0x16be1f), &entries, 4);
+    LOG_INFO(Loader, "Light list: {} entries for {}x{} ({} tiles; the game's own fits 25,600)",
+             entries, max.width, max.height, tiles);
+}
+
+} // namespace
+
+float SavedScreenPercent() {
+    std::ifstream in{RenderSizePath()};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("screen_percent=", 0) == 0) {
+            const float v = float(std::atof(line.c_str() + 15));
+            return v > 0.0f ? std::clamp(v, 10.0f, 200.0f) : 0.0f;
+        }
+    }
+    return 0.0f;
+}
+
+void SaveScreenPercent(float percent) {
+    const int value = percent > 0.0f ? int(std::lround(std::clamp(percent, 10.0f, 200.0f))) : 0;
+    std::ofstream out{RenderSizePath(), std::ios::trunc};
+    out << "# Written by the DLSS panel (Page Up): the game's render size in percent of the\n"
+           "# screen (10-200; 0 = the game's own 1080 lines), read at start. SHADPS4_RENDER_HEIGHT\n"
+           "# or SHADPS4_SCREEN_PERCENT in shadps4-flags-user.txt win over this file.\n"
+        << "screen_percent=" << value << "\n";
+    LOG_INFO(Loader, "Screen percentage {} saved (applies at the next start)", value);
+}
+
+RenderSize CurrentRenderSize() {
+    const u64 v = g_now_size.load(std::memory_order_acquire);
+    return {u32(v >> 32), u32(v)};
+}
+
+RenderSize PercentReference() {
+    return Reference(g_aspect);
+}
+
+float CurrentScreenPercent() {
+    // From the size drawn (a live change moves it): its 16:9-basis height over 100%'s.
+    const RenderSize s = CurrentRenderSize();
+    const double h0 = g_aspect < 16.0 / 9.0 - 1e-6 ? s.width * 9.0 / 16.0 : double(s.height);
+    return float(100.0 * h0 / FullBaseHeight(g_aspect));
+}
+
+RenderSize RenderSizeForPercent(float percent) {
+    return SizeAt(percent > 0.0f ? BaseHeightForPercent(percent, g_aspect) : 1080, g_aspect);
+}
+
+bool RenderHeightFromFlags() {
+    return g_height_from_flags;
+}
+
+// SHADPS4_ASPECT (1.1, user 2026-10-20; EXPERIMENTS "v1.1 C"): the game fills the screen's shape.
+// The renderer's size setup FUN_8001eff00 stores the render size (+0xc / +0x10), the output size
+// ([0] / [4]) and the 2D screen space (globals 0x801d0ccc0 / ccc4: HUD layout, and the camera's
+// aspect = ccc0 / ccc4 at camera creation, 0x80058030c); the mode toggle FUN_8001f0be0 re-applies
+// render / output from esi / edi. All eight 1920 / 1080 immediates get the target size: the
+// buffers, the video-out buffers, the HUD (anchored to the edges) and the camera follow (Hor+: the
+// vertical view stays, wider screens see more at the sides). Measured on 21:9 (s1426): round
+// shapes, more picture left and right, HUD at the new edges, 0 Critical.
+//   auto (default): wider screens see more at the sides, narrower ones (16:10, 4:3, 1:1) more above
+//        and below (the 16:9 width is kept); crop: narrow screens cut the sides instead; W:H (e.g.
+//        21:9, 32:9, 4:3): that shape; off.
+// Decided once at boot (the size setup runs once): a new window shape needs a restart. DLSS finds
+// its inputs at any size (vk_dlss.h "Any render size").
+// SHADPS4_RENDER_HEIGHT (1.1, user 2026-10-20: "720p or 480p internal" for weaker cards): the
+// height the game renders at instead of 1080 (360 - 2160; the width follows the shape). Every
+// buffer, the HUD and the camera follow as for a shape; the presenter (FSR) or DLSS scales the
+// picture to the window. E.g. 720 = 1280x720 (0.44x the pixels), 480 = 856x480 (0.2x), 1440 =
+// 2560x1440 (supersampling). 96 - 4320 lines (8K; at most 8K's pixel count in any shape).
+// Screen percentage (1.1, user 10-20 ~20:15; the DLSS panel's slider, saved in
+// user/render-size.ini, or SHADPS4_SCREEN_PERCENT=NN): the render size as 10-200% of the
+// screen in the render shape (the monitor's largest box of that shape), e.g. 67% of 2560x1440 =
+// 1712x968 (DLSS Quality), 150% = 3840x2160 (DLAA at 4K, the presenter scales it down).
+// SHADPS4_RENDER_HEIGHT wins over both; with neither the game keeps its 1080 lines.
+static void ApplyAspectRatio() {
+    const char* env = std::getenv("SHADPS4_ASPECT");
+    const std::string mode = env ? env : "auto";
+    constexpr double base = 16.0 / 9.0;
+    double aspect = 0.0;
+    if (mode == "off" || mode == "0") {
+        aspect = base;
+    } else if (const auto colon = mode.find(':'); colon != std::string::npos) {
+        const double w = std::atof(mode.substr(0, colon).c_str());
+        const double h = std::atof(mode.substr(colon + 1).c_str());
+        aspect = h > 0.0 ? w / h : 0.0;
+    } else if (g_screen_w > 0 && g_screen_h > 0) {
+        aspect = double(g_screen_w) / double(g_screen_h);
+    }
+    // 3%: a "1280x720" window reports a client area like 1279x724 (measured, s1427).
+    if (aspect <= 0.0 || std::abs(aspect - base) < 0.03 * base) {
+        aspect = base; // 16:9 or unknown
+    }
+    u32 h0 = 1080;
+    if (const char* rh = std::getenv("SHADPS4_RENDER_HEIGHT"); rh && std::atoi(rh) > 0) {
+        h0 = CapPixels(std::clamp(Round8(std::atof(rh)), MinLines, MaxLines), aspect);
+        g_height_from_flags = true;
+    } else {
+        const char* pe = std::getenv("SHADPS4_SCREEN_PERCENT");
+        const float percent = pe && std::atof(pe) > 0.0
+                                  ? std::clamp(float(std::atof(pe)), 10.0f, 200.0f)
+                                  : SavedScreenPercent();
+        if (percent > 0.0f) {
+            h0 = BaseHeightForPercent(percent, aspect);
+            g_percent_now = percent;
+        }
+    }
+    g_aspect = aspect;
+    g_h0 = h0;
+    // The boot size M (live changes, a percentage chosen, SHADPS4_LIVE_RES not 0, normal mode -
+    // the Pro toggle loads other immediates): at least 100% of the screen, so the slider is live
+    // from its lowest value up to the screen's size (above: after a restart).
+    const char* live_env = std::getenv("SHADPS4_LIVE_RES");
+    // User 10-20 ~23:40: live from the first start, no restart for any size - the game boots at
+    // the largest size (200% of the screen within the 3200x1800-pixel headroom, or the pick when
+    // that is larger, up to 4K's pixels) and the first frames
+    // switch it to the pick, or to its own 1080 lines without one. Only the loading frames draw
+    // at the big size; the purge then frees those targets (lower-end PCs keep nothing big).
+    // SHADPS4_LIVE_RES=0: boot at the pick (no live changes), SHADPS4_RENDER_HEIGHT too.
+    const bool live = !g_height_from_flags && !(live_env && live_env[0] == '0') &&
+                      !EmulatorSettings.IsNeo();
+    const u32 headroom = CapPixels(BaseHeightForPercent(200.0f, aspect), aspect, HeadroomPixels);
+    const u32 hm = live ? std::max(h0, headroom) : h0;
+    if (aspect == base && h0 == 1080 && hm == 1080) {
+        return; // 16:9 at 1080: nothing to do
+    }
+    const bool narrow = aspect < base - 1e-6;
+    // Narrow screens (not crop): the camera keeps the 16:9 horizontal view and gains picture above
+    // and below. The projection builder 0x800581c90 computes P00 = 2 / (r - l) / tanX and
+    // P11 = 2 / (t - b) / tanY from ONE load of 2.0 (0x581d10, used by those two divisions only);
+    // it is pointed at 2 / k (k = (16/9) / aspect) placed in the 12 padding bytes before the
+    // function (0x581c84, after a ret: never executed). With the camera aspect = the screen's
+    // (screen space below), tanX x k = the 16:9 tanX, tanY x k = the taller view.
+    const bool add_vertical = narrow && mode != "crop";
+    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
+    static constexpr u8 pad[4] = {0x90, 0x90, 0x90, 0x90};
+    if (add_vertical &&
+        (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) != 0 ||
+         std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581c84), pad, 4) != 0)) {
+        LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, the projection builder differs (eboot 01.07)");
+        return;
+    }
+    // Multiples of 8; wide: the height h0 (1080), narrow: its 16:9 width (1920); at most 32:9
+    // (3840 x 1080) and 1:1 (1920 x 1920).
+    const RenderSize size = SizeAt(h0, aspect); // S: drawn
+    const RenderSize max = SizeAt(hm, aspect);  // M: allocated (= S without live changes)
+    const u32 w = size.width;
+    const u32 h = size.height;
+    // The 2D screen space (HUD layout; its ratio = the camera aspect) stays at the 1080-line scale
+    // when the render height differs (s1440 rh720: at 1280x720 screen space the minimap drew ~1.2x
+    // too large and the skyline strip above it broke - some HUD parts are sized in 1080p pixels).
+    // SHADPS4_RENDER_HUD=native keeps the screen space at the render size (that look).
+    const char* hud_env = std::getenv("SHADPS4_RENDER_HUD");
+    const bool hud_native = hud_env && std::string{hud_env} == "native";
+    double hud_scale = hud_native ? 1.0 : 1080.0 / h0;
+    // SHADPS4_HUD_SPACE_SCALE (test, 10-20): scales the 2D space at the same shape (the camera
+    // aspect = its ratio stays) - how the HUD's size follows the space on narrow screens.
+    if (const char* v = std::getenv("SHADPS4_HUD_SPACE_SCALE"); v && std::atof(v) > 0.2) {
+        hud_scale *= std::atof(v);
+    }
+    const u32 sw = u32(std::lround(w * hud_scale));
+    const u32 sh = u32(std::lround(h * hud_scale));
+    struct Imm {
+        u64 offset;
+        u32 original;
+        bool width;
+        bool screen_space;
+    };
+    // Eboot 01.07 offsets (byte-compared before any write; FUN_8001eff00, FUN_8001f0be0).
+    static constexpr Imm imms[] = {
+        {0x1eff4a, 0x780, true, false},  {0x1eff51, 0x438, false, false}, // render size
+        {0x1eff57, 0x780, true, false},  {0x1eff5e, 0x438, false, false}, // output size
+        {0x1f0403, 0x780, true, true},   {0x1f03fb, 0x438, false, true},  // 2D screen space
+        {0x1f0d3e, 0x780, true, false},  {0x1f0d4d, 0x438, false, false}, // mode toggle
+    };
+    for (const auto& imm : imms) {
+        u32 live;
+        std::memcpy(&live, reinterpret_cast<const void*>(g_eboot_address + imm.offset), 4);
+        if (live != imm.original) {
+            LOG_ERROR(Loader, "SHADPS4_ASPECT: refused, eboot+{:#x} holds {:#x} (not {:#x})",
+                      imm.offset, live, imm.original);
+            return;
+        }
+    }
+    // The size setup (render, output) allocates at M; the mode toggle loads S.
+    for (const auto& imm : imms) {
+        const bool toggle = imm.offset >= 0x1f0d3e;
+        const u32 value = imm.screen_space ? (imm.width ? sw : sh)
+                          : toggle         ? (imm.width ? w : h)
+                                           : (imm.width ? max.width : max.height);
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
+    }
+    g_render_w = w;
+    g_render_h = h;
+    // Until the switch is taken the game draws at M (the purge then drops M's targets).
+    g_now_size.store((u64(max.width) << 32) | max.height, std::memory_order_release);
+    g_max = max;
+    g_live_ok = live;
+    ApplyLightListCapacity(max);
+    if (max.width != w || max.height != h) {
+        // The renderer's init zeroes the mode bytes after these patches (study d2): the first
+        // sceGnmSubmitDone switches the game from M to S.
+        g_live_pending.store((u64(w) << 32) | h, std::memory_order_release);
+    }
+    if (add_vertical) {
+        const float two_over_k = float(2.0 / (base / aspect));
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581c84), &two_over_k, 4);
+        const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
+    }
+    LOG_INFO(Loader, "SHADPS4_ASPECT: the game renders {}x{} (aspect {:.3f}, screen {}x{}, "
+             "monitor {}x{}, {}, render height {}{}, HUD space {}x{}{}{})", w, h, aspect,
+             g_screen_w, g_screen_h, g_display_w, g_display_h, mode, h0,
+             g_height_from_flags    ? std::string{" from SHADPS4_RENDER_HEIGHT"}
+             : g_percent_now > 0.0f ? fmt::format(" = {:.0f}% of the screen", g_percent_now)
+                                    : std::string{},
+             sw, sh,
+             add_vertical ? ", 16:9 width kept, more picture above / below" : "",
+             live ? fmt::format(", live changes up to {}x{}", max.width, max.height)
+                  : std::string{});
+}
+
+bool LiveResizeAvailable() {
+    return g_live_ok;
+}
+
+RenderSize LiveMaxSize() {
+    return g_max;
+}
+
+bool RequestScreenPercent(float percent) {
+    if (!g_live_ok || percent <= 0.0f) {
+        return false;
+    }
+    const RenderSize s = SizeAt(BaseHeightForPercent(percent, g_aspect), g_aspect);
+    if (s.width > g_max.width || s.height > g_max.height) {
+        return false; // more than the boot allocation: after a restart
+    }
+    g_live_pending.store((u64(s.width) << 32) | s.height, std::memory_order_release);
+    return true;
+}
+
+float ToggleNativePercent() {
+    if (!g_live_ok) {
+        return 0.0f;
+    }
+    // No pick saved: the game's own 1080 lines as a percentage.
+    const float saved = SavedScreenPercent();
+    const float pick = saved > 0.0f ? saved : float(100.0 * 1080.0 / FullBaseHeight(g_aspect));
+    const bool at_native = std::abs(CurrentScreenPercent() - 100.0f) < 0.5f;
+    const float to = at_native ? pick : 100.0f;
+    return RequestScreenPercent(to) ? to : 0.0f;
+}
+
+bool TakeLivePurge(u64 sizes[2]) {
+    const u64 old_size = g_purge_old.exchange(0, std::memory_order_acq_rel);
+    if (old_size == 0) {
+        return false;
+    }
+    sizes[0] = old_size;
+    sizes[1] = g_purge_new.load(std::memory_order_relaxed);
+    g_purge_last_old = old_size;
+    return true;
+}
+
+void RequeueLivePurge() {
+    // The boot switch lands during the loading screens, where the new size's targets appear
+    // only when the world draws: up to 3000 frames. A newer change replaces it anyway.
+    if (g_purge_tries.fetch_add(1, std::memory_order_relaxed) < 3000) {
+        u64 expected = 0;
+        g_purge_old.compare_exchange_strong(expected, g_purge_last_old,
+                                            std::memory_order_acq_rel);
+    }
+}
+
+bool InLiveResizeWindow() {
+    const s64 at = g_live_ms.load(std::memory_order_relaxed);
+    return at != 0 && NowMs() - at < 3000;
+}
+
+bool IsRenderShaped(u32 width, u32 height) {
+    if (height == 0) {
+        return false;
+    }
+    return std::abs(double(width) / height - g_aspect) < 0.03 * g_aspect;
+}
+
+s64 MsSinceLiveResize() {
+    const s64 at = g_live_ms.load(std::memory_order_relaxed);
+    return at == 0 ? INT64_MAX : NowMs() - at;
+}
+
+namespace {
+
+/// Writes S into the mode toggle's two imm32 (0x1f0d3e esi = width, 0x1f0d4d edi = height).
+bool WriteToggleSize(u32 w, u32 h) {
+    u8* const imm_w = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d3e);
+    u8* const imm_h = reinterpret_cast<u8*>(g_eboot_address + 0x1f0d4d);
+    constexpr size_t span = 0x1f0d4d + 4 - 0x1f0d3e; // one page
+#ifdef _WIN32
+    DWORD old = 0;
+    if (!VirtualProtect(imm_w, span, PAGE_EXECUTE_READWRITE, &old)) {
+        LOG_ERROR(Loader, "Live render size: VirtualProtect failed ({})", GetLastError());
+        return false;
+    }
+#endif
+    std::memcpy(imm_w, &w, 4);
+    std::memcpy(imm_h, &h, 4);
+#ifdef _WIN32
+    VirtualProtect(imm_w, span, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), imm_w, span);
+#endif
+    return true;
+}
+
+// The trigger: the stored colour option (renderer +0xdf0f06, low byte) made to differ from the
+// wanted one (+0xdf0f11): the toggle's compare at 0x1f0d0a fails, its change block re-sizes
+// everything to S and stores the right byte back (study sec. 3, the quietest of the three).
+volatile u8* StoredOption() {
+    return reinterpret_cast<volatile u8*>(g_eboot_address + 0x1d0cbd6);
+}
+u8 WantedOption() {
+    return *reinterpret_cast<const volatile u8*>(g_eboot_address + 0x1d0cbe1);
+}
+
+} // namespace
+
+// DLSS jitter (1.1, user 10-21; notes/study-jitter-2026-10-20.md): the game's TAA moves the
+// camera between 2 sub-pixel positions (FUN_800472810: +-0.5 / the render size in NDC = +-0.25
+// render px, by frame parity). DLSS wants many: with DLSS on, five guarded edits point the
+// game's two numerator loads at a slot the emulator writes each frame (a Halton(2,3) point),
+// take the parity-0 path always, and point the SMAA subsample-index loads (which land in the
+// blend-weights CB at +48, where DlssResolve reads the phase) at the slot's (jx, jy, tag, 0) -
+// DLSS gets the exact offset of the frame it resolves. DLSS off: the original bytes come back
+// (the game's own T2x needs its 2-phase pattern and matching SMAA index). Pro mode has no jitter.
+namespace {
+
+struct CodeEdit {
+    u64 offset;    // eboot offset of the bytes changed
+    u8 size;       // 4 = a rip-relative disp32, 2 = the jz
+    u64 next_insn; // for disp32: the eboot offset of the next instruction
+    u32 slot_off;  // for disp32: the slot byte the load reads
+    u32 original;  // the original disp32 / 2 bytes (little endian)
+};
+// Measured bytes (study sec. 3): A1 y numerator, A2 x numerator, A3 jz -> nop, B1 / B2 SMAA index.
+constexpr CodeEdit JitterEdits[] = {
+    {0x47297a, 4, 0x47297e, 4, 0x0063c6aa},
+    {0x472982, 4, 0x472986, 0, 0x0063c6a6},
+    {0x472998, 2, 0, 0, 0x0674},
+    {0x472240, 4, 0x472244, 8, 0x0063cd6c},
+    {0x47224a, 4, 0x47224e, 8, 0x0063cd52},
+};
+// Whole-instruction guards (the opcode bytes before each disp32).
+constexpr u8 GuardA1[] = {0xc5, 0xfa, 0x10, 0x05};
+constexpr u8 GuardA2[] = {0xc5, 0xfa, 0x10, 0x15};
+constexpr u8 GuardB[] = {0xc5, 0xfa, 0x6f, 0x05};
+
+bool g_jitter_patched = false;
+bool g_jitter_refused = false;
+u32 g_jitter_k = 0;
+
+bool WriteCodeBytes(u64 offset, const void* data, size_t size) {
+    u8* const p = reinterpret_cast<u8*>(g_eboot_address + offset);
+#ifdef _WIN32
+    DWORD old = 0;
+    if (!VirtualProtect(p, size, PAGE_EXECUTE_READWRITE, &old)) {
+        return false;
+    }
+#endif
+    std::memcpy(p, data, size);
+#ifdef _WIN32
+    VirtualProtect(p, size, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, size);
+#endif
+    return true;
+}
+
+bool JitterBytesOriginal() {
+    const auto at = [](u64 off) { return reinterpret_cast<const u8*>(g_eboot_address + off); };
+    if (std::memcmp(at(0x472976), GuardA1, 4) != 0 || std::memcmp(at(0x47297e), GuardA2, 4) != 0 ||
+        std::memcmp(at(0x47223c), GuardB, 4) != 0 || std::memcmp(at(0x472246), GuardB, 4) != 0) {
+        return false;
+    }
+    for (const auto& e : JitterEdits) {
+        u32 live = 0;
+        std::memcpy(&live, at(e.offset), e.size);
+        if (live != e.original) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void SetJitterPatch(bool on) {
+    if (on == g_jitter_patched) {
+        return;
+    }
+    if (on && (g_eboot_scratch == 0 || !JitterBytesOriginal())) {
+        if (!g_jitter_refused) {
+            g_jitter_refused = true;
+            LOG_ERROR(Loader, "DLSS jitter: refused (eboot 01.07 bytes differ or no slot)");
+        }
+        return;
+    }
+    for (const auto& e : JitterEdits) {
+        u32 value = e.original;
+        if (on) {
+            value = e.size == 2 ? 0x9066 // 66 90: a 2-byte nop
+                                : u32(s64(g_eboot_scratch + e.slot_off) -
+                                      s64(g_eboot_address + e.next_insn));
+        }
+        if (!WriteCodeBytes(e.offset, &value, e.size)) {
+            LOG_ERROR(Loader, "DLSS jitter: VirtualProtect failed at {:#x}", e.offset);
+            return;
+        }
+    }
+    g_jitter_patched = on;
+    LOG_INFO(Loader, "DLSS jitter: {} (slot {:#x})",
+             on ? "Halton sequence, DLSS sets the sub-pixel position" : "the game's own 2 phases",
+             g_eboot_scratch);
+}
+
+float Halton(u32 index, u32 base) {
+    float f = 1.0f, r = 0.0f;
+    while (index > 0) {
+        f /= float(base);
+        r += f * float(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+/// SHADPS4_HALTON_PROBE=1 (diagnostic, 10-21; study-delsin-mv-ssr sec. 1.6): with the Halton jitter
+/// running, 60 s after its first frame, for 4 frames: every view-projection-like 4x4 (16-byte
+/// aligned rows) in the main camera object ([0x807f2d2b8], 0x2000 bytes) and in the ranges of
+/// SHADPS4_HALTON_PROBE_SCAN=<hex addr>:<hex size>,... with its jitter (A, B) = the projection's
+/// row-2 terms read back from the matrix, next to this frame's step k and steps k-1 / k-2, so the
+/// field that keeps a 2-frame-old projection shows up.
+void HaltonProbe(RenderSize now) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_HALTON_PROBE");
+        return v && v[0] == '1';
+    }();
+    if (!on || now.width == 0 || now.height == 0) {
+        return;
+    }
+    static const s64 start = NowMs();
+    static int done = 0;
+    if (done >= 4 || NowMs() - start < 60000) {
+        return;
+    }
+    ++done;
+    const auto step_ab = [&](u32 k) {
+        const float jx = Halton(k + 1, 2) - 0.5f;
+        const float jy = Halton(k + 1, 3) - 0.5f;
+        return std::pair<double, double>{2.0 * jx / now.width, -2.0 * jy / now.height};
+    };
+    // The phase count as JitterFrame derives it (k wraps there).
+    const RenderSize ref = Reference(g_aspect);
+    const double ratio = std::max(1.0, double(ref.width) / now.width);
+    const u32 phases = std::clamp(u32(std::lround(8.0 * ratio * ratio)), 8u, 64u);
+    const auto [a0, b0] = step_ab(g_jitter_k);
+    const auto [a1, b1] = step_ab((g_jitter_k + phases - 1) % phases);
+    const auto [a2, b2] = step_ab((g_jitter_k + phases - 2) % phases);
+    LOG_INFO(Loader,
+             "HaltonProbe frame {}: k={} of {} | step k A,B=({:+.4e},{:+.4e}) k-1 ({:+.4e},{:+.4e}) "
+             "k-2 ({:+.4e},{:+.4e}) (the next frame draws step k)",
+             done, g_jitter_k, phases, a0, b0, a1, b1, a2, b2);
+    const auto scan = [&](VAddr base, u64 size, const char* what) {
+        auto* const memory = Core::Memory::Instance();
+        if (!memory || !memory->IsMappedRange(base, size)) {
+            LOG_INFO(Loader, "HaltonProbe   {} ({:#x}, {:#x} bytes): not mapped", what, base, size);
+            return;
+        }
+        for (u64 off = 0; off + 64 <= size; off += 16) {
+            float m[16];
+            std::memcpy(m, reinterpret_cast<const void*>(base + off), sizeof(m));
+            const double c3[3] = {m[3], m[7], m[11]};
+            const double n3 = c3[0] * c3[0] + c3[1] * c3[1] + c3[2] * c3[2];
+            if (!(n3 > 0.8 && n3 < 1.2)) {
+                continue;
+            }
+            const double a = (m[0] * c3[0] + m[4] * c3[1] + m[8] * c3[2]) / n3;
+            const double b = (m[1] * c3[0] + m[5] * c3[1] + m[9] * c3[2]) / n3;
+            const double p00 = std::sqrt(std::pow(m[0] - a * c3[0], 2) +
+                                         std::pow(m[4] - a * c3[1], 2) +
+                                         std::pow(m[8] - a * c3[2], 2));
+            if (!(std::abs(a) < 0.01 && std::abs(b) < 0.01 && p00 > 0.3 && p00 < 6.0)) {
+                continue;
+            }
+            LOG_INFO(Loader, "HaltonProbe   {}+{:#x} ({:#x}): A,B=({:+.4e},{:+.4e}) P00 {:.4f}", what,
+                     off, base + off, a, b, p00);
+        }
+    };
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    if (cam != 0) {
+        scan(cam, 0x2000, "camera");
+    }
+    if (const char* v = std::getenv("SHADPS4_HALTON_PROBE_SCAN")) {
+        std::stringstream ss{v};
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            const auto colon = item.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            const VAddr base = std::strtoull(item.substr(0, colon).c_str(), nullptr, 16);
+            const u64 size = std::strtoull(item.substr(colon + 1).c_str(), nullptr, 16);
+            scan(base, size, item.c_str());
+        }
+    }
+}
+
+/// The Halton wobble fix (10-21; study-delsin-mv-ssr sec. 1.6-1.7, probe s1539): the main camera
+/// ([0x807f2d2b8]) keeps its jittered view-projection history as (VP, unjittered VP) pairs:
+/// +0x200 this frame, +0x380 one frame back, +0x300 two back; each frame start shifts +0x380 ->
+/// +0x300 and +0x200 -> +0x380 (measured). The moving objects' velocity pass reads +0x300 as the
+/// previous VP: with the game's 2 jitter phases its jitter always equals the current one and
+/// cancels; with Halton every mover's motion vector was off by j(N) - j(N-2) (Delsin's wobble).
+/// Here, between frames, the entry about to become +0x300 gets the NEXT frame's jitter: for
+/// M = V x P (row vectors) column 0 = P00 x V.col0 + A x V.col2 and column 3 = V.col2, so
+/// col0 += dA x col3 (all 4 rows) moves exactly the jitter term A; col1 likewise for B. The view
+/// (camera motion) is untouched. SHADPS4_HALTON_REBASE=0 off.
+void RebaseHistoryJitter(RenderSize now, float jx, float jy) {
+    static const bool on = [] {
+        const char* v = std::getenv("SHADPS4_HALTON_REBASE");
+        return !(v && v[0] == '0');
+    }();
+    if (!on || now.width == 0 || now.height == 0) {
+        return;
+    }
+    const VAddr cam = *reinterpret_cast<const u64*>(g_eboot_address + 0x7f2d2b8);
+    // A stale or not-yet-set camera pointer (loads, menus) must not fault Game:Main.
+    auto* const memory = Core::Memory::Instance();
+    if (cam == 0 || !memory || !memory->IsMappedRange(cam + 0x380, 0x80)) {
+        return;
+    }
+    // The jitter terms of a VP read back from the matrix (V's rotation is orthonormal).
+    const auto terms = [](const float* m, double& a, double& b) {
+        const double n3 = double(m[3]) * m[3] + double(m[7]) * m[7] + double(m[11]) * m[11];
+        if (!(n3 > 0.8 && n3 < 1.2)) {
+            return false;
+        }
+        a = (double(m[0]) * m[3] + double(m[4]) * m[7] + double(m[8]) * m[11]) / n3;
+        b = (double(m[1]) * m[3] + double(m[5]) * m[7] + double(m[9]) * m[11]) / n3;
+        return std::abs(a) < 0.01 && std::abs(b) < 0.01;
+    };
+    float* const vp = reinterpret_cast<float*>(cam + 0x380);
+    const float* const plain = reinterpret_cast<const float*>(cam + 0x3c0);
+    double a = 0.0, b = 0.0, pa = 0.0, pb = 0.0;
+    // Layout check every frame: a jittered VP at +0x380 and its unjittered twin at +0x3c0 (another
+    // camera class or a cutscene camera fails it and is left alone).
+    if (!terms(vp, a, b) || !terms(plain, pa, pb) || std::abs(pa) > 1e-6 || std::abs(pb) > 1e-6) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_WARNING(Loader, "Halton rebase: the camera history layout differs, left alone");
+        }
+        return;
+    }
+    // The game's window offset is (X / W, Y / H) with X = -2 jx, Y = 2 jy: A = 2 jx / W, B = -2 jy / H.
+    const double da = 2.0 * jx / now.width - a;
+    const double db = -2.0 * jy / now.height - b;
+    for (int r = 0; r < 4; ++r) {
+        vp[r * 4 + 0] = float(vp[r * 4 + 0] + da * vp[r * 4 + 3]);
+        vp[r * 4 + 1] = float(vp[r * 4 + 1] + db * vp[r * 4 + 3]);
+    }
+}
+
+/// Game:Main, inside sceGnmSubmitDone (the render jobs of this frame joined; the next frame's
+/// jitter function and SMAA setup both run before the next call - study sec. 3).
+void JitterFrame() {
+    // On by default again (10-21: the wobble - movers' motion vectors kept a 2-frame-old jitter -
+    // is fixed by RebaseHistoryJitter); SHADPS4_DLSS_HALTON=0 = the game's own 2 phases.
+    // SHADPS4_DLSS_HALTON=force (test): on without DLSS too - RenderDoc turns DLSS off, and the
+    // motion-vector checks need a capture with the Halton jitter running.
+    static const int mode = [] {
+        const char* v = std::getenv("SHADPS4_DLSS_HALTON");
+        return !v ? 1 : v[0] == '0' ? 0 : v[0] == 'f' ? 2 : 1;
+    }();
+    const bool dlss_on = Vulkan::Dlss::Enabled() &&
+                         Vulkan::Dlss::g_ready.load(std::memory_order_relaxed) &&
+                         Vulkan::Dlss::g_user_on.load(std::memory_order_relaxed);
+    const bool want = mode != 0 && !EmulatorSettings.IsNeo() && (dlss_on || mode == 2);
+    SetJitterPatch(want);
+    if (!g_jitter_patched) {
+        return;
+    }
+    // DLSS's guide: 8 x (output / render)^2 phases (8 at DLAA, 72 at 33%), here 8..64.
+    const RenderSize now = CurrentRenderSize();
+    const RenderSize ref = Reference(g_aspect);
+    const double ratio = now.width > 0 ? std::max(1.0, double(ref.width) / now.width) : 1.0;
+    const u32 phases = std::clamp(u32(std::lround(8.0 * ratio * ratio)), 8u, 64u);
+    g_jitter_k = (g_jitter_k + 1) % phases;
+    const float jx = Halton(g_jitter_k + 1, 2) - 0.5f; // render px, (-0.5, 0.5)
+    const float jy = Halton(g_jitter_k + 1, 3) - 0.5f;
+    // The image moves by (-X/2, +Y/2) px for numerators (X, Y) (study sec. 2).
+    struct Slot {
+        float x, y;
+        float cb[4]; // (jx, jy, tag, 0): the blend-weights CB floats 12-15
+    } slot{-2.0f * jx, 2.0f * jy, {jx, jy, 100.0f + float(g_jitter_k), 0.0f}};
+    std::memcpy(reinterpret_cast<void*>(g_eboot_scratch), &slot.x, 8);
+    std::memcpy(reinterpret_cast<void*>(g_eboot_scratch + 8), slot.cb, 16);
+    HaltonProbe(now);
+    RebaseHistoryJitter(now, jx, jy);
+}
+
+} // namespace
+
+/// SHADPS4_LIVE_RES_TEST=50,67,100,... (test): from 40 s after the first frame, every 8 s
+/// (SHADPS4_LIVE_RES_TEST_MS) the next percentage of the list is requested, as the panel's slider
+/// would; the list repeats.
+static void LiveResTestStep() {
+    static const std::vector<float> list = [] {
+        std::vector<float> out;
+        if (const char* v = std::getenv("SHADPS4_LIVE_RES_TEST")) {
+            std::stringstream ss{v};
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (std::atof(item.c_str()) > 0.0) {
+                    out.push_back(float(std::atof(item.c_str())));
+                }
+            }
+        }
+        return out;
+    }();
+    if (list.empty()) {
+        return;
+    }
+    static const s64 start = NowMs();
+    static const s64 step = [] {
+        const char* v = std::getenv("SHADPS4_LIVE_RES_TEST_MS");
+        return v && std::atoi(v) > 0 ? s64(std::atoi(v)) : s64(8000);
+    }();
+    static const s64 delay = [] {
+        const char* v = std::getenv("SHADPS4_LIVE_RES_TEST_DELAY_MS");
+        return v && std::atoi(v) > 0 ? s64(std::atoi(v)) : s64(40000);
+    }();
+    static size_t next = 0;
+    const s64 due = start + delay + s64(next) * step;
+    if (NowMs() >= due) {
+        const float p = list[next % list.size()];
+        LOG_INFO(Loader, "SHADPS4_LIVE_RES_TEST: {}% -> {}", p,
+                 RequestScreenPercent(p) ? "queued" : "refused");
+        ++next;
+    }
+}
+
+void OnSubmitDone() {
+    JitterFrame();
+    LiveResTestStep();
+    // Game:Main is inside this HLE call, so its frame begin (FUN_8001f0be0, the toggle) cannot run
+    // meanwhile; job threads never run it (study sec. 3).
+    if (g_live_check != 0) {
+        // The last poke: taken when the game's size table holds S (slot 0 = the output size at
+        // renderer +0xdf0f14 = 0x801d0cbe4, study sec. 1; its change block wrote it).
+        u32 table[2];
+        std::memcpy(table, reinterpret_cast<const void*>(g_eboot_address + 0x1d0cbe4), 8);
+        if (table[0] == u32(g_live_check >> 32) && table[1] == u32(g_live_check)) {
+            const u64 old_size = g_now_size.exchange(g_live_check, std::memory_order_acq_rel);
+            g_live_ms.store(NowMs(), std::memory_order_relaxed);
+            // This frame drew at S from its start (the change block runs at frame begin): at the
+            // end of the back's first frame at S it drops the old size's unused targets.
+            if (old_size != g_live_check) {
+                g_purge_new.store(g_live_check, std::memory_order_relaxed);
+                g_purge_tries.store(0, std::memory_order_relaxed);
+                g_purge_old.store(old_size, std::memory_order_release);
+            }
+            LOG_INFO(Loader, "Live render size: the game draws {}x{} ({:.0f}% of the screen; boot "
+                             "allocation {}x{}) after {} poke(s)",
+                     u32(g_live_check >> 32), u32(g_live_check), CurrentScreenPercent(),
+                     g_max.width, g_max.height, g_live_tries);
+            g_live_check = 0;
+        } else if (g_live_tries >= 2400) {
+            // s1494: the boot request (M -> S) is not taken through the logos and loading
+            // screens (the mode check runs in game); 2400 frames is well past them.
+            LOG_ERROR(Loader, "Live render size: the game did not take {}x{} after {} frames "
+                              "(its table: {}x{})",
+                      u32(g_live_check >> 32), u32(g_live_check), g_live_tries, table[0], table[1]);
+            g_live_check = 0;
+        } else {
+            ++g_live_tries;
+            *StoredOption() = WantedOption() != 0 ? 0 : 1; // the renderer was not up yet
+            return;
+        }
+    }
+    const u64 pending = g_live_pending.exchange(0, std::memory_order_acq_rel);
+    if (pending == 0) {
+        return;
+    }
+    if (!WriteToggleSize(u32(pending >> 32), u32(pending))) {
+        g_live_pending.store(pending, std::memory_order_release); // next frame
+        return;
+    }
+    // Window for the texture cache and DLSS from the poke on (the back may still be recording
+    // this frame: stragglers at the old size perfect-match their old images).
+    g_live_ms.store(NowMs(), std::memory_order_relaxed);
+    *StoredOption() = WantedOption() != 0 ? 0 : 1;
+    g_live_check = pending;
+    g_live_tries = 1;
+}
+
+// SHADPS4_HUD (1.1, user 2026-10-20): where the HUD is drawn, to taste - e.g. a 16:9 HUD on a 21:9
+// picture. The game places its HUD inside the console's "display safe area": FUN_8001eff00 asks
+// sceSystemServiceGetDisplaySafeAreaInfo for a ratio r (clamped to 0.85 - 1.0) and sets the HUD
+// margins 0x801d0ccc8 / cccc = (W - W r) / 2 and (H - H r) / 2 (at least 16 px). Here r = the HUD
+// width / the render width, the 0.85 floor is lifted and the vertical margin keeps r = 1, in all
+// three copies of that code: the HUD narrows sideways only.
+//   default 16:9 on a widened picture, else full; full = the whole width; 16:9 / 21:9 / any W:H = that shape, centred; NN% = NN percent
+//   of the width. Decided at boot, as SHADPS4_ASPECT.
+static void ApplyHudWidth() {
+    // Default: 16:9 on a widened picture (the HUD art is made for 16:9; at full width the minimap
+    // ends partly off the right edge, s1427), the full width otherwise.
+    const char* env = std::getenv("SHADPS4_HUD");
+    const std::string v = env ? env : (double(g_render_w) * 9.0 > double(g_render_h) * 16.0 * 1.03 ? "16:9" : "full");
+    if (v == "full") {
+        return;
+    }
+    double width = 0.0;
+    if (const auto colon = v.find(':'); colon != std::string::npos) {
+        const double a = std::atof(v.substr(0, colon).c_str());
+        const double b = std::atof(v.substr(colon + 1).c_str());
+        width = b > 0.0 ? double(g_render_h) * a / b : 0.0;
+    } else if (!v.empty() && v.back() == '%') {
+        width = double(g_render_w) * std::atof(v.c_str()) / 100.0;
+    }
+    const float ratio = float(std::clamp(width / double(g_render_w), 0.2, 1.0));
+    if (width <= 0.0 || ratio >= 0.999f) {
+        LOG_INFO(Loader, "SHADPS4_HUD={}: the full width ({}x{})", v, g_render_w, g_render_h);
+        return;
+    }
+    // The margin code exists three times (the size setup and two refreshes): per copy the floor
+    // load vmovss disp(%rip), %xmm2 -> vxorps xmm2, xmm2, xmm2 + 4-byte nop (followed by
+    // vminss / vcmpltss), and vmulss %xmm0, %xmm2, %xmm0 (H * r) -> vmovaps %xmm2, %xmm0 (H).
+    static constexpr u64 floors[3] = {0x1f042f, 0x1f2aae, 0x1f2bae};
+    static constexpr u64 ymuls[3] = {0x1f0471, 0x1f2afb, 0x1f2bfb};
+    static constexpr u8 floor_head[4] = {0xc5, 0xfa, 0x10, 0x15};
+    static constexpr u8 floor_tail[9] = {0xc5, 0xf2, 0x5d, 0xc8, 0xc5, 0xfa, 0xc2, 0xc2, 0x01};
+    static constexpr u8 floor_new[8] = {0xc5, 0xe8, 0x57, 0xd2, 0x0f, 0x1f, 0x40, 0x00};
+    static constexpr u8 ymul_old[4] = {0xc5, 0xea, 0x59, 0xc0};
+    static constexpr u8 ymul_new[4] = {0xc5, 0xf8, 0x28, 0xc2};
+    const auto at = [](u64 offset) { return reinterpret_cast<u8*>(g_eboot_address + offset); };
+    for (int i = 0; i < 3; ++i) {
+        if (std::memcmp(at(floors[i]), floor_head, 4) != 0 ||
+            std::memcmp(at(floors[i] + 8), floor_tail, 9) != 0 ||
+            std::memcmp(at(ymuls[i]), ymul_old, 4) != 0) {
+            LOG_ERROR(Loader, "SHADPS4_HUD: refused, the safe-area code differs at copy {} "
+                              "(eboot 01.07 only)", i);
+            return;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        std::memcpy(at(floors[i]), floor_new, 8);
+        std::memcpy(at(ymuls[i]), ymul_new, 4);
+    }
+    g_hud_ratio = ratio;
+    LOG_INFO(Loader, "SHADPS4_HUD={}: HUD {} px wide of {} (safe-area ratio {:.3f}, sides only)", v,
+             u32(width + 0.5), g_render_w, ratio);
+}
+
+// SHADPS4_PERF_MODE (1.1 prototype, user 2026-10-20: "cut back on particles, drop the render or
+// LOD distance" with the game's own assets; study notes/study-performance-mode-2026-10-20.md).
+// The game ships a 21-row quality ladder at 0x800da08c0 (20 bytes per row: LOD scale for its 7 LOD
+// distance bands, sun-shadow cascade offset, a distance with no known reader, a screen-size cull,
+// random thinning) that it climbs only when a frame overflows its GPU command memory; level 0 =
+// row 0 in normal play. A preset is written INTO row 0, so the game's own path runs it (the
+// harsher rows stay for overflow). Plus: the engine's low-res particle pass forced (it steps down
+// only on a GPU timer that means nothing under emulation), the streamer's high-res texture slots
+// (4 nearest blocks) and, in "office", the ambient pedestrian ratio.
+//   low:    LOD 0.7, one sun-shadow cascade less (= the game's row 3), particles at half
+//           resolution, 2 high-res texture blocks.
+//   office: LOD 0.5, one cascade less (row 5's values, its unknown distance column kept at row
+//           0's), particles at quarter resolution, no high-res texture blocks, half the pedestrians.
+// Decided at boot; every site byte-compared first (eboot 01.07), all or nothing.
+static void ApplyPerfMode() {
+    const char* env = std::getenv("SHADPS4_PERF_MODE");
+    const std::string mode = env ? env : "off";
+    const bool low = mode == "low" || mode == "1";
+    const bool office = mode == "office" || mode == "2";
+    if (!low && !office) {
+        return;
+    }
+    struct Site {
+        u64 offset;
+        std::vector<u8> original;
+        std::vector<u8> value;
+        const char* what;
+    };
+    const std::vector<u8> row0 = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24,
+                                  0x74, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    std::vector<u8> row = row0;
+    const float lod = low ? 0.7f : 0.5f;
+    std::memcpy(row.data(), &lod, 4);
+    const s32 cascades = -1;
+    std::memcpy(row.data() + 4, &cascades, 4);
+    const u8 particle_level = low ? 1 : 2; // resolution 1.0 / 0.5 / 0.25 (table 0x800aaa918)
+    const u8 hires_slots = low ? 2 : 0;
+    std::vector<Site> sites = {
+        {0xda08c0, row0, row, "quality ladder row 0"},
+        // FUN_8003ed6a0: je over the "set level" store -> 2 nops, and the stored level.
+        {0x3ed6b0, {0x74, 0x0f}, {0x90, 0x90}, "particle level: always set"},
+        {0x3ed6b8, {0x00, 0x00, 0x00, 0x00}, {particle_level, 0x00, 0x00, 0x00}, "particle level"},
+        // FUN_8000fd890: mov r12d, 4 / cmp eax, 4 (the 4 nearest blocks get .hires.xpps).
+        {0xfe9a2, {0x04}, {hires_slots}, "high-res texture slots (mov)"},
+        {0xfe9b2, {0x04}, {hires_slots}, "high-res texture slots (cmp)"},
+    };
+    if (office) {
+        // Pedestrian count per class = level count x ratio[world state] (0x40ee42): 1.0 -> 0.5.
+        sites.push_back({0x40ca01, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 0"});
+        sites.push_back({0x40c83f, {0x00, 0x00, 0x80, 0x3f}, {0x00, 0x00, 0x00, 0x3f},
+                         "pedestrian ratio 1"});
+    }
+    for (const auto& s : sites) {
+        if (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + s.offset),
+                        s.original.data(), s.original.size()) != 0) {
+            LOG_ERROR(Loader, "SHADPS4_PERF_MODE: refused, {} at eboot+{:#x} differs (eboot 01.07 "
+                              "only)", s.what, s.offset);
+            return;
+        }
+    }
+    for (const auto& s : sites) {
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + s.offset), s.value.data(),
+                    s.value.size());
+    }
+    LOG_INFO(Loader, "SHADPS4_PERF_MODE={}: LOD scale {:.1f}, one sun-shadow cascade less, "
+                     "particles at {} resolution, {} high-res texture blocks{}",
+             mode, lod, low ? "half" : "quarter", hires_slots,
+             office ? ", half the pedestrians" : "");
+}
+
+int GameQualityLevel() {
+    if (g_eboot_address == 0) {
+        return -1;
+    }
+    s32 level;
+    std::memcpy(&level, reinterpret_cast<const void*>(g_eboot_address + 0xf39978), 4);
+    return level;
+}
+
 static void ApplyHouseSplit() {
     const char* env = std::getenv("SHADPS4_HOUSE_SPLIT");
     const char* chunk_env = std::getenv("SHADPS4_HOUSE_CHUNK");
@@ -423,6 +1424,9 @@ void OnGameLoaded() {
     ApplyParticleLateRead();
     ApplyParticleLightOneSubmit();
     ApplyHouseSplit();
+    ApplyAspectRatio();
+    ApplyHudWidth();
+    ApplyPerfMode();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 

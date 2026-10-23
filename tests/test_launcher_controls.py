@@ -65,6 +65,13 @@ class ControlMapTest(unittest.TestCase):
         self.assertNotIn('ISSN_LOD_SCALE', {k for k in launcher.game_environment({**base, 'draw_distance': '0.45'})
                                             if k not in __import__('os').environ})
 
+    def test_perf_mode(self):
+        base = {**launcher.APP_DEFAULTS}
+        self.assertNotIn('ISSN_PERF_MODE', launcher.game_environment(base))
+        self.assertEqual(launcher.game_environment({**base, 'perf_mode': 'low'})['ISSN_PERF_MODE'], 'low')
+        self.assertEqual(launcher.game_environment({**base, 'perf_mode': 'office'})['ISSN_PERF_MODE'], 'office')
+        self.assertNotIn('ISSN_PERF_MODE', launcher.game_environment({**base, 'perf_mode': 'ultra'}))
+
     def test_changed_buttons_in_table_order(self):
         controls = {'key': {'circle': ' Left Shift ', 'cross': 'Q', 'square': ''}, 'pad': {'cross': 'b'}}
         self.assertEqual(launcher.control_map(controls, 'key'), 'cross=Q,circle=Left Shift')

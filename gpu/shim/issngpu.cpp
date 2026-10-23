@@ -6,6 +6,8 @@
 #include "issn_settings.h"
 #include "issn_copy.h"
 #ifndef _WIN32
+#include <cstdint>
+#include <cmath>
 #include <sys/resource.h>
 #endif
 #include "issn_toggles.h"
@@ -63,6 +65,37 @@ Frontend::WindowSDL* g_window = nullptr;
 namespace MemoryPatcher {
 uintptr_t g_eboot_address = 0;
 std::string g_game_serial;
+// issn-axy: axylpup's 1.1 live screen percentage lives in his patcher (not in this port yet):
+// the core's hooks see a game that never changes its render size.
+bool LiveResizeAvailable() {
+    return false;
+}
+void OnSubmitDone() {}
+bool TakeLivePurge(u64 sizes[2]) {
+    (void)sizes;
+    return false;
+}
+void RequeueLivePurge() {}
+bool InLiveResizeWindow() {
+    return false;
+}
+bool IsRenderShaped(u32 width, u32 height) {
+    // The game's 16:9 render shape (+-3%), as his check with the default aspect.
+    return height != 0 && std::abs(double(width) / height - 16.0 / 9.0) < 0.03 * (16.0 / 9.0);
+}
+s64 MsSinceLiveResize() {
+    return INT64_MAX;
+}
+/// The game's own quality ladder level (0 = full ... 20), read live (eboot +0xf39978); -1
+/// before the game is loaded.
+int GameQualityLevel() {
+    if (g_eboot_address == 0) {
+        return -1;
+    }
+    s32 level;
+    std::memcpy(&level, reinterpret_cast<const void*>(g_eboot_address + 0xf39978), 4);
+    return level;
+}
 } // namespace MemoryPatcher
 namespace Common {
 extern const char g_scm_desc[];

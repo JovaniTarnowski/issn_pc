@@ -1528,6 +1528,12 @@ void PipelineCache::PrepareNativeColourLocked(const GraphicsPipeline* base,
                  HasAnyShaderPatch(vs->pgm_hash, Shader::Stage::Vertex))) {
                 return "shader patch";
             }
+            // The SSR dither swaps fs_204f45fe's plain module by its exact SPIR-V; a native
+            // colour variant is emitted differently and would keep the stripes (one fullscreen
+            // draw per frame on the plain path).
+            if (fs->pgm_hash == 0x204f45fe && SsrDitherEnabled()) {
+                return "ssr dither";
+            }
             for (u32 i = 0; i < stages.size(); ++i) {
                 if (stages[i] && i != u32(LogicalStage::Vertex) &&
                     i != u32(LogicalStage::Fragment)) {
@@ -2178,7 +2184,7 @@ void PipelineCache::GraphicsKeySecondPass(const AmdGpu::Regs& regs, GraphicsPipe
         // they were. Static per mode (UpscaleWanted), so lookup memos see one key; without the HUD
         // layer the alpha channel is masked off and the change has no effect.
         if (cb == 0 && key.blend_controls[0].enable && Dlss::UpscaleWanted() &&
-            col_buf.Address() == Dlss::HudLayerAddr &&
+            col_buf.Address() == Dlss::HudLayerAddr() &&
             !(key.write_masks[0] & vk::ColorComponentFlagBits::eA)) {
             using Factor = AmdGpu::BlendControl::BlendFactor;
             auto& bc = key.blend_controls[0];
@@ -2506,6 +2512,7 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
         program->AddPermut(module, std::move(spec));
         NoteStageSelection(l_stage, program.get(), 0, true);
         Dlss::NoteWeightsInfo(program->info, params.Base());
+        Dlss::NoteShaderInfo(program->info, params.Base());
         lookup_translate_ms += MsSince(t_translate);
         return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
                                perm_hash);
@@ -2514,6 +2521,7 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
     auto& program = it_pgm.value();
     auto& info = program->info;
     Dlss::NoteWeightsInfo(info, params.Base());
+    Dlss::NoteShaderInfo(info, params.Base());
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
@@ -2943,6 +2951,7 @@ PipelineCache::Resolve PipelineCache::ResolveStageReadOnly(
     }
     const Program& program = *it->second;
     Dlss::NoteWeightsInfo(program.info, params.Base());
+    Dlss::NoteShaderInfo(program.info, params.Base());
     if (program.precompiled && !program.precompiled_seen) [[unlikely]] {
         out.miss = Miss::PrecompiledFirstUse; // the front records the use, may retire
         return Resolve::Miss;

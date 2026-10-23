@@ -1031,6 +1031,18 @@ void EmitContext::DefineBuffers() {
     }
 }
 
+Id EmitContext::PtClampPage(Id page) {
+    const u64 table_pages = VideoCore::BufferCache::BdaNumPages();
+    return OpSelect(U64, OpULessThan(U1[1], page, Constant(U64, table_pages)), page,
+                    Constant(U64, u64{0}));
+}
+
+Id EmitContext::PtAbove(Id last_page) {
+    // Also at the full 40-bit table: guest + size - 1 can cross 2^40 (review 10-20, item 4).
+    return OpUGreaterThanEqual(U1[1], last_page,
+                               Constant(U64, VideoCore::BufferCache::BdaNumPages()));
+}
+
 void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id inherited) {
     // SHADPS4_NATIVE_PT (sec. 18): this draw's full guest address of the binding - the record's
     // offset word (ring: the job thread's guest address, low 32 bits) and hi byte, an inherited
@@ -1038,7 +1050,8 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     // 16 KB guest page, 0 = not cached) to the device address the binding's loads start at. A
     // miss maps to the table's fallback (the page table buffer itself: always mapped memory, so
     // no pointer ever leaves mapped memory) and every load of the binding then reads 0. The hi
-    // byte bounds the address below 2^40, so the page index never leaves the table.
+    // byte bounds the address below 2^40; with a smaller table (SHADPS4_PT_BITS) a page above it
+    // is clamped to page 0 and counts as a miss, so the pointer never leaves the table.
     const auto hi_byte = [&](Id word) {
         return OpBitFieldUExtract(U32[1], word, ConstU32((binding % 4) * 8), ConstU32(8u));
     };
@@ -1057,8 +1070,10 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     // read by pointer at fallback + page * 8 (no set-0 binding for the page table).
     const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
                              NativeTableLoad(Shader::NativeTablePtFallback + 1))};
-    const Id page{OpShiftRightLogical(U64, guest,
-                                      ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id page_raw{OpShiftRightLogical(U64, guest,
+                                          ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    // last_page >= page, so checking the binding's last page covers both.
+    const Id page{PtClampPage(page_raw)};
     const Id entry_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, page, ConstU32(3u)))};
     const Id entry{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, entry_addr),
                           spv::MemoryAccessMask::Aligned, 8u)};
@@ -1069,8 +1084,10 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
     // page-table load per binding per invocation.
     const Id size{OpUMax(U32[1], native_size_bytes[handle], ConstU32(1u))};
     const Id last_byte{OpIAdd(U64, guest, OpUConvert(U64, OpISub(U32[1], size, ConstU32(1u))))};
-    const Id last_page{OpShiftRightLogical(U64, last_byte,
-                                           ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id last_page_raw{OpShiftRightLogical(
+        U64, last_byte, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+    const Id above{PtAbove(last_page_raw)};
+    const Id last_page{PtClampPage(last_page_raw)};
     const Id last_addr{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, last_page, ConstU32(3u)))};
     const Id entry_last{OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, last_addr),
                                spv::MemoryAccessMask::Aligned, 8u)};
@@ -1078,10 +1095,15 @@ void EmitContext::NativePtTranslate(u32 handle, u32 binding, Id record_word, Id 
                                          ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
     const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
                                      OpINotEqual(U1[1], entry_last, u64_zero_value))};
-    const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
-                              OpLogicalNot(U1[1], contiguous))};
+    const Id miss{OpLogicalOr(U1[1],
+                              OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                                          OpLogicalNot(U1[1], contiguous)),
+                              above)};
     const Id npages{OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
-    const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+    // Above the table: a miss, but not flagged (no buffer could ever be found there).
+    const Id flag{OpLogicalAnd(U1[1],
+                               OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value)),
+                               OpLogicalNot(U1[1], above))};
     OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
                    NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
                    OpSelect(U32[1], flag, npages, u32_zero_value));
@@ -1388,9 +1410,13 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
             const Id last{OpIAdd(U64, a, Constant(U64, u64{bytes} - 1))};
             const Id fallback{u64_of(NativeTableLoad(Shader::NativeTablePtFallback),
                                      NativeTableLoad(Shader::NativeTablePtFallback + 1))};
-            const Id page{OpShiftRightLogical(U64, a4, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
-            const Id last_page{
+            // SHADPS4_PT_BITS: clamped like NativePtTranslate (review 10-20, item 1).
+            const Id page{PtClampPage(
+                OpShiftRightLogical(U64, a4, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS)))};
+            const Id last_page_raw{
                 OpShiftRightLogical(U64, last, ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
+            const Id above{PtAbove(last_page_raw)};
+            const Id last_page{PtClampPage(last_page_raw)};
             const auto entry_at = [&](Id pg) {
                 const Id ea{OpIAdd(U64, fallback, OpShiftLeftLogical(U64, pg, ConstU32(3u)))};
                 return OpLoad(U64, OpConvertUToPtr(physical_pointer_type_u64, ea),
@@ -1402,11 +1428,15 @@ Id EmitContext::NativePullAttribute(u32 loc, Id vindex) {
                                                  ConstU32(VideoCore::BufferCache::CACHING_PAGEBITS))};
             const Id contiguous{OpLogicalAnd(U1[1], OpIEqual(U1[1], entry_last, OpIAdd(U64, entry, distance)),
                                              OpINotEqual(U1[1], entry_last, u64_zero_value))};
-            const Id miss{OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
-                                      OpLogicalNot(U1[1], contiguous))};
+            const Id miss{OpLogicalOr(U1[1],
+                                      OpLogicalOr(U1[1], OpIEqual(U1[1], entry, u64_zero_value),
+                                                  OpLogicalNot(U1[1], contiguous)),
+                                      above)};
             const Id npages{
                 OpUConvert(U32[1], OpIAdd(U64, OpISub(U64, last_page, page), Constant(U64, u64{1})))};
-            const Id flag{OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value))};
+            const Id flag{OpLogicalAnd(
+                U1[1], OpLogicalAnd(U1[1], miss, OpINotEqual(U1[1], guest, u64_zero_value)),
+                OpLogicalNot(U1[1], above))};
             OpFunctionCall(void_id, native_pt_fault, NativeTableLoad(Shader::NativeTableFaultAddr),
                            NativeTableLoad(Shader::NativeTableFaultAddr + 1), OpUConvert(U32[1], page),
                            OpSelect(U32[1], flag, npages, u32_zero_value));
@@ -1871,7 +1901,10 @@ void EmitContext::DefineSharedMemory() {
             return std::make_tuple(Id{}, Id{}, Id{});
         }
 
-        const u32 num_elements{Common::DivCeil(shared_memory_size, element_size)};
+        // A dispatch may use DS instructions with LDS_SIZE 0 (the accesses fall outside the
+        // allocation on hardware). A zero-length OpTypeArray is invalid SPIR-V (VUID 08737); AMD's
+        // RDNA1 driver divides by the length and crashes in vkCreateComputePipelines (GitHub #5).
+        const u32 num_elements{std::max(1u, Common::DivCeil(shared_memory_size, element_size))};
         const Id array_type{TypeArray(element_type, ConstU32(num_elements))};
 
         const auto mem_type = [&] {
