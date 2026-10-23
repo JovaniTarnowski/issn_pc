@@ -13,6 +13,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
+#include "video_core/renderer_vulkan/issn_shader_report.h"
 #include "video_core/renderer_vulkan/vk_pipeline_compile_pool.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -292,6 +293,45 @@ void DeferredPipeline::Wait() {
     g_stats.preload_waits.fetch_add(preload ? 1 : 0, std::memory_order_relaxed);
     g_stats.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
     AtomicMax(g_stats.max_wait_ns, wait_ns);
+    auto& c = ShaderReport::g_counters;
+    c.compute_waits.fetch_add(1, std::memory_order_relaxed);
+    c.compute_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    ShaderReport::AtomicMax(c.compute_wait_max_ns, wait_ns);
+    ShaderReport::Report();
+}
+
+void ShaderReport::Report() {
+    static std::atomic<s64> last_ns{0};
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch())
+                        .count();
+    s64 last = last_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000LL ||
+        !last_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    auto& c = g_counters;
+    const auto take = [](std::atomic<u64>& a) { return a.exchange(0, std::memory_order_relaxed); };
+    const u64 sync_n = take(c.sync_n), async_n = take(c.async_n), waits = take(c.compute_waits);
+    const double ms = 1e-6;
+    const double sync_ms = take(c.sync_ns) * ms, sync_max = take(c.sync_max_ns) * ms;
+    const double async_ms = take(c.async_create_ns) * ms, async_max = take(c.async_max_ns) * ms;
+    const double translate_ms = take(c.translate_ns) * ms;
+    const u64 skipped = take(c.skipped_draws);
+    const double wait_ms = take(c.compute_wait_ns) * ms, wait_max = take(c.compute_wait_max_ns) * ms;
+    if (sync_n + async_n + waits == 0) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Shaders, last {:.0f} s: graphics {} in the frame ({:.0f} ms, max {:.0f} ms), {} in "
+                "the background ({:.0f} ms, max {:.0f} ms; {} draws waited for them); compute "
+                "first uses waited {} times ({:.0f} ms, max {:.0f} ms); translation {:.0f} ms",
+                static_cast<double>(now - last) * 1e-9, sync_n, sync_ms, sync_max, async_n,
+                async_ms, async_max, skipped, waits, wait_ms, wait_max, translate_ms);
 }
 
 namespace PipelineCompilePool {

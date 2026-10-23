@@ -32,6 +32,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/native_census.h"
+#include "video_core/renderer_vulkan/issn_shader_report.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_bindless.h"
@@ -344,25 +345,48 @@ struct PipelineCache::AsyncJob {
     std::unique_ptr<GraphicsPipeline> pipeline;
 };
 
-// FIFO worker. vk::PipelineCache was created without the externally-synchronized flag, so the
-// driver serializes its use between this thread and the synchronous compute path.
+// FIFO workers. vk::PipelineCache was created without the externally-synchronized flag, so the
+// driver serializes its use between these threads and the synchronous compute path.
+// issn_pc (2026-10-23): several workers (SHADPS4_ASYNC_PIPELINE_THREADS, default a quarter of the
+// logical processors, 1-4), like the parallel boot preload that already builds GraphicsPipelines
+// on several threads at once: a new area brings dozens of new pipelines together, and one worker
+// left their draws skipped for seconds.
 struct PipelineCache::AsyncCompiler {
     AsyncCompiler(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                   const Shader::Profile& profile_, vk::PipelineCache pipeline_cache_)
         : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
-          pipeline_cache{pipeline_cache_}, thread{std::bind_front(&AsyncCompiler::Run, this)} {}
+          pipeline_cache{pipeline_cache_} {
+        const u32 count = ThreadCount();
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this, i](std::stop_token stoken) { Run(stoken, i); });
+        }
+    }
 
-    // Queued jobs are dropped; a construction in progress completes first (one driver compile).
-    // Finished, unpublished pipelines are destroyed with `finished`, after the thread.
+    // Queued jobs are dropped; constructions in progress complete first (one driver compile
+    // each). Finished, unpublished pipelines are destroyed with `finished`, after the threads.
     ~AsyncCompiler() {
-        thread.request_stop();
-        thread.join();
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        cv.notify_all();
+        threads.clear(); // joins
+    }
+
+    static u32 ThreadCount() {
+        if (const char* env = std::getenv("SHADPS4_ASYNC_PIPELINE_THREADS"); env && *env) {
+            return std::clamp<u32>(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 8u);
+        }
+        return std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1u, 4u);
+    }
+
+    u32 NumThreads() const {
+        return static_cast<u32>(threads.size());
     }
 
     void Push(std::unique_ptr<AsyncJob> job) {
         {
             std::scoped_lock lk{mutex};
-            job->queued_ahead = static_cast<u32>(queue.size()) + (busy ? 1u : 0u);
+            job->queued_ahead = static_cast<u32>(queue.size()) + busy;
             queue.push_back(std::move(job));
         }
         cv.notify_one();
@@ -381,12 +405,13 @@ struct PipelineCache::AsyncCompiler {
     /// Returns once nothing is queued or in construction.
     void WaitIdle() {
         std::unique_lock lk{mutex};
-        idle_cv.wait(lk, [&] { return queue.empty() && !busy; });
+        idle_cv.wait(lk, [&] { return queue.empty() && busy == 0; });
     }
 
 private:
-    void Run(std::stop_token stoken) {
-        Common::SetCurrentThreadName("shadPS4:PipelineCompiler");
+    void Run(std::stop_token stoken, u32 index) {
+        const std::string name = fmt::format("shadPS4:PipelineCompiler{}", index);
+        Common::SetCurrentThreadName(name.c_str());
         while (true) {
             std::unique_ptr<AsyncJob> job;
             {
@@ -397,7 +422,7 @@ private:
                 }
                 job = std::move(queue.front());
                 queue.pop_front();
-                busy = true;
+                ++busy;
             }
             const auto t_create = CompileClock::now();
             job->pipeline = std::make_unique<GraphicsPipeline>(
@@ -408,7 +433,7 @@ private:
             {
                 std::scoped_lock lk{mutex};
                 finished.push_back(std::move(job));
-                busy = false;
+                --busy;
                 num_finished.fetch_add(1, std::memory_order_release);
             }
             idle_cv.notify_all();
@@ -425,9 +450,9 @@ private:
     std::condition_variable_any idle_cv;
     std::deque<std::unique_ptr<AsyncJob>> queue;
     std::vector<std::unique_ptr<AsyncJob>> finished;
-    bool busy{};
+    u32 busy{};
     std::atomic<u32> num_finished{};
-    std::jthread thread; // last: joined before anything above is destroyed
+    std::vector<std::jthread> threads; // last: joined before anything above is destroyed
 };
 
 // SHADPS4_NATIVE_COLOUR (notes/colour-pass-2026-10-09.md sec. 3): one colour variant's driver
@@ -1156,6 +1181,9 @@ const GraphicsPipeline* PipelineCache::GraphicsLookupLocked(const AmdGpu::Regs& 
             QueueAsyncPipeline(pipeline_hash);
             fetch_shader.reset();
             ++compile_stats.skipped_draws;
+            ShaderReport::g_counters.skipped_draws.fetch_add(1, std::memory_order_relaxed);
+            ShaderReport::g_counters.translate_ns.fetch_add(
+                static_cast<u64>(lookup_translate_ms * 1e6), std::memory_order_relaxed);
             return nullptr;
         }
 
@@ -1183,6 +1211,7 @@ const GraphicsPipeline* PipelineCache::GraphicsLookupLocked(const AmdGpu::Regs& 
         // Pending in the compiler: entries are null only while SHADPS4_ASYNC_PIPELINES is on.
         // Not memoised: a prepared entry is seeded from a non-null pipeline only.
         ++compile_stats.skipped_draws;
+        ShaderReport::g_counters.skipped_draws.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     if (prepared_hit) {
@@ -1974,8 +2003,10 @@ void PipelineCache::QueueAsyncPipeline(u64 pipeline_hash) {
     if (!async_compiler) {
         async_compiler = std::make_unique<AsyncCompiler>(instance, scheduler, desc_heap, profile,
                                                          *pipeline_cache);
-        LOG_INFO(Render_Vulkan, "AsyncPipelines: compiler thread started; draws of a graphics "
-                                "pipeline are skipped while it compiles");
+        LOG_WARNING(Render_Vulkan,
+                    "AsyncPipelines: {} compiler threads; draws of a new graphics pipeline are "
+                    "skipped while it compiles (SHADPS4_ASYNC_PIPELINES=0: compile in the frame)",
+                    async_compiler->NumThreads());
     }
     auto job = std::make_unique<AsyncJob>();
     job->key = graphics_key;
@@ -2015,6 +2046,22 @@ void PipelineCache::NoteCompiledPipeline(u64 hash, double translate_ms, double c
     stats.translate_ms_total += translate_ms;
     stats.create_ms_total += create_ms;
     stats.max_create_ms = std::max(stats.max_create_ms, create_ms);
+    {
+        auto& c = ShaderReport::g_counters;
+        const auto ns = [](double ms) { return static_cast<u64>(ms * 1e6); };
+        if (async) {
+            // The translation was counted when the job was queued (it ran in the frame).
+            c.async_n.fetch_add(1, std::memory_order_relaxed);
+            c.async_create_ns.fetch_add(ns(create_ms), std::memory_order_relaxed);
+            ShaderReport::AtomicMax(c.async_max_ns, ns(create_ms));
+        } else {
+            c.sync_n.fetch_add(1, std::memory_order_relaxed);
+            c.sync_ns.fetch_add(ns(translate_ms + create_ms), std::memory_order_relaxed);
+            ShaderReport::AtomicMax(c.sync_max_ns, ns(translate_ms + create_ms));
+            c.translate_ns.fetch_add(ns(translate_ms), std::memory_order_relaxed);
+        }
+        ShaderReport::Report();
+    }
     // translate: new programs/modules this lookup created (0 when all were cached); create: the
     // GraphicsPipeline constructor, which holds the driver compile; queued: jobs ahead of this
     // one in the compiler when it was queued.

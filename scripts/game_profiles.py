@@ -28,6 +28,10 @@ AXY_RELEASE_FLAGS = {
     'SHADPS4_ASC_YIELD': '1',
     'SHADPS4_ASYNC_COMPUTE_PIPELINES': '1',
     'SHADPS4_ASYNC_COMPUTE_THREADS': '12',
+    # issn_pc 2026-10-23 (players: stutter while shaders compile): a new graphics pipeline compiles on
+    # background threads and its draws are skipped meanwhile (the core's switch, off in axylpup's
+    # release, which ships a pre-made cache instead). The launcher's Shader compilation choice.
+    'SHADPS4_ASYNC_PIPELINES': '1',
     'SHADPS4_ASYNC_RECORDING': '1',
     'SHADPS4_ASYNC_RECORDING_TIMING': '0',
     'SHADPS4_ASYNC_SUBMIT': '1',

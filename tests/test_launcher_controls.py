@@ -79,6 +79,17 @@ class ControlMapTest(unittest.TestCase):
         self.assertEqual(launcher.game_environment({**base, 'perf_mode': 'office'})['ISSN_PERF_MODE'], 'office')
         self.assertNotIn('ISSN_PERF_MODE', launcher.game_environment({**base, 'perf_mode': 'ultra'}))
 
+    def test_shader_compile(self):
+        base = {**launcher.APP_DEFAULTS}
+        # Default: the game profile's SHADPS4_ASYNC_PIPELINES=1 applies (nothing set here).
+        self.assertNotIn('SHADPS4_ASYNC_PIPELINES', launcher.game_environment(base))
+        self.assertEqual(launcher.game_environment({**base, 'shader_compile': 'frame'})['SHADPS4_ASYNC_PIPELINES'], '0')
+        with unittest.mock.patch.dict(os.environ, {"SHADPS4_ASYNC_PIPELINES": "0"}):
+            self.assertNotIn('SHADPS4_ASYNC_PIPELINES', launcher.game_environment(base))
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        import game_profiles
+        self.assertEqual(game_profiles.AXY_RELEASE_FLAGS['SHADPS4_ASYNC_PIPELINES'], '1')
+
     def test_render_scale(self):
         base = {**launcher.APP_DEFAULTS}
         self.assertNotIn('ISSN_RENDER_SCALE', launcher.game_environment(base))
