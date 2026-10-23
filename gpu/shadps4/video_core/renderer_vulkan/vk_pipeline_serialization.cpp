@@ -920,8 +920,8 @@ void PipelineCache::ReadSeedStamp() {
     seed_stamp.shaders = std::move(shaders);
     seed_stamp.perms = std::move(perms);
     if (seed_stamp.graphics) {
-        LOG_INFO(Render,
-                 "CacheRebuild: seed stamp {} {} build {}: {} shaders, {} permutations, all stages",
+        LOG_WARNING(Render,
+                    "CacheRebuild: seed stamp {} {} build {}: {} shaders, {} permutations, all stages",
                  serial, app_ver, build, seed_stamp.shaders.size(), seed_stamp.perms.size());
     } else {
         LOG_WARNING(Render,
@@ -1460,7 +1460,7 @@ void PipelineCache::WarmUp() {
             if (rs.equal[s] + rs.differ[s] + rs.no_code[s] + rs.rebuilt[s] + rs.reused[s] +
                 rs.layout_mismatch[s] + rs.not_stamped[s] + rs.identity_mismatch[s] +
                 rs.kind_refused[s]) {
-                LOG_INFO(Render,
+                LOG_WARNING(Render,
                          "CacheRebuild: stage {}: verify equal={} differ={} annotated={} "
                          "annotate_failed={} | rebuilt={} (prebuilt {}) reused={} "
                          "layout_mismatch={} | no code in the game index={} | refused: kind={} "
