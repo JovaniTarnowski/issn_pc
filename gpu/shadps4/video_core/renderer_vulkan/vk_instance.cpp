@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss5.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_memory_budget.h"
 #include "video_core/renderer_vulkan/issn_fsr4.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -402,6 +403,7 @@ bool Instance::CreateDevice() {
                            add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    g_driver_budget.store(supports_memory_budget, std::memory_order_relaxed); // vk_memory_budget.h
     if (const char* fault = std::getenv("SHADPS4_DEVICE_FAULT"); fault && fault[0] == '1') {
         device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
         LOG_INFO(Render_Vulkan, "DeviceFault: VK_EXT_device_fault {}",

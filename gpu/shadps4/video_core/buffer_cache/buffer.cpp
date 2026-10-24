@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/release_mode.h"
 #include <immintrin.h>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -61,6 +62,22 @@ std::string_view BufferTypeName(MemoryUsage type) {
     return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 }
 
+static thread_local bool t_require_video = false;
+
+RequireVideoMemory::RequireVideoMemory() {
+    t_require_video = true;
+}
+
+RequireVideoMemory::~RequireVideoMemory() {
+    t_require_video = false;
+}
+
+/// RequireVideoMemory: device-local memory types only, VMA's budget estimate skipped.
+static void RequireVideo(VmaAllocationCreateInfo& ci) {
+    ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+}
+
 UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
     : device{device_}, allocator{allocator_} {}
 
@@ -100,14 +117,33 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
 
     const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
     VkBuffer unsafe_buffer{};
-    // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
-    VkResult result = Vulkan::AllocateWithBudgetRetry(
-        allocator, alloc_ci, "buffer", buffer_ci.size,
-        [&] { return std::string{BufferTypeName(usage)}; },
-        [&](const VmaAllocationCreateInfo& ci) {
-            return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer, &allocation,
-                                   out_alloc_info);
-        });
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (t_require_video && usage == MemoryUsage::DeviceLocal) {
+        VmaAllocationCreateInfo video_ci = alloc_ci;
+        RequireVideo(video_ci);
+        result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &video_ci, &unsafe_buffer,
+                                 &allocation, out_alloc_info);
+        if (result != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan,
+                        "A {} MB buffer did not fit in video memory ({}); the normal allocation "
+                        "decides; {}",
+                        buffer_ci.size >> 20, vk::to_string(vk::Result{result}),
+                        Vulkan::DescribeDeviceLocalBudgets(allocator));
+        }
+    }
+    if (result != VK_SUCCESS) {
+        // v1.0.2: over VMA's budget, retry without it (vk_memory_budget.h) instead of asserting.
+        result = Vulkan::AllocateWithBudgetRetry(
+            allocator, alloc_ci, "buffer", buffer_ci.size,
+            [&] { return std::string{BufferTypeName(usage)}; },
+            [&](const VmaAllocationCreateInfo& ci) {
+                return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ci, &unsafe_buffer,
+                                       &allocation, out_alloc_info);
+            });
+    }
+    if (result != VK_SUCCESS && buffer_ci.size >= (256ull << 20)) {
+        Common::ReleaseMode::ShowOutOfMemoryNotice(buffer_ci.size); // 1.1.1 (GitHub #5)
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer of {} MB ({}) with error {}",
                buffer_ci.size >> 20, BufferTypeName(usage), vk::to_string(vk::Result{result}));
     buffer = vk::Buffer{unsafe_buffer};
@@ -120,6 +156,56 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
         ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
         bda_addr = bda_result;
     }
+}
+
+bool ProbeBufferAllocation(const Vulkan::Instance& instance, MemoryUsage usage,
+                           vk::BufferUsageFlags flags, u64 size, u32& heap, bool require_video) {
+    // The same create info and memory request as Buffer::Buffer + UniqueBuffer::Create.
+    if (instance.IsNativeBindingsActive() &&
+        (flags & (vk::BufferUsageFlagBits::eUniformBuffer |
+                  vk::BufferUsageFlagBits::eStorageBuffer))) {
+        flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetReadbackQueueFamilyIndex()};
+    const bool concurrent = instance.BuffersShareReadbackFamily();
+    const VkBufferCreateInfo buffer_ci = static_cast<VkBufferCreateInfo>(vk::BufferCreateInfo{
+        .size = size,
+        .usage = flags,
+        .sharingMode = concurrent ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = concurrent ? 2u : 0u,
+        .pQueueFamilyIndices = concurrent ? families.data() : nullptr,
+    });
+    const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+    VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                 (with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0) |
+                 MemoryUsageVmaFlags(usage),
+        .usage = MemoryUsageVma(usage),
+        .requiredFlags = 0,
+        .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
+    };
+    if (require_video && usage == MemoryUsage::DeviceLocal) {
+        RequireVideo(alloc_ci);
+    }
+    VmaAllocator allocator = instance.GetAllocator();
+    VkBuffer probe{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    VkResult result = vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &probe, &allocation, &info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && Vulkan::AllowOverBudget() &&
+        (alloc_ci.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) != 0) {
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &probe, &allocation, &info);
+    }
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkPhysicalDeviceMemoryProperties* props{};
+    vmaGetMemoryProperties(allocator, &props);
+    heap = props->memoryTypes[info.memoryType].heapIndex;
+    vmaDestroyBuffer(allocator, probe, allocation);
+    return true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,

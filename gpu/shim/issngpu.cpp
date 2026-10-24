@@ -30,6 +30,7 @@
 #include <SDL3/SDL.h>
 #include "../issngpu.h"
 #include "common/elf_info.h"
+#include "common/release_mode.h"
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -126,6 +127,28 @@ void SymbolsResolver::AddSymbol(const char* nid, const char* library, const char
     g_symbols.push_back({nid, library, module, address});
 }
 } // namespace Core::Loader
+
+// axylpup 1.1.1 (GitHub #5): the box shown before an out-of-memory assert closes the game.
+namespace Common::ReleaseMode {
+void ShowOutOfMemoryNotice(unsigned long long bytes) {
+    static std::atomic<bool> shown{false};
+    if (shown.exchange(true)) {
+        return;
+    }
+    const std::string text = fmt::format(
+        "Windows could not give the game {} MB of memory for the graphics card, so the game has "
+        "to close.\n\nWhat usually helps:\n"
+        "- close other programs (browser, Discord, overlays)\n"
+        "- lower the internal resolution or turn Performance mode on (launcher: Performance)\n"
+        "- turn the page file on: Advanced system settings > Performance Settings > Advanced > "
+        "Virtual memory > \"Automatically manage paging file size\"\n"
+        "- keep at least 20 GB free on C:\n\n"
+        "user\\last_run.log has the details - please attach it to a bug report.",
+        bytes >> 20);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "inFAMOUS Second Son: out of memory",
+                             text.c_str(), nullptr);
+}
+} // namespace Common::ReleaseMode
 
 // ElfInfo's fields are private to Core::Emulator; the port fills them here.
 namespace Core {

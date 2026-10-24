@@ -470,6 +470,8 @@ void StartTickPoller(Vulkan::MasterSemaphore* semaphore) {
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
+// 1.1.1 (#36): an upload whose one host buffer is refused goes through a buffer of this size.
+static constexpr size_t UploadPieceSize = 256_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
@@ -7196,6 +7198,20 @@ void BufferCache::LogLeanStats() {
              s[2], s[3], s[4], s[5]);
 }
 
+// 1.1.1 (GitHub #30): whether `size` more bytes fit the driver's device-local budget with a 256 MB
+// margin (BIG_GROW's mesh buffer); nullopt when the driver gives no budget (VK_EXT_memory_budget).
+// `freed`: the joined buffers' bytes, released right after the copy - credited up to a quarter of
+// the new size (i30: 524 MB of pieces at the first join; a whole-buffer regrow gets no free pass,
+// its old copy would stay over budget for the whole copy).
+static std::optional<bool> MeshFitsVideo(const Vulkan::Instance& instance, u64 size, u64 freed) {
+    const auto free = Vulkan::DriverFreeDeviceLocal(instance.GetAllocator());
+    if (!free) {
+        return std::nullopt;
+    }
+    const u64 credit = std::min(freed, size / 4);
+    return size + (256ull << 20) <= *free + credit;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
     static constexpr int STREAM_LEAP_THRESHOLD = 16;
     boost::container::small_vector<BufferId, 16> overlap_ids;
@@ -7203,6 +7219,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
     VAddr end = device_addr + wanted_size;
     int stream_score = 0;
     bool has_stream_leap = false;
+    bool mesh = false; // a BIG_GROW mesh-sized join (>= 1 GB)
     const auto expand_begin = [&](VAddr add_value) {
         static constexpr VAddr min_page = CACHING_PAGESIZE + DEVICE_PAGESIZE;
         if (add_value > begin - min_page) {
@@ -7358,9 +7375,81 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         // rooftop at the last one - the play hitches). Buffers inside the extension are joined
         // like any overlap, so no page keeps two buffers.
         const u64 cur = end - begin;
+        // 1.1.1 (GitHub #30): every mesh-sized join prefers video memory (CreateBuffer checks the
+        // driver's budget for its real size) - not only the extended one: the city save's first
+        // join was already 2766 MB, above a 2560 MB step (s1584), and later regrows are joins too.
+        mesh = true;
         // r15d: straight to the cap (3.75 GB) at the first big join - normally the load - so the
         // region never grows again in the scene (r15b: an in-scene growth's coherent upload stalled ~1 s).
-        const u64 want = big_grow_bytes;
+        // 1.1.1 (GitHub #5: an RTX 5050 8 GB on 16 GB of RAM - the 3 GB buffer fitted neither in
+        // video nor in system memory at the first big join, on 1.0.2 and 1.1, and the assert closed
+        // the game): the first big join tries the tier first (allocated and freed again), then the
+        // smaller tiers down to 2.75 GB, then no extension (the old growth path). The pick holds
+        // for the session. SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB (test): a try above it asks for
+        // 64 GB instead, which the driver really refuses.
+        u64 pieces = 0; // the joined buffers' bytes (MeshFitsVideo's credit)
+        for (const BufferId id : overlap_ids) {
+            pieces += slot_buffers[id].SizeBytes();
+        }
+        static const u64 want = [&]() -> u64 {
+            u64 fail_above = ~0ull;
+            if (const char* f = std::getenv("SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB")) {
+                fail_above = std::strtoull(f, nullptr, 10) << 20;
+            }
+            const VmaAllocator allocator = instance.GetAllocator();
+            const vk::BufferUsageFlags flags = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+            // The tier, then the smaller tiers (3 GB, 2.75 GB) as steps down; below 7 GiB of video
+            // memory (the 2.75 GB tier) also 2.5 GB: the city's mesh memory reached 2790 MB (s1558),
+            // so that one regrows once in the scene, still better than system RAM (GitHub #30).
+            boost::container::small_vector<u64, 4> sizes{big_grow_bytes};
+            for (const u64 step : {u64{0xC0000000ull}, u64{0xB0000000ull}}) {
+                if (step < big_grow_bytes) {
+                    sizes.push_back(step);
+                }
+            }
+            if (big_grow_bytes <= 0xB0000000ull) {
+                sizes.push_back(0xA0000000ull);
+            }
+            const auto& mp = instance.GetMemoryProperties();
+            for (const u64 size : sizes) {
+                const u64 ask = size > fail_above ? (64ull << 30) : size;
+                // 1.1.1 (GitHub #30, RX 5600 XT 6 GB): the probe used to count any heap as a fit -
+                // VMA's budget is its own 80%-of-heap estimate (4697 of 5872 MiB), so the 2816 MB
+                // buffer went to system RAM (heap 1) although the card had room (2370 MB in use).
+                // Now: video memory only, sized against the driver's budget when it gives one.
+                // Without a driver budget: the old probe, but only a device-local heap counts.
+                const std::optional<bool> in_budget = MeshFitsVideo(instance, ask, pieces);
+                u32 heap = 0;
+                bool fits = false;
+                bool system_heap = false;
+                if (in_budget.value_or(true)) {
+                    fits = ProbeBufferAllocation(instance, MemoryUsage::DeviceLocal, flags, ask, heap,
+                                                 /*require_video=*/in_budget.has_value());
+                    system_heap =
+                        fits && !(mp.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+                    fits = fits && !system_heap;
+                }
+                if (fits) {
+                    LOG_INFO(Render_Vulkan, "BIG_GROW: the {} MB mesh buffer fits (heap {}){}; {}",
+                             size >> 20, heap, size < big_grow_bytes ? " - stepped down" : "",
+                             Vulkan::DescribeDriverBudgets(allocator));
+                    return size;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "BIG_GROW: a {} MB mesh buffer does not fit in video memory{}{}; {}; {}; {}",
+                            ask >> 20,
+                            in_budget == false ? " (over the driver's budget with a 256 MB margin)"
+                            : system_heap      ? " (it would land in system memory)"
+                                               : "",
+                            ask != size ? " (test: SHADPS4_BIG_GROW_PROBE_FAIL_ABOVE_MB)" : "",
+                            Vulkan::DescribeDeviceLocalBudgets(allocator),
+                            Vulkan::DescribeDriverBudgets(allocator),
+                            Common::DescribeSystemMemory());
+            }
+            LOG_WARNING(Render_Vulkan, "BIG_GROW: no mesh buffer size fits - the old growth path "
+                                       "(the mesh memory regrows as blocks stream in)");
+            return 0;
+        }();
         const u64 mapped = memory->TryClampRangeSize(begin, want);
         VAddr grow_end = Common::AlignDown(begin + mapped, CACHING_PAGESIZE);
         if (mapped > cur && grow_end > end) {
@@ -7402,6 +7491,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         .begin = begin,
         .end = end,
         .has_stream_leap = has_stream_leap,
+        .mesh = mesh,
     };
 }
 
@@ -7491,9 +7581,16 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
             big_old = std::max(big_old, s);
         }
     }
+    // 1.1.1 (GitHub #30): BIG_GROW's mesh buffer goes to video memory whenever the driver's budget
+    // has room for it now (the joined buffers still alive), not where VMA's estimate sends it.
+    std::optional<RequireVideoMemory> video;
+    if (overlap.mesh && MeshFitsVideo(instance, size, big_copy).value_or(false)) {
+        video.emplace();
+    }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+    video.reset();
     auto& new_buffer = slot_buffers[new_buffer_id];
     new_buffer.memo_serial = ++buffer_memo_serial;
     for (const BufferId overlap_id : overlap.ids) {
@@ -8229,6 +8326,23 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         staging_buffer.Commit();
         return staging_buffer.Handle();
     } else {
+        // 1.1.1 (GitHub #36, RTX 5070 12 GB, 32 GB RAM, driver 621.10): the 3.75 GB mesh buffer's
+        // first upload asked for one 3822 MB host buffer and the driver refused it (error -2, with
+        // 12.7 GB of the system heap's budget free) - the game closed at the loading screen. Probed
+        // first; refused -> UploadCopiesInPieces (256 MB at a time). PCs where it fits are unchanged.
+        // SHADPS4_UPLOAD_PIECES_TEST=1 (test): every upload above 256 MB takes the pieces path.
+        static const bool pieces_test = [] {
+            const char* v = std::getenv("SHADPS4_UPLOAD_PIECES_TEST");
+            return v && v[0] == '1';
+        }();
+        u32 heap = 0;
+        if (total_size_bytes > UploadPieceSize &&
+            (pieces_test ||
+             !ProbeBufferAllocation(instance, MemoryUsage::Upload,
+                                    vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes, heap))) {
+            UploadCopiesInPieces(buffer, copies, total_size_bytes, pieces_test);
+            return VK_NULL_HANDLE;
+        }
         // For large one time transfers use a temporary host buffer.
         auto temp_buffer =
             std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
@@ -8243,6 +8357,83 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
     }
+}
+
+void BufferCache::UploadCopiesInPieces(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                                       size_t total_size_bytes, bool test) {
+    // One host buffer of UploadPieceSize, refilled per piece; the GPU finishes each piece's copies
+    // before the next fill (once per mesh buffer at a loading screen, so the waits do not matter).
+    auto piece = std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
+                                          vk::BufferUsageFlagBits::eTransferSrc, UploadPieceSize);
+    u8* const staging = piece->mapped_data.data();
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    const vk::BufferMemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    boost::container::small_vector<vk::BufferCopy, 16> batch;
+    u64 used = 0;
+    u32 pieces = 0;
+    const auto submit = [&] {
+        if (batch.empty()) {
+            return;
+        }
+        scheduler.EndRendering();
+        {
+            auto access = scheduler.AcquireCommandBuffer();
+            const auto cmdbuf = access.Handle();
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &pre_barrier,
+            });
+            cmdbuf.copyBuffer(piece->Handle(), buffer.Handle(), batch);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &post_barrier,
+            });
+        }
+        scheduler.Finish(); // the piece buffer is refilled next
+        batch.clear();
+        used = 0;
+        ++pieces;
+    };
+    for (const vk::BufferCopy& copy : copies) {
+        u64 done = 0;
+        while (done < copy.size) {
+            if (used == UploadPieceSize) {
+                submit();
+            }
+            const u64 n = std::min<u64>(copy.size - done, UploadPieceSize - used);
+            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset + done;
+            memory->CopySparseMemory(device_addr, staging + used, n);
+            batch.push_back({used, copy.dstOffset + done, n});
+            used += n;
+            done += n;
+        }
+    }
+    submit();
+    LOG_WARNING(Render_Vulkan,
+                "Large upload of {} MB in {} pieces of up to {} MB ({}); {}", total_size_bytes >> 20,
+                pieces, UploadPieceSize >> 20,
+                test ? "SHADPS4_UPLOAD_PIECES_TEST" : "one host buffer of that size was refused",
+                Vulkan::DescribeDeviceLocalBudgets(instance.GetAllocator()));
+    scheduler.DeferOperation([piece = std::move(piece)]() mutable { piece.reset(); });
+    TouchBuffer(buffer);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {

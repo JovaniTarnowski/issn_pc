@@ -1,4 +1,4 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.2
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.3
 ======================================================
 
 A test build: the game plays from the start, at about 90-105 FPS standing in the open city on a
@@ -13,6 +13,16 @@ from its bin\x64 folder (not development) into bin\dlss next to issn-probe.exe (
 Graphics > Open the DLSS folder): sl.interposer.dll, sl.common.dll, sl.dlss.dll, sl.pcl.dll,
 nvngx_dlss.dll. Then choose DLSS in Graphics > Anti-aliasing. Untested by us (no NVIDIA card):
 please report how it goes. Without the files the game keeps its own anti-aliasing.
+
+What's new in 0.3.3
+- Fixed: after playing a while with 0.3.2 the game could stop opening (the shader cache paired
+  shaders wrongly: a new shader took the slot of one the seed had left out). New shaders now
+  never reuse a slot the cache still names, and the cache starts in a new folder
+  (user\cache\issn-seed-0.3.3); user\cache\issn-seed-0.3.2 can be deleted.
+- axylpup's 1.1.1 fixes in the graphics core: AMD cards whose driver refused a fast-path shader
+  variant (RX 6800 XT, RX 570) no longer close; 6-12 GB cards keep the big mesh buffer in video
+  memory and try smaller sizes before running out; large uploads go through in pieces when the
+  driver refuses one big buffer; out of memory shows a message instead of closing silently.
 
 What's new in 0.3.2
 - Shaders prepared on the first start: the package carries a shader seed (the list of the game's
@@ -30,7 +40,7 @@ What's new in 0.3.2
   scaled up. Helps when the graphics card is the limit, not the processor.
 - Every 10 s while new shaders appear the log says how many and how long anything waited.
 - The game writes user\last_run.log itself also with "Close the launcher on play".
-- The shader cache moves to a new folder (user\cache\issn-seed-0.3.2); user\cache\CUSA00223 or
+- The shader cache moves to a new folder (user\cache\issn-seed-<version>); user\cache\CUSA00223 or
   CUSA00004 from older versions can be deleted.
 
 What's new in 0.3.1

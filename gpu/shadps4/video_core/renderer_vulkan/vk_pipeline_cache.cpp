@@ -540,16 +540,35 @@ private:
                 queue.pop_front();
                 busy = true;
             }
+            // 1.1.1 (GitHub #25, #31): named before the driver sees it, so a driver crash or
+            // refusal in a player's log says which variant (vs / ps program hashes).
+            const u64 key_hash = std::hash<GraphicsPipelineKey>{}(job->key);
+            const auto pgm = [&](size_t i) { return job->infos[i] ? job->infos[i]->pgm_hash : 0; };
+            LOG_INFO(Render_Vulkan,
+                     "NativeColour: compiling variant of {:#x} slot {} (vs {:#x} ps {:#x}, "
+                     "bindless {}, {} bindings)",
+                     key_hash, job->slot, pgm(size_t(Shader::LogicalStage::Vertex)),
+                     pgm(size_t(Shader::LogicalStage::Fragment)), job->bindless,
+                     job->bindings.size());
             const auto t0 = CompileClock::now();
             auto variant = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, job->key, pipeline_cache, job->infos,
                 job->runtime_infos, job->fetch_shader, job->modules, job->sdata, false,
-                &job->bindings, job->records_binding, job->bindless);
+                &job->bindings, job->records_binding, job->bindless, /*refusable=*/true);
             const double ms = MsSince(t0);
             variant->sparse_dead_mask = job->dead_mask; // q3 (before the slot publishes it)
             variant->native_bindless_vs = job->bindless_vs;
             auto& slot = job->base->native_colour[job->slot];
-            if (!variant->UsesPushDescriptors()) {
+            if (!variant->IsCreated()) {
+                // The driver refused it (logged by the constructor): not eligible, the normal
+                // pipeline draws this description - as for no push descriptors below.
+                LOG_WARNING(Render_Vulkan,
+                            "NativeColour: variant of {:#x} refused by the driver - not eligible, "
+                            "the normal path draws it",
+                            key_hash);
+                job->base->native_colour_why.store("driver refused", std::memory_order_relaxed);
+                slot.state.store(2, std::memory_order_release);
+            } else if (!variant->UsesPushDescriptors()) {
                 // Too many descriptors for push descriptors (NVIDIA: 32): the slot stays claimed
                 // with no variant, so the back keeps the generic path for this description.
                 LOG_INFO(Render_Vulkan,
@@ -1379,9 +1398,20 @@ void PipelineCache::PrepareNativeVariantLocked(const GraphicsPipeline* base,
                               params.hash);
     }
     GraphicsPipeline::SerializationSupport sdata{};
+    LOG_INFO(Render_Vulkan, "NativePass: compiling variant of {:#x} (vs {:#x})",
+             std::hash<GraphicsPipelineKey>{}(graphics_key),
+             infos[size_t(Shader::LogicalStage::Vertex)] ? infos[size_t(Shader::LogicalStage::Vertex)]->pgm_hash : 0);
     auto variant = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, native_modules, sdata, false, nullptr, records_binding);
+        runtime_infos, fetch_shader, native_modules, sdata, false, nullptr, records_binding,
+        false, /*refusable=*/true);
+    if (!variant->IsCreated()) {
+        // 1.1.1 (GitHub #25, #31): a variant the driver refuses is left out; the base draws.
+        LOG_WARNING(Render_Vulkan, "NativePass: variant of {:#x} refused by the driver - not used",
+                    std::hash<GraphicsPipelineKey>{}(graphics_key));
+        native_variants.push_back(std::move(variant));
+        return;
+    }
     if (!variant->UsesPushDescriptors()) {
         LOG_WARNING(Render_Vulkan, "NativePass: variant of {:#x} has no push descriptors",
                     std::hash<GraphicsPipelineKey>{}(graphics_key));
@@ -2569,18 +2599,22 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        // A program none of whose cached metas loaded: index 0 may still name one on disk.
+        const size_t first_idx = FreePermIndex(params.hash, 0);
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, first_idx, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, first_idx);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        NoteStageSelection(l_stage, program.get(), 0, true);
+        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, first_idx);
+        disk_metas.insert(perm_hash);
+        program->InsertPermut(module, std::move(spec), first_idx);
+        NoteStageSelection(l_stage, program.get(), first_idx, true);
         Dlss::NoteWeightsInfo(program->info, params.Base());
         Dlss::NoteShaderInfo(program->info, params.Base());
         lookup_translate_ms += MsSince(t_translate);
-        return std::make_tuple(&program->info, module, SharedFetchMetadata(program->modules[0]),
-                               perm_hash);
+        return std::make_tuple(&program->info, module,
+                               SharedFetchMetadata(program->modules[first_idx]), perm_hash);
     }
 
     auto& program = it_pgm.value();
@@ -2666,6 +2700,8 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
         }
     }
     if (compiled) {
+        perm_idx = FreePermIndex(params.hash, perm_idx);
+        perm_hash = HashCombine(params.hash, perm_idx);
         const auto t_translate = CompileClock::now();
         auto new_info = Shader::Info(stage, l_stage, params);
         // The pipeline layout and descriptor binding of every permutation come from the
@@ -2697,7 +2733,8 @@ PipelineCache::Result PipelineCache::GetProgram(const AmdGpu::Regs& regs, Stage 
         // the program from it as a live one nor learns from the guessed Info.
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx,
                            program->precompiled);
-        program->AddPermut(module, std::move(spec));
+        disk_metas.insert(perm_hash);
+        program->InsertPermut(module, std::move(spec), perm_idx);
         lookup_translate_ms += MsSince(t_translate);
     } else {
         info.AddBindings(binding);

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -232,6 +233,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader.reset();
     compute_key.Deserialize(ar);
+    disk_metas.insert(compute_key.value); // issn_pc: its permutation index stays taken
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -450,6 +452,14 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader.reset();
     graphics_key.Deserialize(ar);
+    // issn_pc: the permutations this key names stay taken even when their meta is missing (a seed
+    // drops differing metas but keeps the keys): a new permutation there would make this key load
+    // the wrong shader on a later boot.
+    for (const auto stage_hash : graphics_key.stage_hashes) {
+        if (stage_hash) {
+            disk_metas.insert(stage_hash);
+        }
+    }
     // A seed key preloads only where the stamp allows graphics (seed_graphics_keys). issn_pc: not
     // in a VERIFY run, which reads no stamp (that needs bit 1) and checks the folder's own SPIR-V:
     // the 0.3.2 release verify skipped every graphics key of a folder grown from a seed, so its
@@ -1205,6 +1215,18 @@ void PipelineCache::WarmUp() {
         }
     });
 
+    // issn_pc: every shader meta on disk (PipelineCache::disk_metas), so a new permutation never
+    // takes the index of one this boot does not load.
+    disk_metas.clear();
+    if (const auto folder = Storage::DataBase::Instance().SidecarPath(""); !folder.empty()) {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+            const auto name = entry.path().filename().string();
+            if (name.size() == 23 && name.starts_with("0x") && name.ends_with(".meta")) {
+                disk_metas.insert(std::strtoull(name.c_str() + 2, nullptr, 16));
+            }
+        }
+    }
     if (profile_data.empty()) {
         std::vector<u8> fresh(sizeof(profile));
         std::memcpy(fresh.data(), &profile, sizeof(profile));
@@ -1521,6 +1543,18 @@ void PipelineCache::WarmUp() {
     PrecompileFromExtract();
 
     Storage::DataBase::Instance().FinishPreload();
+
+    // issn_pc: SHADPS4_EXIT_AFTER_WARMUP=1 (packaging/windows/make_seed.sh): the process ends here,
+    // once the boot preload (and a VERIFY run's stamp) is done, before the game starts.
+    if (const char* exit_env = std::getenv("SHADPS4_EXIT_AFTER_WARMUP");
+        exit_env && exit_env[0] == '1') {
+        Storage::DataBase::Instance().Close();
+        std::printf("Shader cache: boot preload done (%zu shaders checked); exiting as "
+                    "SHADPS4_EXIT_AFTER_WARMUP asks\n",
+                    stamp_perms.size());
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }
 }
 
 void PipelineCache::Sync() {

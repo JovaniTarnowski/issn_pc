@@ -34,4 +34,9 @@ void HideOwnConsole();
 /// The game's eboot.bin: saved choice, else a folder picker (saved on success). nullopt = cancelled.
 std::optional<std::filesystem::path> GamePath();
 
+/// 1.1.1 (GitHub #5): a player-facing box before an out-of-memory assert closes the game - what did
+/// not fit and what usually helps. Once per process; blocks the calling thread until closed.
+/// issn_pc: defined in gpu/shim/issngpu.cpp (SDL message box; release_mode.cpp is not built).
+void ShowOutOfMemoryNotice(unsigned long long bytes);
+
 } // namespace Common::ReleaseMode

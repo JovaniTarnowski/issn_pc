@@ -186,6 +186,7 @@ public:
         VAddr begin;
         VAddr end;
         bool has_stream_leap = false;
+        bool mesh = false; ///< a BIG_GROW mesh-sized join: video memory if it fits (GitHub #30)
     };
 
 public:
@@ -879,6 +880,9 @@ private:
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);
+
+    void UploadCopiesInPieces(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                              size_t total_size_bytes, bool test);
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
 
