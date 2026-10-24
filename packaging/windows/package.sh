@@ -83,7 +83,9 @@ if [[ -n ${ISSN_SHADER_SEED_FROM:-} ]]; then
     version=$(sed -n "s/^VERSION = '\(.*\)'.*/\1/p" launcher/issn_launcher_win.py)
     seed_name=${ISSN_SHADER_SEED_NAME:-issn-seed-$version}
     verified_exe=$(dirname -- "$ISSN_SHADER_SEED_FROM")/../../bin/issn-probe.exe
-    if [[ ! -f $verified_exe ]] || ! cmp -s "$verified_exe" "$dest/bin/issn-probe.exe"; then
+    # sha256sum (coreutils): MSYS2 has no cmp unless diffutils is installed.
+    if [[ ! -f $verified_exe ]] ||
+        [[ $(sha256sum < "$verified_exe") != $(sha256sum < "$dest/bin/issn-probe.exe") ]]; then
         echo "The seed's folder was not verified with this package's bin/issn-probe.exe ($verified_exe)." >&2
         echo 'Run the verify from dist/issn-windows after packaging, without building again.' >&2
         exit 1
