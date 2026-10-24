@@ -1,10 +1,12 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.1
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.2
 ======================================================
 
 A test build: the game plays from the start, at about 90-105 FPS standing in the open city on a
-Ryzen 7 3700X + RX 9060 XT once its shaders are compiled. The first time each place or effect
-appears its shaders compile and the game stutters; that goes away as the cache fills. Please report
-how far you get and what goes wrong (see DLSS (optional, NVIDIA RTX)
+Ryzen 7 3700X + RX 9060 XT. The first start prepares the shaders once (a few minutes, with a
+progress screen); new ones that still appear while playing compile in the background. Please
+report how far you get and what goes wrong (see Reporting problems).
+
+DLSS (optional, NVIDIA RTX)
 NVIDIA's files are not included (licence). Download Streamline SDK 2.14.16 from
 https://github.com/NVIDIA-RTX/Streamline/releases (exactly that version) and copy these five files
 from its bin\x64 folder (not development) into bin\dlss next to issn-probe.exe (launcher:
@@ -12,7 +14,24 @@ Graphics > Open the DLSS folder): sl.interposer.dll, sl.common.dll, sl.dlss.dll,
 nvngx_dlss.dll. Then choose DLSS in Graphics > Anti-aliasing. Untested by us (no NVIDIA card):
 please report how it goes. Without the files the game keeps its own anti-aliasing.
 
-Reporting problems).
+What's new in 0.3.2
+- Shaders prepared on the first start: the package carries a shader seed (the list of the game's
+  shaders and their settings, no game code) and the first start makes them from your own game
+  files, with a progress screen (a few minutes, once). Effect shaders (smoke, powers, particles)
+  come ready on every graphics card; the other shaders on cards like the tester's (recent AMD on
+  Windows), elsewhere they compile while playing. The log says which: "all stages" or "compute
+  stages only".
+- Shaders that are still new compile in the background: the game no longer stops for them, the
+  thing they draw appears a moment later (launcher: Performance > Shader compilation; "In the
+  frame" is the old behaviour). Effects get priority, since the game has to wait for those.
+- Internal resolution (launcher: Performance > Internal resolution): the game draws at 83%, 67%,
+  58% or 50% of 1080 lines. With FSR 4 the picture is rebuilt at the window size by the matching
+  preset (67% = Quality, 58% = Balanced, 50% = Performance); with the game's own AA it is only
+  scaled up. Helps when the graphics card is the limit, not the processor.
+- Every 10 s while new shaders appear the log says how many and how long anything waited.
+- The game writes user\last_run.log itself also with "Close the launcher on play".
+- The shader cache moves to a new folder (user\cache\issn-seed-0.3.2); user\cache\CUSA00223 or
+  CUSA00004 from older versions can be deleted.
 
 What's new in 0.3.1
 - axylpup's 1.1 fixes in the graphics core: texture-cache hangs, 8 GB AMD cards (RX 6600)
@@ -36,13 +55,6 @@ What's new in 0.3.0
   Radeon RX 7000 / 9000) or DLSS (NVIDIA RTX; NVIDIA's files are not included, the launcher shows
   where they go and where to download them). In the game, Home switches FSR 4 / DLSS and the
   game's own anti-aliasing live (the FPS bar shows which one runs).
-- Internal resolution (launcher: Performance > Internal resolution): the game draws at 83%, 67%,
-  58% or 50% of 1080 lines. With FSR 4 the picture is rebuilt at the window size by the matching
-  preset (67% = Quality, 58% = Balanced, 50% = Performance); with the game's own AA it is only
-  scaled up. FSR 4 also upscales the game's 1080p to a larger window (1440p, 4K).
-- Performance mode (launcher: Performance > Performance mode, from axylpup's 1.1): the game's
-  own lower settings for the open city. Balanced is about 13% more FPS there, Maximum about 19%
-  with fewer pedestrians.
 - Frame rate limit and VSync from the launcher and the in-game menu (applied on restart);
   Unlimited by default, the game keeps its speed at any frame rate.
 - Draw distance back to the game's own, with Long and Very long for less pop-in.

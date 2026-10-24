@@ -1,8 +1,8 @@
 # issn_pc: inFAMOUS Second Son nativo no PC
 
 Port nativo de **inFAMOUS Second Son** (PS4) para **Windows** (Vulkan). Builds de teste: o jogo é
-jogável, mas espere bugs e engasgos na primeira vez que os shaders de cada lugar
-compilam.
+jogável, mas espere bugs. Os shaders são preparados na primeira abertura (alguns minutos, uma
+vez).
 
 > **Nenhum arquivo do jogo vem neste projeto.** Você precisa do dump do seu próprio jogo, feito
 > da sua cópia no seu PS4: veja [docs/issn/DUMP.md](docs/issn/DUMP.md).
@@ -31,6 +31,13 @@ Vulkan 1.3 e driver atualizado. Versões do jogo: CUSA00223 (EUA) e CUSA00004 (E
   **DLSS** (NVIDIA RTX; os arquivos da NVIDIA não vêm junto: baixe o Streamline SDK 2.14.16 e
   copie `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll`, `sl.pcl.dll` e `nvngx_dlss.dll` de
   `bin\x64` para `bin\dlss`; o launcher abre essa pasta para você).
+- **Shaders preparados na primeira abertura:** o pacote traz uma semente (a lista dos shaders do
+  jogo e das configurações deles, sem nenhum código do jogo) e a primeira abertura monta os
+  shaders a partir dos arquivos do seu próprio jogo. Os de efeitos vêm prontos em qualquer placa;
+  os outros em placas como a do testador (AMD recente). O que ainda for novo compila em segundo
+  plano, sem travar o jogo.
+- **Resolução interna** (83% a 50%) com o FSR 4 reconstruindo a imagem no tamanho da janela, e
+  **Modo de desempenho** (os ajustes mais leves do próprio jogo, da 1.1 do axylpup).
 - Limite de FPS e VSync; distância de detalhe original, Longa ou Muito longa; F12 tira print.
 - **Mouse 1:1:** clique na janela do jogo e o mouse mira direto na câmera do jogo, sem a curva
   do analógico. Y ou F7 solta o mouse; `-` / `=` mudam a velocidade.
@@ -55,14 +62,16 @@ bash packaging/windows/package.sh   # dist/issn-windows.zip
 ## English
 
 Native PC port of **inFAMOUS Second Son** (PS4) for **Windows** (Vulkan). Test builds: the game is
-playable, but expect bugs and a stutter the first time each place's shaders compile.
+playable, but expect bugs. The first start prepares the shaders once (a few minutes).
 **No game files are included**: you need a dump of your own copy (CUSA00223 US or CUSA00004 EU).
 
 Download `issn-windows.zip` from [Releases](../../releases), extract it anywhere and open
 `inFAMOUS Second Son.exe`, choose the game folder (with `eboot.bin`) and click PLAY. Windows 10
 (1903+) / 11 64-bit, an AVX CPU and a Vulkan 1.3 GPU are needed. Features: axylpup's graphics core,
 the game's AA, FSR 4 (included) or DLSS (bring NVIDIA's Streamline 2.14.16 files into `bin\dlss`),
-frame rate limit, 1:1 mouse aim (click in the window; Y / F7 lets go), axylpup's keyboard layout,
+shaders prepared on the first start from a shipped seed (shader list and settings, no game
+code; new ones compile in the background), internal resolution with FSR 4 upscaling, performance
+mode, frame rate limit, 1:1 mouse aim (click in the window; Y / F7 lets go), axylpup's keyboard layout,
 DualShock 4 / DualSense touchpad and motion, touchpad and spray-can emulation for other pads, and
 Add to Steam. Building: [packaging/windows/README.md](packaging/windows/README.md).
 
