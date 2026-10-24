@@ -113,6 +113,14 @@ else
     mkdir -p "$play"
     find "$play" -mindepth 1 -maxdepth 1 ! -name user ! -name mods ! -name issn.ini \
         ! -name mods.json ! -name patches.json -exec rm -rf {} +
-    cp -r "$dest/." "$play/"
+    # Everything but user/: the shader seed goes in only where that cache folder does not exist
+    # yet. Copied over a folder that was played with, the seed's metas would replace the folder's
+    # own under the same names while its SPIR-V stays: mismatched shaders (2026-10-24, a seed made
+    # from such a folder crashed the game).
+    find "$dest" -mindepth 1 -maxdepth 1 ! -name user -exec cp -r {} "$play/" \;
+    if [[ -n ${seed_name:-} && ! -e $play/user/cache/$seed_name ]]; then
+        mkdir -p "$play/user/cache"
+        cp -r "$dest/user/cache/$seed_name" "$play/user/cache/"
+    fi
 fi
 du -sh "$dest" dist/issn-windows.zip
