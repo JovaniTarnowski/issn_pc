@@ -629,7 +629,11 @@ static void synth_motion(PadData *d, bool tilt, bool rattle, float aim_x, float 
     q_axis(0.0f,1.0f,0.0f,synth.yaw,qy); q_axis(1.0f,0.0f,0.0f,synth.pitch,qp); q_axis(0.0f,0.0f,1.0f,synth.phi,qr);
     q_mul(qy,qp,q); q_mul(q,qr,q);
     const float gx=2*q[0]*q[1]+2*q[3]*q[2], gy=1-2*q[0]*q[0]-2*q[2]*q[2], gz=2*q[1]*q[2]-2*q[3]*q[0];
-    const float shake=rattle ? 2.5f*sinf(2.0f*pi*5.0f*(float)(now-synth.t0)/1e6f) : 0.0f;
+    /* The rattle: gravity's magnitude swings 1 - 3.5 g at 5 Hz along the pose's own up (the game's
+     * shake test wants an axis above 2.5 g while rolled > 30 degrees). It used to swing -1.5 - 3.5
+     * g: below zero the gravity vector pointed the other way, the game read the pad upside down
+     * and the spray can's aim turned left-right and up-down while X was held (tester 10-24). */
+    const float shake=rattle ? 1.25f+1.25f*sinf(2.0f*pi*5.0f*(float)(now-synth.t0)/1e6f) : 0.0f;
     const float g=STANDARD_GRAVITY*(1.0f+shake)*accel_scale();
     d->acceleration[0]=gx*g; d->acceleration[1]=gy*g; d->acceleration[2]=gz*g;
     float w[3]={0.0f,0.0f,0.0f};
