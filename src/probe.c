@@ -868,17 +868,24 @@ int main(int argc, char **argv) {
     }
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
-    /* ISSN_ISA_REWRITE=0 never rewrites, =1 rewrites every site; by default the sets the CPU lacks. */
+    /* ISSN_ISA_REWRITE=0 never rewrites, =1 rewrites every site, =sse4a the EXTRQ sites (to try the
+     * Intel path on an AMD CPU); by default the sets the CPU lacks. */
     const char *policy = getenv("ISSN_ISA_REWRITE");
-    unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
-    if (cpu_missing_sets && !isa_sets) {
+    unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 :
+                        policy && !strcmp(policy, "sse4a") ? (cpu_missing_sets | CPU_SET_SSE4A) : cpu_missing_sets;
+    /* SSE4A alone (every Intel CPU) does not stop a run without the table: only some code uses
+     * EXTRQ (inFAMOUS Second Son: 96 sites), and the loader's own tests run images without it. */
+    const unsigned stop_sets = cpu_missing_sets & ~(unsigned)CPU_SET_SSE4A;
+    if (stop_sets && !isa_sets) {
         printf("STOP: this CPU lacks %s and the rewrite is disabled (ISSN_ISA_REWRITE=0)\n", missing);
         return 20;
     }
-    if (cpu_missing_sets && !isa_file) {
+    if (stop_sets && !isa_file) {
         printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
         return 20;
     }
+    if (cpu_missing_sets && (!isa_sets || !isa_file))
+        printf("CPU: lacks SSE4A and runs without the ISA rewrite: an EXTRQ would end the game\n");
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];
@@ -1047,7 +1054,7 @@ int main(int argc, char **argv) {
         }
     }
     isa_table = isa_sets && isa_file ? isa_table_load(isa_file) : NULL;
-    if (!isa_table && cpu_missing_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
+    if (!isa_table && stop_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
     /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
     image = allocate(round_page(size) + stub_area);
@@ -1057,8 +1064,15 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (isa_table && isa_table_matches(isa_table, image, size)) {
-        printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
-        return 20;
+        if (stop_sets) {
+            printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
+            return 20;
+        }
+        printf("CPU: lacks SSE4A and the rewrite table does not match the image: an EXTRQ would end the game\n");
+        free(isa_table->sites);
+        free(isa_table->hits);
+        free(isa_table);
+        isa_table = NULL;
     }
     if (!cpu_only) {
         char title[128]="inFAMOUS Second Son", serial[16]="UNKNOWN", sfo[4096];
@@ -1142,6 +1156,7 @@ int main(int argc, char **argv) {
             _exit(20); /* no destructors: GPU threads are running */
         }
         if (isa_sets == 0xffffffffu) printf("ISA: forced rewrite of all %u sites (ISSN_ISA_REWRITE=1), %u skipped\n", r.rewritten, r.skipped);
+        else if (!cpu_missing_sets) printf("ISA: forced rewrite of the SSE4A sites (ISSN_ISA_REWRITE=sse4a): %u sites, %u skipped\n", r.rewritten, r.skipped);
         else printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
                     missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
         runtime_set_report_hook(isa_report_hook);

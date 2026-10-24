@@ -12,9 +12,10 @@ CpuFeatureWords cpu_feature_words(void) {
     return words;
 }
 
-/* Jaguar's sets beyond the x86-64 baseline that Intel CPUs also have (SSE4A is left out: the
- * game runs on Intel). Each one arrived on Intel with Haswell at the latest. A missing fatal set
- * stops the game; the rewritable ones, which Sandy and Ivy Bridge lack, can be emulated. */
+/* Jaguar's sets beyond the x86-64 baseline. A missing fatal set stops the game; the rewritable
+ * ones can be emulated: MOVBE, F16C, BMI1 and LZCNT (Intel has them from Haswell on) and SSE4A,
+ * which no Intel CPU has (issn_pc 2026-10-24: inFAMOUS Second Son runs EXTRQ, 96 sites; God of War
+ * III, where this list comes from, had none, and an i7-10700K closed on its first one). */
 enum { LEAF1, LEAF7, EXT1 };
 typedef struct { const char *name; int word; uint32_t bit; unsigned set; } CpuSet;
 static const CpuSet fatal_sets[] = {
@@ -23,6 +24,7 @@ static const CpuSet fatal_sets[] = {
 static const CpuSet rewritable_sets[] = {
     {"MOVBE", LEAF1, 1u << 22, CPU_SET_MOVBE}, {"F16C", LEAF1, 1u << 29, CPU_SET_F16C},
     {"BMI1", LEAF7, 1u << 3, CPU_SET_BMI1},    {"LZCNT", EXT1, 1u << 5, CPU_SET_LZCNT},
+    {"SSE4A", EXT1, 1u << 6, CPU_SET_SSE4A},
 };
 
 /* Names the missing sets, comma separated in out; returns how many, and their CPU_SET_* bits in *mask. */

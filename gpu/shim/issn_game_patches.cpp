@@ -23,6 +23,12 @@
 namespace VideoCore {
 void PS4_SYSV_ABI ParticleArenaDiscardHook(); // buffer_cache.cpp
 }
+// issn_pc: the screen shape (issngpu.cpp: window size; MemoryPatcher::IsRenderShaped / MovieFitRect).
+namespace IssnShape {
+bool ScreenPixels(int& width, int& height);
+extern double g_aspect;
+extern float g_movie_x, g_movie_y;
+} // namespace IssnShape
 
 namespace {
 using MemoryPatcher::g_eboot_address;
@@ -263,30 +269,121 @@ static void ApplyLightListCapacity(u32 width, u32 height) {
     std::printf("Render size: light list %u entries for %ux%u\n", entries, width, height);
 }
 
-static void ApplyRenderSize() {
-    u32 height = 0;
-    if (const char* v = std::getenv("ISSN_RENDER_HEIGHT"); v && std::atoi(v) > 0) {
-        height = static_cast<u32>(std::atoi(v));
-    } else if (const char* p = std::getenv("ISSN_RENDER_SCALE"); p && std::atof(p) > 0.0) {
-        height = static_cast<u32>(std::lround(1080.0 * std::atof(p) / 100.0));
+/// The render size at 16:9-basis height h0 in the shape `aspect` (axylpup's SizeAt): wide shapes
+/// keep the height (up to 32:9), narrow ones keep the 16:9 width (down to 1:1).
+static void SizeAt(u32 h0, double aspect, u32& width, u32& height) {
+    if (aspect < 16.0 / 9.0 - 1e-6) {
+        width = Round8(h0 * 16.0 / 9.0);
+        height = std::min(width, Round8(width / aspect));
+    } else {
+        width = std::min(Round8(h0 * 32.0 / 9.0), Round8(h0 * aspect));
+        height = h0;
     }
-    if (height == 0) {
+}
+
+// Movies fit inside the screen (axylpup 1.1.1): the full-screen movie draw FUN_8004575b0 samples
+// the movie by f = (ccc4 * 16) / (ccc0 * 9) on a quad at (-1, -1, 1, 1); on another shape f != 1
+// cut the movie (21:9: 12% lost above and below). 16 / 9 become the screen space's size (f = 1)
+// and the quad takes the movie's shape inside the screen (bars, never stretched); the rasterizer
+// clears the target first (MemoryPatcher::MovieFitRect).
+static void ApplyMovieFit(u32 sw, u32 sh) {
+    const double f = double(sh) * 16.0 / (double(sw) * 9.0);
+    if (std::abs(f - 1.0) < 0.01) {
         return;
     }
-    height = std::clamp<u32>(Round8(height), 360, 2160);
-    const u32 width = Round8(height * 16.0 / 9.0);
+    static constexpr float k_orig[2] = {16.0f, 9.0f};
+    static constexpr float rect_orig[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+    auto* k = reinterpret_cast<float*>(g_eboot_address + 0xaadbe0);
+    auto* rect = reinterpret_cast<float*>(g_eboot_address + 0xaadd60);
+    if (std::memcmp(k, k_orig, sizeof(k_orig)) != 0 || std::memcmp(rect, rect_orig, sizeof(rect_orig)) != 0) {
+        std::printf("Screen shape: movies keep the 16:9 draw (constants differ in this eboot)\n");
+        return;
+    }
+    const float x = f < 1.0 ? float(f) : 1.0f;
+    const float y = f < 1.0 ? 1.0f : float(1.0 / f);
+    const float k_new[2] = {float(sw), float(sh)};
+    const float rect_new[4] = {-x, -y, x, y};
+    std::memcpy(k, k_new, sizeof(k_new));
+    std::memcpy(rect, rect_new, sizeof(rect_new));
+    IssnShape::g_movie_x = x;
+    IssnShape::g_movie_y = y;
+}
+
+// Render size and screen shape (axylpup 1.1 render height + SHADPS4_ASPECT, src/common/
+// memory_patcher.cpp ApplyAspectRatio), decided at boot:
+// - ISSN_RENDER_HEIGHT / ISSN_RENDER_SCALE (launcher: Internal resolution): the lines the game
+//   renders (360 - 2160, 1080 = the game's own).
+// - ISSN_ASPECT (launcher: Screen shape): auto (default) = the game window's shape (fullscreen:
+//   the monitor's), off = 16:9, or W:H (21:9, 32:9, 16:10, 4:3). Wider screens see more at the
+//   sides (the vertical view stays), narrower ones keep the 16:9 width and see more above and
+//   below (the projection's 2.0 becomes 2 / k); the HUD anchors to the new edges in a 2D screen
+//   space kept at the 1080-line scale; movies keep their shape with bars.
+// The renderer's size setup FUN_8001eff00 (render + output size) and the mode toggle FUN_8001f0be0
+// load 1920 / 1080 immediates; the 2D screen space (HUD, camera aspect) is 0x1f0403 / 0x1f03fb.
+static void ApplyRenderSize() {
+    constexpr double base = 16.0 / 9.0;
+    u32 h0 = 1080;
+    if (const char* v = std::getenv("ISSN_RENDER_HEIGHT"); v && std::atoi(v) > 0) {
+        h0 = static_cast<u32>(std::atoi(v));
+    } else if (const char* p = std::getenv("ISSN_RENDER_SCALE"); p && std::atof(p) > 0.0) {
+        h0 = static_cast<u32>(std::lround(1080.0 * std::atof(p) / 100.0));
+    }
+    h0 = std::clamp<u32>(Round8(h0), 360, 2160);
+    const char* aspect_env = std::getenv("ISSN_ASPECT");
+    const std::string mode = aspect_env && *aspect_env ? aspect_env : "auto";
+    double aspect = base;
+    int screen_w = 0, screen_h = 0;
+    if (const auto colon = mode.find(':'); colon != std::string::npos) {
+        const double w = std::atof(mode.substr(0, colon).c_str());
+        const double h = std::atof(mode.substr(colon + 1).c_str());
+        aspect = h > 0.0 && w > 0.0 ? w / h : base;
+    } else if (mode == "auto" && IssnShape::ScreenPixels(screen_w, screen_h) && screen_h > 0) {
+        aspect = double(screen_w) / double(screen_h);
+    }
+    // 3%: a "1280x720" window reports a client area like 1279x724 (axylpup's measurement).
+    if (std::abs(aspect - base) < 0.03 * base) {
+        aspect = base;
+    }
+    aspect = std::clamp(aspect, 1.0, 32.0 / 9.0);
+    u32 width, height;
+    SizeAt(h0, aspect, width, height);
+    // At most 4K's pixels in any shape (axylpup: larger lost the device).
+    while (u64(width) * height > 3840ull * 2160ull && h0 > 360) {
+        h0 -= 8;
+        SizeAt(h0, aspect, width, height);
+    }
     if (width == 1920 && height == 1080) {
         return;
     }
+    const bool narrow = aspect < base - 1e-6;
+    // Narrow shapes: the projection builder 0x800581c90 computes P00 / P11 from one load of 2.0
+    // (0x581d10); it is pointed at 2 / k in the 4 padding bytes before the function (0x581c84).
+    static constexpr u8 two_load[8] = {0xc5, 0xfa, 0x10, 0x1d, 0x98, 0x27, 0x56, 0x00};
+    static constexpr u8 pad[4] = {0x90, 0x90, 0x90, 0x90};
+    if (narrow && (std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581d10), two_load, 8) != 0 ||
+                   std::memcmp(reinterpret_cast<const void*>(g_eboot_address + 0x581c84), pad, 4) != 0)) {
+        std::printf("Screen shape: %.3f refused (the projection code differs in this eboot); 16:9\n", aspect);
+        aspect = base;
+        SizeAt(h0, aspect, width, height);
+        if (width == 1920 && height == 1080) {
+            return;
+        }
+    }
+    const bool shaped = aspect != base;
+    // The HUD space stays at the 1080-line scale (axylpup s1440: at 1280x720 some HUD parts sized
+    // in 1080p pixels broke); 16:9 keeps 1920x1080.
+    const u32 sw = u32(std::lround(width * 1080.0 / h0)), sh = u32(std::lround(height * 1080.0 / h0));
     struct Imm {
         u64 offset;
         u32 original;
         bool width;
+        bool screen_space;
     };
     static constexpr Imm imms[] = {
-        {0x1eff4a, 0x780, true}, {0x1eff51, 0x438, false}, // render size
-        {0x1eff57, 0x780, true}, {0x1eff5e, 0x438, false}, // output size
-        {0x1f0d3e, 0x780, true}, {0x1f0d4d, 0x438, false}, // mode toggle
+        {0x1eff4a, 0x780, true, false}, {0x1eff51, 0x438, false, false}, // render size
+        {0x1eff57, 0x780, true, false}, {0x1eff5e, 0x438, false, false}, // output size
+        {0x1f0403, 0x780, true, true},  {0x1f03fb, 0x438, false, true},  // 2D screen space
+        {0x1f0d3e, 0x780, true, false}, {0x1f0d4d, 0x438, false, false}, // mode toggle
     };
     for (const auto& imm : imms) {
         u32 live = 0;
@@ -298,11 +395,26 @@ static void ApplyRenderSize() {
         }
     }
     for (const auto& imm : imms) {
-        const u32 value = imm.width ? width : height;
+        const u32 value = imm.screen_space ? (imm.width ? sw : sh) : (imm.width ? width : height);
         std::memcpy(reinterpret_cast<void*>(g_eboot_address + imm.offset), &value, 4);
     }
     ApplyLightListCapacity(width, height);
-    std::printf("Render size: %ux%u (%.0f%% of 1080 lines)\n", width, height, height * 100.0 / 1080.0);
+    if (narrow) {
+        const float two_over_k = float(2.0 / (base / aspect));
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581c84), &two_over_k, 4);
+        const s32 disp = s32(0x581c84 - (0x581d10 + 8)); // rip-relative from the next instruction
+        std::memcpy(reinterpret_cast<void*>(g_eboot_address + 0x581d10 + 4), &disp, 4);
+    }
+    IssnShape::g_aspect = aspect;
+    if (shaped) {
+        ApplyMovieFit(sw, sh);
+    }
+    std::printf("Render size: %ux%u (%.0f%% of 1080 lines)%s\n", width, height, h0 * 100.0 / 1080.0,
+                shaped ? fmt::format(", screen shape {:.3f} ({}; window {}x{}), HUD space {}x{}{}", aspect,
+                                     mode, screen_w, screen_h, sw, sh,
+                                     narrow ? ", 16:9 width kept, more picture above and below" : "")
+                             .c_str()
+                       : "");
 }
 } // namespace
 

@@ -75,10 +75,11 @@ def parse_cpu_features(output):
 
 
 def isa_rewrite_wanted(missing, env):
-    """ISSN_ISA_REWRITE=1 forces the ISA rewrite table, 0 disables it; otherwise the CPU decides."""
+    """ISSN_ISA_REWRITE=1 (or sse4a: the EXTRQ sites only) forces the ISA rewrite table, 0 disables
+    it; otherwise the CPU decides."""
     policy = env.get('ISSN_ISA_REWRITE')
-    if policy in ('0', '1'):
-        return policy == '1'
+    if policy in ('0', '1', 'sse4a'):
+        return policy != '0'
     return bool(missing)
 
 

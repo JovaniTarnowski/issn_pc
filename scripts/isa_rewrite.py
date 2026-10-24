@@ -1,4 +1,5 @@
-"""Find the Haswell-only instructions (MOVBE, LZCNT, BMI1, F16C) in the linked image.
+"""Find the instructions some hosts lack in the linked image: the Haswell ones (MOVBE, LZCNT, BMI1,
+F16C) and AMD's SSE4A EXTRQ, which no Intel CPU runs (register form; its stub is generated code).
 
 scan_segment decodes one executable segment with iced-x86 and classifies each
 site: JMP (5+ bytes, patched with a jump to a stub), JMP_RELOCATE (4 bytes,
@@ -25,14 +26,15 @@ except ImportError:
     iced_x86 = None
 
 (KIND_MOVBE_LOAD, KIND_MOVBE_STORE, KIND_LZCNT, KIND_TZCNT, KIND_ANDN, KIND_BEXTR,
- KIND_BLSI, KIND_BLSMSK, KIND_BLSR, KIND_VCVTPH2PS, KIND_VCVTPS2PH) = range(1, 12)
+ KIND_BLSI, KIND_BLSMSK, KIND_BLSR, KIND_VCVTPH2PS, KIND_VCVTPS2PH, KIND_EXTRQ) = range(1, 13)
 MODE_JMP, MODE_JMP_RELOCATE, MODE_INT3, MODE_UNSUPPORTED = range(4)
 NO_REG = 0xFF
 HEADER = struct.Struct('<8sQ32sII8x')                # magic, image size, sha256, sites, unsupported
 RECORD = struct.Struct('<QBBBBBBBBBBBB4xq15sB15sx')  # mirrors IsaSite in the C loader
 SET_OF_KIND = {KIND_MOVBE_LOAD: 'MOVBE', KIND_MOVBE_STORE: 'MOVBE', KIND_LZCNT: 'LZCNT',
                KIND_TZCNT: 'BMI1', KIND_ANDN: 'BMI1', KIND_BEXTR: 'BMI1', KIND_BLSI: 'BMI1',
-               KIND_BLSMSK: 'BMI1', KIND_BLSR: 'BMI1', KIND_VCVTPH2PS: 'F16C', KIND_VCVTPS2PH: 'F16C'}
+               KIND_BLSMSK: 'BMI1', KIND_BLSR: 'BMI1', KIND_VCVTPH2PS: 'F16C', KIND_VCVTPS2PH: 'F16C',
+               KIND_EXTRQ: 'SSE4A'}
 
 
 @dataclass
@@ -59,6 +61,8 @@ def kind_of(ins):
     m = ins.mnemonic
     if m == Mnemonic.MOVBE:
         return KIND_MOVBE_LOAD if ins.op0_kind == OpKind.REGISTER else KIND_MOVBE_STORE
+    if ins.code == Code.EXTRQ_XMM_XMM:
+        return KIND_EXTRQ
     return {Mnemonic.LZCNT: KIND_LZCNT, Mnemonic.TZCNT: KIND_TZCNT, Mnemonic.ANDN: KIND_ANDN,
             Mnemonic.BEXTR: KIND_BEXTR, Mnemonic.BLSI: KIND_BLSI, Mnemonic.BLSMSK: KIND_BLSMSK,
             Mnemonic.BLSR: KIND_BLSR, Mnemonic.VCVTPH2PS: KIND_VCVTPH2PS,
@@ -157,7 +161,7 @@ def encode_table(image, sites):
 def summary(sites):
     sets = [SET_OF_KIND[s.kind] for s in sites]
     modes = [s.mode for s in sites]
-    per_set = ', '.join(f'{name} {sets.count(name)}' for name in ('MOVBE', 'BMI1', 'LZCNT', 'F16C'))
+    per_set = ', '.join(f'{name} {sets.count(name)}' for name in ('MOVBE', 'BMI1', 'LZCNT', 'F16C', 'SSE4A'))
     return (f'ISA: {len(sites)} sites ({per_set}); {modes.count(MODE_JMP_RELOCATE)} relocated, '
             f'{modes.count(MODE_INT3)} int3, {modes.count(MODE_UNSUPPORTED)} unsupported')
 

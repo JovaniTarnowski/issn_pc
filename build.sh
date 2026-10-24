@@ -133,4 +133,6 @@ if [[ ${1:-} == --test ]]; then
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -c src/isa_rewrite.c -I. -Isrc -o out/isa_rewrite.o
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mbmi -mlzcnt -I. -Isrc tests/test_isa_stub.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-stub-test
     out/isa-stub-test tests/data/isa_fixture.bin
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_isa_extrq.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-extrq-test
+    out/isa-extrq-test
 fi

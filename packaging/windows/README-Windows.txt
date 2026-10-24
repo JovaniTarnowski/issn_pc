@@ -1,4 +1,4 @@
-inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.3
+inFAMOUS Second Son for PC (issn_pc) - TEST BUILD 0.3.4
 ======================================================
 
 A test build: the game plays from the start, at about 90-105 FPS standing in the open city on a
@@ -13,6 +13,17 @@ from its bin\x64 folder (not development) into bin\dlss next to issn-probe.exe (
 Graphics > Open the DLSS folder): sl.interposer.dll, sl.common.dll, sl.dlss.dll, sl.pcl.dll,
 nvngx_dlss.dll. Then choose DLSS in Graphics > Anti-aliasing. Untested by us (no NVIDIA card):
 please report how it goes. Without the files the game keeps its own anti-aliasing.
+
+What's new in 0.3.4
+- Intel processors: the game no longer closes right after the Sucker Punch logo. It uses AMD's
+  SSE4A instruction EXTRQ (96 places), which no Intel CPU has; the port now replaces it with an
+  equivalent on Intel (Windows and Linux).
+- Ultrawide and other screen shapes (launcher: Graphics > Screen shape, from axylpup's 1.1): the
+  game fills 21:9, 32:9, 16:10 ... and sees more at the sides (or above and below on 16:10); the
+  HUD moves to the edges and movies keep their shape with black bars. Automatic follows the
+  window: play in fullscreen on an ultrawide monitor.
+- Spray can with the mouse: about 9x calmer (2.5 degrees per 100 px, as axylpup's build); - / =
+  change its speed while the pad is tilted (ISSN_SPRAY_MOUSE sets it).
 
 What's new in 0.3.3
 - Fixed: after playing a while with 0.3.2 the game could stop opening (the shader cache paired
@@ -110,7 +121,8 @@ Controller
     U L3, O R3, Enter Options, arrows d-pad.
   - Left click R2 (shoot), right click L2 (aim) while the mouse aims; 1 / 3 also work.
   - R / G: left / right side of the touchpad click (G + IJKL: swipe).
-  - Spray can: hold Z to tilt the pad, tap Z or hold X to rattle it, move the mouse to aim.
+  - Spray can: hold Z to tilt the pad, tap Z or hold X to rattle it, move the mouse to aim
+    (- / = change its speed while the pad is tilted).
   - F12 screenshot, Insert the port's menu.
 - Started from Steam: the port ignores Steam Input's device filter so the controller is seen
   (ISSN_KEEP_STEAM_PAD_FILTER=1 keeps it). If a pad still is not found, the log lists what SDL

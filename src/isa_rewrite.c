@@ -72,7 +72,10 @@ static int register_valid(uint8_t reg) { return reg <= 15 || reg == ISA_NO_REG; 
  * The writer stores scale 0 without a memory operand, else iced's scale (1 when there is no index). */
 static int record_valid(const IsaSite *s, uint64_t image_size) {
     if (s->length < 4 || s->length > 15 || s->relocated_length > 15) return 0;
-    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_VCVTPS2PH || s->mode > ISA_MODE_UNSUPPORTED) return 0;
+    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_EXTRQ || s->mode > ISA_MODE_UNSUPPORTED) return 0;
+    /* EXTRQ: two XMM registers, a jmp to generated code only (no int3: the trap emulation has no XMM). */
+    if (s->kind == ISA_EXTRQ && (s->dst > 15 || s->src1 > 15 || s->mem_slot != ISA_MEM_NONE || s->mode == ISA_MODE_INT3))
+        return 0;
     if (!register_valid(s->dst) || !register_valid(s->src1) || !register_valid(s->src2) || !register_valid(s->base) ||
         !register_valid(s->index) || s->mem_slot > ISA_MEM_SRC)
         return 0;
@@ -146,6 +149,7 @@ unsigned isa_site_set(const IsaSite *s) {
     case ISA_LZCNT: return CPU_SET_LZCNT;
     case ISA_TZCNT: case ISA_ANDN: case ISA_BEXTR: case ISA_BLSI: case ISA_BLSMSK: case ISA_BLSR: return CPU_SET_BMI1;
     case ISA_VCVTPH2PS: case ISA_VCVTPS2PH: return CPU_SET_F16C;
+    case ISA_EXTRQ: return CPU_SET_SSE4A;
     default: return 0;
     }
 }
@@ -179,10 +183,65 @@ static int rel32_to(const unsigned char *next, const unsigned char *target, int3
     return 1;
 }
 
+/* The relocated instruction (JMP_RELOCATE) and the jmp back to the site's end; 0 when out of range. */
+static size_t emit_tail(unsigned char *code, unsigned char *p, const unsigned char *at, const IsaSite *s,
+                        unsigned char *image) {
+    const unsigned char *back = image + s->offset + s->length;
+    if (s->mode == ISA_MODE_JMP_RELOCATE) {
+        emit_bytes(&p, s->relocated, s->relocated_length);
+        back = image + s->offset + 4 + s->relocated_length;
+    }
+    int32_t rel;
+    if (!rel32_to(at + (p - code) + JMP_BYTES, back, &rel)) return 0;
+    emit_u8(&p, 0xe9);
+    emit_u32(&p, (uint32_t)rel);
+    return (size_t)(p - code);
+}
+
+/* EXTRQ xmm_dst, xmm_src (66 [REX] 0F 79 /r, AMD SSE4A): the low qword of dst becomes its field of
+ * length src[5:0] (0 = 64) starting at bit src[13:8], zero-extended; the high qword is undefined
+ * by AMD's manual and kept here. Below the red zone: rflags, rax, rcx, rdx saved; pinsrq (SSE4.1)
+ * writes the low qword back. */
+static size_t emit_extrq(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
+                         unsigned char *image) {
+    static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff}; /* lea rsp,[rsp-0x100] */
+    static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};   /* lea rsp,[rsp+0x100] */
+    static const uint8_t body[] = {
+        0x48, 0x89, 0xca,             /* mov rdx, rcx */
+        0x48, 0xc1, 0xea, 0x08,       /* shr rdx, 8 */
+        0x83, 0xe2, 0x3f,             /* and edx, 63      (index) */
+        0x83, 0xe1, 0x3f,             /* and ecx, 63      (length) */
+        0x48, 0x87, 0xca,             /* xchg rdx, rcx    (rcx = index, rdx = length) */
+        0x48, 0xd3, 0xe8,             /* shr rax, cl */
+        0x85, 0xd2,                   /* test edx, edx    (length 0 = 64: no mask) */
+        0x74, 0x10,                   /* jz +16 */
+        0x89, 0xd1,                   /* mov ecx, edx */
+        0xba, 0x01, 0x00, 0x00, 0x00, /* mov edx, 1 */
+        0x48, 0xd3, 0xe2,             /* shl rdx, cl */
+        0x48, 0xff, 0xca,             /* dec rdx */
+        0x48, 0x21, 0xd0,             /* and rax, rdx */
+    };
+    const uint8_t rex_d = (uint8_t)(0x48 | (s->dst >= 8 ? 0x04 : 0)), rex_s = (uint8_t)(0x48 | (s->src1 >= 8 ? 0x04 : 0));
+    unsigned char *p = code;
+    emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
+    emit_bytes(&p, (const uint8_t[]){0x9c, 0x50, 0x51, 0x52}, 4);   /* pushfq; push rax, rcx, rdx */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);               /* mov rax, &hits[i] */
+    emit_u64(&p, (uint64_t)(uintptr_t)hit);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);         /* inc qword [rax] */
+    emit_bytes(&p, (const uint8_t[]){0x66, rex_d, 0x0f, 0x7e, (uint8_t)(0xc0 | (s->dst & 7) << 3)}, 5);  /* movq rax, xmm_dst */
+    emit_bytes(&p, (const uint8_t[]){0x66, rex_s, 0x0f, 0x7e, (uint8_t)(0xc1 | (s->src1 & 7) << 3)}, 5); /* movq rcx, xmm_src */
+    emit_bytes(&p, body, sizeof body);
+    emit_bytes(&p, (const uint8_t[]){0x66, rex_d, 0x0f, 0x3a, 0x22, (uint8_t)(0xc0 | (s->dst & 7) << 3), 0x00}, 7); /* pinsrq xmm_dst, rax, 0 */
+    emit_bytes(&p, (const uint8_t[]){0x5a, 0x59, 0x58, 0x9d}, 4);   /* pop rdx, rcx, rax; popfq */
+    emit_bytes(&p, lea_rsp_up, sizeof lea_rsp_up);
+    return emit_tail(code, p, at, s, image);
+}
+
 /* Writes the stub for `s` into `code` (laid out to run at `at`). Returns its size, or 0 when the
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
                         unsigned char *image) {
+    if (s->kind == ISA_EXTRQ) return emit_extrq(code, at, s, hit, image);
     static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff};   /* lea rsp,[rsp-0x100] */
     static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
     static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
@@ -252,6 +311,12 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
             report.skipped++;
             continue;
         }
+        if (s->kind == ISA_EXTRQ && s->mode == ISA_MODE_JMP_RELOCATE &&
+            memcmp(site + 4, s->relocated, s->relocated_length) != 0) {
+            fprintf(stderr, "ISA: site 0x%llx extrq skipped: next instruction changed\n", (unsigned long long)s->offset);
+            report.skipped++;
+            continue;
+        }
         if (s->mode == ISA_MODE_JMP_RELOCATE && memcmp(site + 4, s->relocated, s->relocated_length) != 0) {
             /* A patch or hook changed the instruction the jmp would cover: the stub would run the old copy. */
             fprintf(stderr, "ISA: site 0x%llx %s: next instruction changed, int3 fallback\n",
@@ -315,7 +380,8 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip) {
 
 const char *isa_kind_name(uint8_t kind) {
     static const char *const names[] = {"?",     "movbe", "movbe",  "lzcnt", "tzcnt",     "andn",
-                                        "bextr", "blsi",  "blsmsk", "blsr",  "vcvtph2ps", "vcvtps2ph"};
+                                        "bextr", "blsi",  "blsmsk", "blsr",  "vcvtph2ps", "vcvtps2ph",
+                                        "extrq"};
     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
 }
 

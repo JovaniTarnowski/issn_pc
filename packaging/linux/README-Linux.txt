@@ -30,7 +30,8 @@ Graphics
 - Anti-aliasing (launcher: Graphics > Anti-aliasing): the game's own or FSR 4 (included; Radeon
   RX 7000 / 9000 on RADV). DLSS is Windows only (NVIDIA's Streamline). In the game, Home switches
   FSR 4 and the game's own anti-aliasing live.
-- Internal resolution and Performance mode (launcher: Performance): as on Windows.
+- Internal resolution and Performance mode (launcher: Performance), Screen shape (Graphics: ultrawide
+  and other shapes; play fullscreen): as on Windows.
 - F12 saves a screenshot (user/screenshots), Insert opens the port's menu.
 
 Controls
@@ -40,7 +41,8 @@ Controls
   for the spray can, L1 rattles it, the right stick aims.
 - Keyboard and mouse: WASD moves, IJKL turns the camera; click in the game window and the mouse
   aims 1:1 (Y or F7 lets it go); left click shoots (R2), right click aims (L2); Space / Left Shift
-  / C / F are Cross / Circle / Square / Triangle; Z held tilts the spray can, X rattles it.
+  / C / F are Cross / Circle / Square / Triangle; Z held tilts the spray can, X rattles it, the
+  mouse aims it (- / = change its speed).
   The launcher's Game > Controls page changes the buttons.
 
 Data

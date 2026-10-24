@@ -66,6 +66,27 @@ void runtime_report(void);
 
 Frontend::WindowSDL* g_window = nullptr;
 
+// issn_pc: the screen shape (issn_game_patches.cpp ApplyRenderSize).
+namespace IssnShape {
+double g_aspect = 16.0 / 9.0;
+float g_movie_x = 0.0f, g_movie_y = 0.0f;
+/// The game window's size in pixels; a fullscreen window: its display's desktop mode.
+bool ScreenPixels(int& width, int& height) {
+    SDL_Window* window = g_window ? g_window->GetSDLWindow() : nullptr;
+    if (!window) {
+        return false;
+    }
+    if (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) {
+        if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window))) {
+            width = mode->w;
+            height = mode->h;
+            return width > 0 && height > 0;
+        }
+    }
+    return SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0;
+}
+} // namespace IssnShape
+
 // issn-axy: what axylpup's tree takes from its loader and patcher.
 namespace MemoryPatcher {
 uintptr_t g_eboot_address = 0;
@@ -85,8 +106,14 @@ bool InLiveResizeWindow() {
     return false;
 }
 bool IsRenderShaped(u32 width, u32 height) {
-    // The game's 16:9 render shape (+-3%), as his check with the default aspect.
-    return height != 0 && std::abs(double(width) / height - 16.0 / 9.0) < 0.03 * (16.0 / 9.0);
+    // The game's render shape (+-3%): 16:9, or the screen shape issn_game_patches.cpp set.
+    const double aspect = IssnShape::g_aspect;
+    return height != 0 && std::abs(double(width) / height - aspect) < 0.03 * aspect;
+}
+bool MovieFitRect(float& x, float& y) {
+    x = IssnShape::g_movie_x;
+    y = IssnShape::g_movie_y;
+    return x > 0.0f;
 }
 s64 MsSinceLiveResize() {
     return INT64_MAX;

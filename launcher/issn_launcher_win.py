@@ -57,7 +57,7 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NEW_GROUP = {} if WINDOWS else {'start_new_session': True}
 UI_FONT, MONO_FONT, SERIF_FONT = 'Segoe UI', 'Consolas', 'Georgia'
 # This build; GitHub release tags are windows-v<VERSION>.
-VERSION = '0.3.3'
+VERSION = '0.3.4'
 # This port's own test builds (never the God of War III port's: they must not be installed over
 # it). The source repository is private; the builds are published in a public repository that
 # holds only releases (tag windows-v<VERSION>, the zip from packaging/windows/package.sh).
@@ -342,7 +342,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', s
                 'vk_validation': False, 'close_on_play': False,
                 'check_updates': False, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation',
                 'glyph_style': 'off', 'compute_priority': True, 'ordered_readback': False, 'draw_distance': '',
-                'perf_mode': '', 'render_scale': '', 'shader_compile': '',
+                'perf_mode': '', 'render_scale': '', 'shader_compile': '', 'screen_shape': '',
                 'anti_aliasing': 'game'}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
@@ -465,6 +465,10 @@ PERF_MODES = [('', ('Off: full quality (default)',)), ('low', ('Balanced: about 
 RENDER_SCALES = [('', ('100%: 1920x1080, the game\'s own (default)',)), ('83', ('83%: 1592x896',)),
                  ('67', ('67%: 1280x720 (FSR 4 Quality)',)), ('58', ('58%: 1112x624 (FSR 4 Balanced)',)),
                  ('50', ('50%: 968x544 (FSR 4 Performance)',))]
+# ISSN_ASPECT (gpu/shim/issn_game_patches.cpp, axylpup's 1.1 screen shapes): '' = the game window's
+# shape (fullscreen: the monitor's), off = the game's 16:9, or a fixed shape.
+SCREEN_SHAPES = [('', ('Automatic: the shape of the window / monitor (default)',)), ('off', ('16:9, the game\'s own',)),
+                 ('21:9', ('21:9 ultrawide',)), ('32:9', ('32:9 super ultrawide',)), ('16:10', ('16:10',))]
 # SHADPS4_ASYNC_PIPELINES (the game profile's default 1): a new graphics shader compiles on
 # background threads and what it draws is skipped until it is ready, instead of the frame waiting.
 SHADER_COMPILE = [('', ('In the background: no stutter, new things can appear a moment later (default)',)),
@@ -874,6 +878,9 @@ def game_environment(s):
         env['ISSN_RENDER_SCALE'] = s['render_scale']
     if s.get('perf_mode') in {value for value, _text in PERF_MODES if value}:
         env['ISSN_PERF_MODE'] = s['perf_mode']
+    env.pop('ISSN_ASPECT', None)
+    if s.get('screen_shape') in {value for value, _text in SCREEN_SHAPES if value}:
+        env['ISSN_ASPECT'] = s['screen_shape']
     env.pop('SHADPS4_ASYNC_PIPELINES', None)
     if s.get('shader_compile') == 'frame':
         env['SHADPS4_ASYNC_PIPELINES'] = '0'
@@ -1417,6 +1424,10 @@ class Launcher:
         tk, ttk = self.tk, self.ttk
         f = self.scrolled_page('graphics', _('Graphics', 'Графика'), _('How the game appears on your screen.'))
         self.build_display(f)
+        self.row(f, _('Screen shape'), self.choice(f, 'screen_shape', 'app', SCREEN_SHAPES, width=44),
+                 _('Ultrawide and other screens: the game fills the shape and sees more at the sides (or above and '
+                   'below on 16:10); the HUD moves to the edges and movies keep their shape with bars. Automatic '
+                   'follows the window, so play in fullscreen on an ultrawide monitor.'), restart=True)
         self.section(f, _('Anti-aliasing'))
         self.row(f, _('Anti-aliasing'), self.choice(f, 'anti_aliasing', 'app', ANTI_ALIASING, width=44),
                  _("Replaces the game's own temporal anti-aliasing. FSR 4 (included) needs a Radeon RX 7000 or "

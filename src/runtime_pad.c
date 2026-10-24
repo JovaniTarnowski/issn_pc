@@ -462,6 +462,10 @@ static void key_axis(uint8_t *axis, bool negative, bool positive) {
  * and, while the window holds the mouse (Y in the game, issn_overlay.cpp), to the right stick as
  * the camera. ISSN_MOUSE_SPEED (pixels per second for a full stick, default 900). */
 static float mouse_dx, mouse_dy; /* motion since the last read, for synth_motion */
+/* issn: degrees the spray can turns per 100 px of mouse motion (ISSN_SPRAY_MOUSE; - / = while the
+ * pad is tilted). axylpup's default, 2.5 (his tester found 5 too fast); 0.3.3 turned it 0.004 rad
+ * per px = 23 degrees, which players found far too jumpy in the opening spray scenes. */
+static float spray_sens=2.5f;
 static int pad_tilted;           /* the last read's tilt (spray can): the mouse aims the can */
 
 /* issn: 1:1 mouse aim (src/mouse_hook.h, axylpup's src/core/mouse_aim.cpp). The loader patches
@@ -551,8 +555,13 @@ static void sample_mouse(PadData *d) {
         static bool minus_was, equals_was;
         const bool minus=k && k[SDL_SCANCODE_MINUS], equals=k && k[SDL_SCANCODE_EQUALS];
         if ((minus && !minus_was) || (equals && !equals_was)) {
-            aim_sens=fmaxf(0.5f,fminf(100.0f,aim_sens*(minus ? 0.8f : 1.25f)));
-            printf("Mouse aim: %.2f degrees per 100 px (- / =)\n",aim_sens);
+            if (pad_tilted) {
+                spray_sens=fmaxf(0.25f,fminf(25.0f,spray_sens*(minus ? 0.8f : 1.25f)));
+                printf("Spray can: %.2f degrees per 100 px (- / =)\n",spray_sens);
+            } else {
+                aim_sens=fmaxf(0.5f,fminf(100.0f,aim_sens*(minus ? 0.8f : 1.25f)));
+                printf("Mouse aim: %.2f degrees per 100 px (- / =)\n",aim_sens);
+            }
             fflush(stdout);
         }
         minus_was=minus; equals_was=equals;
@@ -576,8 +585,8 @@ static void sample_mouse(PadData *d) {
  * it (src/input/controller.cpp SyntheticMotionLocked): the pad's pose is yaw * pitch * roll; held
  * tilted it rolls 90 degrees (eased over 80 ms), and the accelerometer reads gravity in the pad's
  * frame from that same pose (the game's own formula), with a 5 Hz rattle on top; the gyroscope
- * reads the pose's change. Aim while tilted: the mouse (0.004 rad per pixel) or the right stick
- * (2 rad/s). */
+ * reads the pose's change. Aim while tilted: the mouse (spray_sens degrees per 100 px) or the right
+ * stick (2 rad/s). */
 static struct {
     float yaw, pitch, phi;
     float last_q[4];
@@ -599,8 +608,15 @@ static void synth_motion(PadData *d, bool tilt, bool rattle, float aim_x, float 
     if (!synth.t0) synth.t0=now;
     const float dt=synth.last_t && now>synth.last_t ? fminf((float)(now-synth.last_t)/1e6f,0.1f) : 0.0f;
     if (tilt) {
-        synth.yaw-=0.004f*mouse_dx+2.0f*aim_x*dt;
-        synth.pitch-=0.004f*mouse_dy+2.0f*aim_y*dt;
+        static int sens_read;
+        if (!sens_read) {
+            const char *e=getenv("ISSN_SPRAY_MOUSE");
+            if (e && atof(e)>0.0) spray_sens=fmaxf(0.25f,fminf(25.0f,(float)atof(e)));
+            sens_read=1;
+        }
+        const float k=spray_sens*pi/180.0f/100.0f;
+        synth.yaw-=k*mouse_dx+2.0f*aim_x*dt;
+        synth.pitch-=k*mouse_dy+2.0f*aim_y*dt;
         synth.pitch=fmaxf(-80.0f*pi/180.0f,fminf(80.0f*pi/180.0f,synth.pitch));
         if (synth.yaw>pi) synth.yaw-=2.0f*pi; else if (synth.yaw<-pi) synth.yaw+=2.0f*pi;
     } else {
