@@ -450,8 +450,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader.reset();
     graphics_key.Deserialize(ar);
-    // A seed key preloads only where the stamp allows graphics (seed_graphics_keys).
-    if (!seed_stamp.graphics &&
+    // A seed key preloads only where the stamp allows graphics (seed_graphics_keys). issn_pc: not
+    // in a VERIFY run, which reads no stamp (that needs bit 1) and checks the folder's own SPIR-V:
+    // the 0.3.2 release verify skipped every graphics key of a folder grown from a seed, so its
+    // new stamp held only compute and the folder's few own graphics stages.
+    if (!seed_stamp.graphics && (CacheRebuildMode() & 2) == 0 &&
         seed_graphics_keys.contains(std::hash<GraphicsPipelineKey>{}(graphics_key))) {
         ++seed_graphics_keys_skipped;
         return false;
