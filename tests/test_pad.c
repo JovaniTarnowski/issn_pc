@@ -281,11 +281,19 @@ int main(void) {
         usleep(15000);
     }
     assert(highest-lowest>2.0f);
+    /* The stick turns it at 30 degrees a second when pushed all the way (0.52 rad/s), squared
+     * after the dead zone (half way: a quarter of that), and the game does not see the stick. */
     inject(path,"rx=255");
     data=read_pad();
     usleep(20000);
     data=read_pad();
-    assert(fabsf(data.angular_velocity[0])>1.5f);
+    assert(fabsf(data.angular_velocity[0])>0.42f && fabsf(data.angular_velocity[0])<0.62f);
+    assert(data.right_x==128 && data.right_y==128);
+    inject(path,"rx=201");
+    data=read_pad();
+    usleep(20000);
+    data=read_pad();
+    assert(fabsf(data.angular_velocity[0])>0.09f && fabsf(data.angular_velocity[0])<0.18f);
     inject(path,"l3 r3");
     data=read_pad();
     assert(!synth.pose_toggle && !(data.buttons & (BTN_L3|BTN_R3)));

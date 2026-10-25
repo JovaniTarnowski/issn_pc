@@ -632,6 +632,14 @@ class ReleaseVersionTest(unittest.TestCase):
         env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x', 'pad_emulation': '0'})
         self.assertEqual(env['ISSN_PAD_EMULATION'], '0')
 
+    def test_spray_stick_speed(self):
+        env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x'})
+        self.assertNotIn('ISSN_SPRAY_STICK', env)  # the runtime's 30 degrees a second
+        env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x', 'spray_stick': '15'})
+        self.assertEqual(env['ISSN_SPRAY_STICK'], '15')
+        env = launcher.game_environment({**launcher.APP_DEFAULTS, 'game_dir': 'x', 'spray_stick': 'zoom'})
+        self.assertNotIn('ISSN_SPRAY_STICK', env)
+
     def test_first_start_follows_windows(self):
         # issn: the testers play in Portuguese; '' follows the Windows language (English for
         # the languages without a translation). English stays a choice in Advanced.

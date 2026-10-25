@@ -335,7 +335,7 @@ PAGES = ('home', 'graphics', 'performance', 'game', 'advanced')
 PAGE_REFRESH = {'home': ('refresh_status',), 'game': ('refresh_lists', 'refresh_game_patches')}
 APP_DEFAULTS = {'ui_language': '', 'game_dir': os.environ.get('ISSN_GAME_DIR', str(PORT_DIR.parent / 'CUSA00004') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False,
                 'video_backend': 'auto', 'gamemode': False, 'mangohud': False, 'desktop_integration': True, 'user_dir': '',
-                'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1', 'game_language': '', 'pad_emulation': '',
+                'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1', 'game_language': '', 'pad_emulation': '', 'spray_stick': '',
                 'player_name': '', 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'no_msaa': '', 'stream_memory': 'cached',
                 'gpu_id': '', 'background_warmup': True, 'parallel_warmup': True, 'pipeline_binaries': False,
                 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
@@ -434,6 +434,10 @@ LANGUAGES = [('', ('Automatic (launcher language)', 'Автоматически 
              ('10', ('Chinese (Traditional)', 'Китайский (традиционный)'))]
 # issn: touchpad and motion emulation for pads without them (runtime_pad.c, ISSN_PAD_EMULATION).
 PAD_EMULATION = [('', ('Automatic (on for pads without a touchpad)',)), ('1', ('On',)), ('0', ('Off',))]
+# issn: the spray can's right-stick aim speed, degrees a second at full push (runtime_pad.c,
+# ISSN_SPRAY_STICK; the runtime's default is 30).
+SPRAY_STICK = [('', ('Normal (default)',)), ('15', ('Slow',)), ('60', ('Fast',)),
+               ('115', ('Very fast (0.3.4 and earlier)',))]
 # Launcher language -> PS4 language id for the Automatic game language.
 GAME_LANGUAGE_OF_UI = {'pt': '17', 'en': '1', 'es': '3', 'fr': '2', 'de': '4', 'it': '5', 'pl': '16',
                        'ru': '8', 'tr': '19', 'ar': '21', 'ja': '0', 'ko': '9', 'zh': '11'}
@@ -890,6 +894,9 @@ def game_environment(s):
     env.pop('ISSN_PAD_EMULATION', None)
     if s.get('pad_emulation') in ('0', '1'):
         env['ISSN_PAD_EMULATION'] = s['pad_emulation']
+    env.pop('ISSN_SPRAY_STICK', None)
+    if s.get('spray_stick') in {value for value, _text in SPRAY_STICK if value}:
+        env['ISSN_SPRAY_STICK'] = s['spray_stick']
     for kind, name in (('key', 'ISSN_KEY_MAP'), ('pad', 'ISSN_PAD_MAP')):
         if value := control_map(s.get('controls', {}), kind):
             env[name] = value
@@ -1672,6 +1679,10 @@ class Launcher:
                    'Select/Back (with L1: the left side). Swipe: hold Select/Back and push the right stick. '
                    'Two fingers: hold Select/Back + RB. Spray can: L3 + R3 together tilts the pad, LB '
                    'rattles it, the right stick aims. Automatic turns it off on a DualShock 4 or DualSense.'),
+                 restart=True)
+        self.row(f, _('Spray can stick speed'), self.choice(f, 'spray_stick', 'app', SPRAY_STICK),
+                 _('How fast the right stick turns the spray can while the pad is tilted (L3 + R3). A light '
+                   'push moves it a little, a full push at this speed. In the game, - / = change it too.'),
                  restart=True)
         self.note(f, _('Keyboard and mouse: WASD moves, IJKL turns the camera. Click in the game window and the '
                        'mouse aims (1:1, as in axylpup\'s build); Y or F7 lets the mouse go and takes it back, '

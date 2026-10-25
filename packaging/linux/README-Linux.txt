@@ -38,7 +38,7 @@ Controls
 - DualShock 4 and DualSense: touchpad, motion sensors and the light bar work as on the PS4.
 - Pads without a touchpad or motion sensors (Xbox, 8BitDo, ...): Select/Back is the touchpad
   click (with L1: the left side; hold it and push the right stick to swipe), L3 + R3 tilts the pad
-  for the spray can, L1 rattles it, the right stick aims.
+  for the spray can, L1 rattles it, the right stick aims (launcher: Spray can stick speed).
 - Keyboard and mouse: WASD moves, IJKL turns the camera; click in the game window and the mouse
   aims 1:1 (Y or F7 lets it go); left click shoots (R2), right click aims (L2); Space / Left Shift
   / C / F are Cross / Circle / Square / Triangle; Z held tilts the spray can, X rattles it, the

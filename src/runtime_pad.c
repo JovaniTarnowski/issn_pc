@@ -466,6 +466,12 @@ static float mouse_dx, mouse_dy; /* motion since the last read, for synth_motion
  * pad is tilted). axylpup's default, 2.5 (his tester found 5 too fast); 0.3.3 turned it 0.004 rad
  * per px = 23 degrees, which players found far too jumpy in the opening spray scenes. */
 static float spray_sens=2.5f;
+/* issn: degrees per second the spray can turns with the right stick pushed all the way
+ * (ISSN_SPRAY_STICK; - / = while the pad is tilted scale it with the mouse's). The stick is
+ * squared after its dead zone, so a light push or a tap moves the can a little. It was 2 rad/s
+ * (115 degrees a second) and linear, which testers on Xbox / 8BitDo pads found far too fast: a tap
+ * threw the can across the wall (10-24). */
+static float spray_stick=30.0f;
 static int pad_tilted;           /* the last read's tilt (spray can): the mouse aims the can */
 
 /* issn: 1:1 mouse aim (src/mouse_hook.h, axylpup's src/core/mouse_aim.cpp). The loader patches
@@ -557,7 +563,9 @@ static void sample_mouse(PadData *d) {
         if ((minus && !minus_was) || (equals && !equals_was)) {
             if (pad_tilted) {
                 spray_sens=fmaxf(0.25f,fminf(25.0f,spray_sens*(minus ? 0.8f : 1.25f)));
-                printf("Spray can: %.2f degrees per 100 px (- / =)\n",spray_sens);
+                spray_stick=fmaxf(3.0f,fminf(360.0f,spray_stick*(minus ? 0.8f : 1.25f)));
+                printf("Spray can: %.2f degrees per 100 px, right stick %.0f degrees a second (- / =)\n",
+                       spray_sens,spray_stick);
             } else {
                 aim_sens=fmaxf(0.5f,fminf(100.0f,aim_sens*(minus ? 0.8f : 1.25f)));
                 printf("Mouse aim: %.2f degrees per 100 px (- / =)\n",aim_sens);
@@ -586,7 +594,7 @@ static void sample_mouse(PadData *d) {
  * tilted it rolls 90 degrees (eased over 80 ms), and the accelerometer reads gravity in the pad's
  * frame from that same pose (the game's own formula), with a 5 Hz rattle on top; the gyroscope
  * reads the pose's change. Aim while tilted: the mouse (spray_sens degrees per 100 px) or the right
- * stick (2 rad/s). */
+ * stick (spray_stick degrees a second at full push, squared). */
 static struct {
     float yaw, pitch, phi;
     float last_q[4];
@@ -602,6 +610,16 @@ static void q_axis(float x, float y, float z, float angle, float out[4]) {
     const float s=sinf(angle*0.5f);
     out[0]=x*s; out[1]=y*s; out[2]=z*s; out[3]=cosf(angle*0.5f);
 }
+/* issn: the right stick as the spray can's aim: a radial dead zone of 0.15, the rest rescaled to
+ * 0..1 and squared (fine control near the center, the full rate at the edge). */
+static void spray_stick_aim(uint8_t rx, uint8_t ry, float *ax, float *ay) {
+    const float x=((float)rx-128.0f)/127.0f, y=((float)ry-128.0f)/127.0f;
+    const float m=sqrtf(x*x+y*y);
+    *ax=*ay=0.0f;
+    if (m<=0.15f) return;
+    const float t=fminf(1.0f,(m-0.15f)/0.85f), scale=t*t/m;
+    *ax=x*scale; *ay=y*scale;
+}
 static void synth_motion(PadData *d, bool tilt, bool rattle, float aim_x, float aim_y) {
     const float pi=3.14159265f;
     const uint64_t now=d->timestamp;
@@ -612,11 +630,13 @@ static void synth_motion(PadData *d, bool tilt, bool rattle, float aim_x, float 
         if (!sens_read) {
             const char *e=getenv("ISSN_SPRAY_MOUSE");
             if (e && atof(e)>0.0) spray_sens=fmaxf(0.25f,fminf(25.0f,(float)atof(e)));
+            e=getenv("ISSN_SPRAY_STICK");
+            if (e && atof(e)>0.0) spray_stick=fmaxf(3.0f,fminf(360.0f,(float)atof(e)));
             sens_read=1;
         }
-        const float k=spray_sens*pi/180.0f/100.0f;
-        synth.yaw-=k*mouse_dx+2.0f*aim_x*dt;
-        synth.pitch-=k*mouse_dy+2.0f*aim_y*dt;
+        const float k=spray_sens*pi/180.0f/100.0f, rate=spray_stick*pi/180.0f;
+        synth.yaw-=k*mouse_dx+rate*aim_x*dt;
+        synth.pitch-=k*mouse_dy+rate*aim_y*dt;
         synth.pitch=fmaxf(-80.0f*pi/180.0f,fminf(80.0f*pi/180.0f,synth.pitch));
         if (synth.yaw>pi) synth.yaw-=2.0f*pi; else if (synth.yaw<-pi) synth.yaw+=2.0f*pi;
     } else {
@@ -856,9 +876,13 @@ static void sample(PadData *d) {
     const bool real_sensors=gamepad && (sensors & SENSOR_ACCEL) && motion_enabled;
     pad_tilted=tilt;
     if (!real_sensors || tilt) { /* Z / X / L3+R3 also drive a pad that has sensors */
-        const float ax=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_x-128.0f)/127.0f : 0.0f;
-        const float ay=(tilt && !(d->buttons & CLICK_RIGHT)) ? ((float)d->right_y-128.0f)/127.0f : 0.0f;
-        synth_motion(d,tilt,rattle,fabsf(ax)<0.15f ? 0.0f : ax,fabsf(ay)<0.15f ? 0.0f : ay);
+        const bool stick_aims=tilt && !(d->buttons & CLICK_RIGHT);
+        float ax=0.0f, ay=0.0f;
+        if (stick_aims) {
+            spray_stick_aim(d->right_x,d->right_y,&ax,&ay);
+            d->right_x=d->right_y=128; /* the stick turns the can, not the game's camera too */
+        }
+        synth_motion(d,tilt,rattle,ax,ay);
         static int was_tilted;
         if (tilt!=was_tilted) printf("Runtime: pad %s\n",tilt ? "tilted (spray can)" : "level");
         was_tilted=tilt;
