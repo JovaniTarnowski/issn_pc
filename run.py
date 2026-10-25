@@ -220,6 +220,17 @@ def main():
         game = update_view
         print(f'Game and update combined from {env["ISSN_PATCH_DIR"]}', flush=True)
     original_game = game.resolve()
+    # issn_pc: the port is made for the 01.07 update (code patches, mouse hook, seed). A base 01.00
+    # dump ends in an unsupported system call after the intro (sceKernelLoadStartModule, tester log
+    # 10-24) - say so here instead. ISSN_ALLOW_OLD_VERSION=1 tries anyway.
+    import game_profiles
+    import patches as game_patches
+    title, version = game_patches.game_title_id(game), game_patches.game_app_version(game)
+    if (title in game_profiles.INFAMOUS_SECOND_SON and version and version != '01.07'
+            and env.get('ISSN_ALLOW_OLD_VERSION') != '1'):
+        fail(f'{title} version {version}: this port needs the game\'s 01.07 update. In the launcher, '
+             'set "Update folder" to the 01.07 update (the folder with its eboot.bin and sce_sys), or '
+             'lay the update over the game folder, then press PLAY again.')
     game = Path(run_script('mods.py', game, '--out', out,
                            '--mods-dir', env.get('ISSN_MODS_DIR', data / 'mods'),
                            '--config', env.get('ISSN_MODS_CONFIG', data / 'mods.json'),
